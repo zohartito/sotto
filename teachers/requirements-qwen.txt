@@ -1,0 +1,2 @@
+mlx-qwen3-asr==0.4.0
+numpy

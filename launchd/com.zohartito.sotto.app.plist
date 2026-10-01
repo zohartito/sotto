@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.zohartito.sotto.app</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>-I</string><string>-S</string><string>-B</string><string>__SOTTO_HOME__/Library/Application Support/sotto/releases/current/source/sealed_release_bootstrap.py</string><string>--release-root</string><string>__SOTTO_HOME__/Library/Application Support/sotto/releases</string><string>--entry</string><string>sotto.py</string><string>run</string><string>--trigger</string><string>right-option</string><string>--idle-release</string><string>0</string><string>--glossary</string><string>__SOTTO_HOME__/Library/Application Support/sotto/releases/current/source/config/sotto-glossary.txt</string></array>
+  <key>ProcessType</key><string>Interactive</string><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>60</integer><key>Umask</key><integer>63</integer>
+  <key>WorkingDirectory</key><string>__SOTTO_HOME__/Library/Application Support/sotto/releases/current/source</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin</string><key>SOTTO_FFMPEG</key><string>__SOTTO_FFMPEG__</string><key>SOTTO_HF_HOME</key><string>__SOTTO_HOME__/Library/Application Support/sotto/huggingface</string><key>HF_HOME</key><string>__SOTTO_HOME__/Library/Application Support/sotto/huggingface</string><key>SOTTO_OFFLINE</key><string>1</string><key>HF_HUB_OFFLINE</key><string>1</string><key>TRANSFORMERS_OFFLINE</key><string>1</string><key>PYTHONDONTWRITEBYTECODE</key><string>1</string></dict>
+  <key>StandardOutPath</key><string>__SOTTO_HOME__/Library/Logs/Sotto/app.log</string><key>StandardErrorPath</key><string>__SOTTO_HOME__/Library/Logs/Sotto/app-error.log</string>
+</dict></plist>

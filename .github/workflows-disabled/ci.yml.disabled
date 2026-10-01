@@ -1,0 +1,49 @@
+# TOMBSTONED (2026-08-03): This workflow is deliberately outside
+# .github/workflows and cannot execute. The locally sealed campaign evidence
+# records actions/setup-python@v7 as mutable but does not provide a reviewed
+# immutable commit digest. Re-enable only after recording reviewed provenance
+# for setup-python and passing tests/test_workflow_action_pinning.py.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: Python syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Import-free check, so it runs on Linux even though sotto itself is
+      # macOS-only (Quartz/AppKit at module scope).
+      - name: Compile all sources
+        run: python -m compileall -q *.py tests
+
+  # tests/gesture_check.py is deliberately NOT wired up here yet.
+  #
+  # It passes reliably on a real Mac (verified: ALL 8 CHECKS PASSED) but fails
+  # 4/8 on a shared macos-latest runner. The suite drives the engine with
+  # wall-clock sleeps — `pressed(); time.sleep(n); released()` — against a
+  # shrunken HOLD_THRESHOLD_S of 0.08s with TAP = 0.02s, leaving only 60ms of
+  # headroom. Under runner scheduling jitter a 20ms press measures as >80ms,
+  # so taps get classified as holds: the four failures are exactly the
+  # tap-shaped cases, and the four hold-shaped cases still pass.
+  #
+  # Gating CI on it needs the engine's clock injected, or the windows widened
+  # well past runner jitter — a source change, out of scope for an
+  # automation-onboarding PR. Run it locally: python tests/gesture_check.py
+  #
+  # Dependencies when it is wired up: numpy + pyobjc-framework-{Cocoa,Quartz,
+  # ApplicationServices}. mlx-whisper and sounddevice are imported lazily
+  # inside the capture/transcribe paths, which these checks never enter.

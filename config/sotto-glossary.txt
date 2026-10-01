@@ -1,0 +1,5 @@
+# Example glossary: copy to a private file and add your own terms.
+# One term or short phrase per line.
+Sotto
+Whisper
+Nemotron

@@ -1,0 +1,6 @@
+# Optional NVIDIA CUDA runtime for CTranslate2: cuBLAS 12 (cuDNN ships inside
+# the ctranslate2 wheel).  Needs an NVIDIA driver with CUDA 12 support; without
+# a working GPU Sotto falls back to the CPU.
+-r requirements-alpha-windows.txt
+-c requirements-alpha-windows-cuda.lock
+nvidia-cublas-cu12

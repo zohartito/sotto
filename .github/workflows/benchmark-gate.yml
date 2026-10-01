@@ -1,0 +1,112 @@
+# benchmark-gate — the EVENT-on-push benchmark gate for sotto (+ a monthly
+# re-benchmark reminder).
+#
+# On every push (and on-demand) it runs `benchmark.py --dry-run` against a tiny
+# committed fixture manifest. The dry run does the full structural validation of
+# the manifest — every row's JSON, audio existence, tags/required_terms shape,
+# and model-candidate parsing — WITHOUT importing MLX or transcribing, so it runs
+# on a Linux runner with the system Python (no MLX, no Metal, no setup-python pin).
+# That is the gate: a malformed manifest or a benchmark.py that no longer imports
+# on stdlib-only fails the push.
+#
+# The full model A/B benchmark needs MLX on Apple Metal and is run locally, not
+# in CI. The monthly `schedule` run posts a re-benchmark reminder in the summary.
+#
+# Dormant-until-committed: benchmark.py and its imports (evaluation.py,
+# speech_config.py) may still be local WIP. Until they land on the default
+# branch this workflow no-ops green instead of failing, then activates
+# automatically once they are committed.
+#
+# Pinning: the one third-party action is a full 40-char SHA (matches secret-scan.yml).
+name: benchmark-gate
+
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    # 09:00 UTC on the 1st of each month — monthly re-benchmark reminder.
+  - cron: "0 9 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Benchmark dry-run gate
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to v7.0.1; matches secret-scan.yml.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        persist-credentials: false
+
+        fetch-depth: 0
+    - name: Run gitleaks
+      uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e   # v3.0.0
+      env:
+          # No GITLEAKS_LICENSE needed: gitleaks-action is free for personal
+          # (non-organization) GitHub accounts.
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Show runner Python
+      run: python3 --version
+
+    - name: Run benchmark dry-run gate
+      id: gate
+      env:
+        MANIFEST: tests/fixtures/benchmark_gate/manifest.jsonl
+      run: |
+        RAN_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [ ! -f benchmark.py ]; then
+          STATUS="dormant"
+          NOTE="benchmark.py not on this ref yet (local WIP) — gate no-ops until it lands"
+          SAMPLES="0"
+        else
+          # Import-surface check first (stdlib-only; mirrors the compileall CI habit).
+          python3 -m compileall -q benchmark.py evaluation.py speech_config.py
+          if python3 benchmark.py "$MANIFEST" --dry-run --output-json gate-result.json; then
+            STATUS="pass"
+            NOTE="manifest validated; benchmark.py imports on stdlib-only"
+            SAMPLES="$(python3 -c 'import json;print(json.load(open("gate-result.json"))["sample_count"])')"
+          else
+            STATUS="fail"
+            NOTE="benchmark --dry-run rejected the manifest or failed to import"
+            SAMPLES="0"
+          fi
+        fi
+        echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+        {
+          echo '### benchmark-gate result'
+          echo ''
+          echo '```json'
+          echo '{'
+          echo '  "schema": "benchmark-gate/v1",'
+          echo '  "event": "'"${GITHUB_EVENT_NAME}"'",'
+          echo '  "status": "'"${STATUS}"'",'
+          echo '  "sample_count": '"${SAMPLES}"','
+          echo '  "note": "'"${NOTE}"'",'
+          echo '  "ran_utc": "'"${RAN_UTC}"'"'
+          echo '}'
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        [ "$STATUS" = "fail" ] && exit 1 || exit 0
+
+    - name: Monthly re-benchmark reminder
+      if: github.event_name == 'schedule'
+      run: |
+        {
+          echo '### Monthly re-benchmark due'
+          echo ''
+          echo 'Run the full model A/B benchmark locally (macOS + MLX/Metal) against'
+          echo 'the current transcription models and refresh the scorecard:'
+          echo ''
+          echo '```'
+          echo 'venv/bin/python benchmark.py <manifest.jsonl> \'
+          echo '  --model turbo=mlx-community/whisper-large-v3-turbo \'
+          echo '  --output-json bench.json --output-markdown bench.md'
+          echo '```'
+          echo ''
+          echo 'Then log the outcome in `.claude/LEARNINGS.md`.'
+        } >> "$GITHUB_STEP_SUMMARY"
+concurrency:
+  group: benchmark-gate-${{ github.ref }}
+  cancel-in-progress: true

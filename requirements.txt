@@ -1,0 +1,9 @@
+mlx-whisper
+parakeet-mlx==0.5.2
+numpy
+pyobjc-framework-AVFoundation
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+scipy
+onnxruntime

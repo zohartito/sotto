@@ -1,0 +1,15 @@
+# Windows source alpha: tested on Windows 11 x64, CPython 3.13.14 (64-bit).
+# Exact resolved dependency set; no models, credentials or local file URLs.
+# NVIDIA GPU: install requirements-alpha-windows-cuda.txt instead (it includes this file).
+-c requirements-alpha-windows.lock
+faster-whisper
+ctranslate2
+huggingface-hub
+numpy
+scipy
+onnxruntime
+sounddevice
+pynput
+# Tray icon and menu (Settings and Correct dialogs use the stdlib's tkinter).
+pystray
+pillow

@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.panel/
+.handoff/
+.DS_Store
+
+# Public source alpha environments and local verification output
+venv-alpha/
+.alpha-state/
+.alpha-cache/

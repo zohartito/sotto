@@ -1,0 +1,2 @@
+mlx-audio[stt]==0.5.3
+numpy
