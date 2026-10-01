@@ -196,6 +196,17 @@ class ChordTests(unittest.TestCase):
         self.assertEqual(events, ['start', 'finish'])
 
 
+class GlossarySourceTests(unittest.TestCase):
+    def test_explicit_file_wins_else_the_data_folder_glossary_if_present(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary)
+            with patch('sotto_paths.DATA_DIR', data):
+                self.assertEqual(sotto.glossary_source('/x/terms.txt'), Path('/x/terms.txt'))
+                self.assertIsNone(sotto.glossary_source(None))
+                (data / 'glossary.txt').write_text('Sotto\n', encoding='utf-8')
+                self.assertEqual(sotto.glossary_source(None), data / 'glossary.txt')
+
+
 class HandsFreeHintTests(unittest.TestCase):
     """Hands-free keeps recording after the key is up, so the overlay says how to stop."""
 

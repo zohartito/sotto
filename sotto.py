@@ -194,6 +194,16 @@ TRIGGER_LABELS = {
 }
 
 
+def glossary_source(explicit: str | None) -> Path | None:
+    """--glossary wins; otherwise glossary.txt in the data folder, so Sotto.app
+    (which takes no arguments) can be taught names and terms too."""
+    if explicit:
+        return Path(explicit)
+    from sotto_paths import DATA_DIR
+    candidate = DATA_DIR / "glossary.txt"
+    return candidate if candidate.is_file() else None
+
+
 def hands_free_hint(trigger: str) -> str:
     """How to end hands-free, short enough for the overlay: "tap right ⌘ to stop"."""
     if trigger == "fn":
@@ -3658,7 +3668,8 @@ def main() -> None:
             language = load_language_mode()
         speech_config = resolve_speech_config(profile, model=args.model,
                                               language="en" if args.adaptive else language)
-        glossary_terms = load_glossary(args.glossary) if args.glossary else ()
+        source = glossary_source(args.glossary)
+        glossary_terms = load_glossary(source) if source else ()
     except ValueError as exc:
         parser.error(str(exc))
     import settings

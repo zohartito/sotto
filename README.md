@@ -177,6 +177,12 @@ Matching ignores case and only replaces whole words or phrases; edits apply to
 the next dictation. History keeps what the model originally heard next to the
 rewritten text. `venv-alpha/bin/python sotto.py dictionary` lists the rules.
 
+To help Whisper hear names and terms in the first place, list them one per line
+in `glossary.txt` in the same data folder (up to 100 terms; lines starting with
+`#` are ignored) and restart Sotto. `config/sotto-glossary.txt` is an example.
+The glossary is used with Whisper on captures up to 30 seconds; a terminal run
+can pass its own file with `--glossary FILE`.
+
 ## Optional Parakeet (fastest; 25 European languages)
 
 **Speech engine → Parakeet** uses NVIDIA's Parakeet TDT 0.6B v3 through MLX:
