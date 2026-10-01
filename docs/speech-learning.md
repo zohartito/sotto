@@ -32,21 +32,15 @@ language override when one is supplied.
 | Profile | Local MLX repository | Default language |
 | --- | --- | --- |
 | `auto` | `mlx-community/whisper-large-v3-turbo` | auto |
-| `hebrew-turbo` | `mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx` | `he` |
-| `hebrew-quality` | `mlx-community/ivrit-ai-whisper-large-v3-mlx` | `he` |
 
-The ivrit.ai repositories are Hebrew-model candidates selected from external
-Hebrew evidence. They have **not** been shown superior on Sotto data before a
-personal-corpus A/B comparison exists. `hebrew-turbo` and `hebrew-quality`
-force Hebrew unless `--language auto|he|en` explicitly changes that choice.
+A language-specific fine-tune is a candidate, not an improvement, until a
+personal-corpus A/B comparison shows it is better on Sotto data.
 `--model REPOSITORY` explicitly replaces the repository selected by the
-profile.
+profile, and `--language CODE` sets the language.
 
 ```bash
 venv/bin/python sotto.py --profile auto
-venv/bin/python sotto.py --profile hebrew-turbo
-venv/bin/python sotto.py --profile hebrew-quality --language auto
-venv/bin/python sotto.py --model mlx-community/ivrit-ai-whisper-large-v3-mlx
+venv/bin/python sotto.py --model ORG/REPOSITORY --language CODE
 ```
 
 The selected model is downloaded to local storage only when it is actually run.
@@ -203,7 +197,7 @@ manifest: each nonblank line has `audio` and `reference`; `id`, `language`,
 manifest location.
 
 ```json
-{"id":"he-001","audio":"audio/he-001.wav","reference":"הטקסט המתוקן","language":"he","tags":["dictation","proper-name"],"required_terms":["Sotto"]}
+{"id":"es-001","audio":"audio/es-001.wav","reference":"El texto corregido","language":"es","tags":["dictation","proper-name"],"required_terms":["Sotto"]}
 {"id":"en-001","audio":"audio/en-001.wav","reference":"Open Sotto","language":"en","tags":["dictation"],"required_terms":["Sotto"]}
 ```
 
@@ -211,25 +205,25 @@ First validate a manifest and candidate names without importing MLX or
 transcribing:
 
 ```bash
-venv/bin/python benchmark.py manifests/held-out.jsonl --profile hebrew-turbo --dry-run
+venv/bin/python benchmark.py manifests/held-out.jsonl --profile auto --dry-run
 ```
 
-For a real, Hebrew-language stock-versus-candidate comparison, give each
+For a real, single-language stock-versus-candidate comparison, give each
 candidate a durable label and write reports outside the manifest's audio
 directory:
 
 ```bash
-venv/bin/python benchmark.py manifests/held-out-hebrew.jsonl \
-  --profile hebrew-turbo \
+venv/bin/python benchmark.py manifests/held-out-spanish.jsonl \
+  --language es \
   --model stock=mlx-community/whisper-large-v3-turbo \
-  --model hebrew-turbo=mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx \
-  --output-json results/stock-vs-hebrew-turbo.json \
-  --output-markdown results/stock-vs-hebrew-turbo.md
+  --model candidate=ORG/REPOSITORY \
+  --output-json results/stock-vs-candidate.json \
+  --output-markdown results/stock-vs-candidate.md
 ```
 
-`--profile hebrew-turbo` deliberately supplies forced `he` to both candidates
+`--language es` deliberately supplies the same forced language to both candidates
 in that comparison. For a different explicit policy, pass
-`--language auto|he|en`; use `--glossary PATH` if that is part of the frozen
+`--language auto` or another code; use `--glossary PATH` if that is part of the frozen
 evaluation condition. A real benchmark loads the selected local models; a
 dry-run does not.
 
@@ -257,7 +251,7 @@ switches.
 Build a **separate, opt-in corrected corpus** if you may eventually consider
 fine-tuning. **5–10 hours** of material is a decision checkpoint, not proof
 that the corpus is sufficient. First compare routing, language policy,
-glossary prompting, and stock/Hebrew model swaps on a frozen held-out set.
+glossary prompting, and stock/fine-tuned model swaps on a frozen held-out set.
 
 Fine-tuning becomes worth investigating only when those comparisons show
 systematic residual errors that a trained adaptation could plausibly address,

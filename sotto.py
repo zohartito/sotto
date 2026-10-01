@@ -3546,7 +3546,7 @@ def main() -> None:
     parser.add_argument("--trigger", default=None, choices=sorted(TRIGGERS),
                         help="dictation key for this run (default: Settings, initially right-option)")
     parser.add_argument("--profile", default=None,
-                        choices=("auto", "hebrew-turbo", "hebrew-quality", "nemotron-en", "parakeet"),
+                        choices=("auto", "nemotron-en", "parakeet"),
                         help="local speech profile (default: saved engine, initially auto)")
     parser.add_argument("--model", default=None,
                         help="explicit local MLX model repository override")

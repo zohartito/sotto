@@ -210,8 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("manifest", help="JSONL manifest containing audio and reference fields")
     parser.add_argument("--model", action="append", default=[], metavar="LABEL=REPO",
                         help="Candidate MLX repo (repeatable); use label=repo to name it")
-    parser.add_argument("--profile", default="auto", help="Base profile: auto, hebrew-turbo, or hebrew-quality")
-    parser.add_argument("--language", choices=("auto", "he", "en"), default=None,
+    parser.add_argument("--profile", default="auto", help="Base profile (default: auto)")
+    parser.add_argument("--language", default=None,
                         help="Explicit language override")
     parser.add_argument("--glossary", help="Local UTF-8 text or JSON glossary")
     parser.add_argument("--limit", type=int, help="Evaluate at most this many manifest rows")

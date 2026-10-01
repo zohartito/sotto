@@ -12,7 +12,7 @@ Trigger keys (settings names, shared with the Mac):
                   Alt release never opens the focused app's menu bar.
   left-shift
 Omitted on purpose: fn (handled by keyboard firmware, invisible to Windows);
-right-option (right Alt is AltGr on many layouts, including Hebrew, and
+right-option (right Alt is AltGr on many non-US layouts, and
 arrives with a synthetic left Ctrl that would cancel every capture);
 right-shift (holding it 8 seconds opens the Filter Keys prompt); the Windows
 key (Start menu on release, Win+H voice typing, PowerToys hold-guides).

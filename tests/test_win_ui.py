@@ -40,14 +40,13 @@ class LabelTest(unittest.TestCase):
         # The Mac's ui.language_menu_options: Automatic, the chosen set, and
         # the active language when it is outside that set.
         self.assertEqual(win_ui.language_menu_options("auto", []), [
-            ("auto", "Automatic (English + Hebrew)", True), ("en", "English", False),
-            ("he", "Hebrew", False)])
-        self.assertEqual(win_ui.language_menu_options("sw", ["he", "fr"]), [
-            ("auto", "Automatic (Hebrew + French)", False), ("he", "Hebrew", False),
+            ("auto", "Automatic (English)", True), ("en", "English", False)])
+        self.assertEqual(win_ui.language_menu_options("sw", ["pt", "fr"]), [
+            ("auto", "Automatic (Portuguese + French)", False), ("pt", "Portuguese", False),
             ("fr", "French", False), ("sw", "Swahili", True)])
-        extra = win_ui.other_languages("sw", ["he", "fr"])
+        extra = win_ui.other_languages("sw", ["pt", "fr"])
         self.assertIn("en", extra)
-        self.assertFalse({"he", "fr", "sw"} & set(extra))
+        self.assertFalse({"pt", "fr", "sw"} & set(extra))
         self.assertLessEqual(set(win_ui.COMMON_LANGUAGES), set(win_ui.WHISPER_LANGUAGES))
 
     def test_tooltips(self) -> None:
@@ -76,7 +75,7 @@ class FakeController:
 
     def recording(self): return False
     def entries(self, limit): return [{"id": "abc", "ts": time.time(), "text": "hello", "revision": 0}]
-    def saved_languages(self): return ["en", "he", "sw"]
+    def saved_languages(self): return ["en", "pt", "sw"]
     def language(self): return self._language
     def progress(self): return ["Corrections saved: 0", "Dictionary rules: 0"]
     def start_now(self): self._record("start_now")
@@ -145,14 +144,14 @@ class MenuTest(unittest.TestCase):
         self.app.controller = self.controller
         menu = self.by_text(self.app.items())
         languages = self.by_text(menu["Language"].submenu.items)
-        automatic = "Automatic (English + Hebrew + Swahili)"
-        self.assertEqual(list(languages), [automatic, "English", "Hebrew", "Swahili", "Other languages"])
+        automatic = "Automatic (English + Portuguese + Swahili)"
+        self.assertEqual(list(languages), [automatic, "English", "Portuguese", "Swahili", "Other languages"])
         self.assertTrue(languages[automatic].checked)
-        self.assertFalse(languages["Hebrew"].checked)
-        self.controller._language = "he"
-        self.assertTrue(languages["Hebrew"].checked)
+        self.assertFalse(languages["Portuguese"].checked)
+        self.controller._language = "pt"
+        self.assertTrue(languages["Portuguese"].checked)
         others = self.by_text(languages["Other languages"].submenu.items)
-        self.assertNotIn("Hebrew", others)
+        self.assertNotIn("Portuguese", others)
         with mock.patch.object(win_ui.TrayApp, "notify"):
             self.invoke(others["French"])
         self.assertEqual(self.controller.calls[-1], ("set_language", "fr"))

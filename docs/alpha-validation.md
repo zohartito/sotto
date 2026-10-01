@@ -46,11 +46,11 @@ macOS 27.2, M4 Max, CPython 3.12.14 unless noted.
 | Foreground run | Ctrl-C and SIGTERM exit 0 in < 0.1 s; Restart re-executes with arguments and environment kept | Real Cocoa event loop, no microphone |
 | Sotto.app build | Launcher compiled, signed ad hoc, verified; SIGTERM reaches the app; exit status passes through | Local app bundle mechanics, not notarization |
 | Automatic language, one encoder pass | 0.63–0.73 s → 0.32–0.40 s (synthetic speech) | Same text on 48/56 clips; the rest equal or better |
-| Fast speed (experimental) | 0.30 s → 0.13 s median; mean error 0.041 → 0.066 (synthetic, 13 languages) | English/Hebrew unaffected on these clips |
-| Parakeet engine | 50–190 ms per sentence; en/es/de/fr correct (numbers as digits); silence and noise → empty; Hebrew (unsupported) → a Latin-letter guess, not empty | Array input, pinned snapshot, chunked long input |
+| Fast speed (experimental) | 0.30 s → 0.13 s median; mean error 0.041 → 0.066 (synthetic, 13 languages) | English unaffected on these clips |
+| Parakeet engine | 50–190 ms per sentence; en/es/de/fr correct (numbers as digits); silence and noise → empty; an unsupported language → a Latin-letter guess, not empty | Array input, pinned snapshot, chunked long input |
 | Nemotron engine (2026-09-30, real model) | 27–29 ms from end of audio to final text while streaming; 3 English sentences, 1 word wrong; silence and noise → empty | Streaming decode on pinned local libraries |
 | Silence handling with the pinned Silero VAD | "Thank you."/"you" on silence or noise held back; speech passes | Output-side verdict only; no input gate |
-| Out-of-set language guard | English/Hebrew unchanged; es/fr/de/ja written as spoken, not translated | Detection probabilities: in-set speech ≥ 0.989, other ≤ 0.112 |
+| Out-of-set language guard | In-set languages unchanged (two-language set); es/fr/de/ja written as spoken, not translated | Detection probabilities: in-set speech ≥ 0.989, other ≤ 0.112 |
 | Nemotron install | Pinned hashes enforced; tampered model, extra library and symlink refused | Checksum gate, synthetic decode only |
 | Windows (i9-11900K, RTX 4070 Ti SUPER) | 333 tests OK from a fresh archive in CPU and CUDA environments; tray start/Quit exit 0 | See windows-alpha.md; no desktop session was used |
 

@@ -40,8 +40,8 @@ WHISPER_LANGUAGES: dict[str, str] = {
 }
 SUPPORTED_LANGUAGES = ("auto", *WHISPER_LANGUAGES)
 # Automatic chooses among these unless Settings names others.
-DEFAULT_AUTOMATIC_LANGUAGES = ("en", "he")
-LANGUAGE_LABELS = {"auto": "Automatic (English + Hebrew)", **WHISPER_LANGUAGES}
+DEFAULT_AUTOMATIC_LANGUAGES = ("en",)
+LANGUAGE_LABELS = {"auto": "Automatic", **WHISPER_LANGUAGES}
 
 
 def automatic_languages(chosen=None) -> tuple[str, ...]:
@@ -61,7 +61,7 @@ DEFAULT_ENGINE_MODE_PATH = DEFAULT_LANGUAGE_MODE_PATH.with_name("engine-mode")
 ENGINE_CHOICES = {"whisper": "Whisper",
                   "parakeet": "Parakeet (fastest · 25 European languages)",
                   "nemotron": "Nemotron (English streaming)"}
-# Parakeet TDT 0.6B v3 detects these itself; no Hebrew, Arabic or Asian languages.
+# Parakeet TDT 0.6B v3 detects these itself; languages outside this list are not supported.
 PARAKEET_LANGUAGES = ("bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it",
                       "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk")
 PARAKEET_DOWNLOAD = "2.5 GB"
@@ -100,12 +100,6 @@ class GlossaryPrompt:
 
 MODEL_PROFILES: dict[str, ModelProfile] = {
     "auto": ModelProfile("auto", "mlx-community/whisper-large-v3-turbo", None),
-    "hebrew-turbo": ModelProfile(
-        "hebrew-turbo", "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx", "he"
-    ),
-    "hebrew-quality": ModelProfile(
-        "hebrew-quality", "mlx-community/ivrit-ai-whisper-large-v3-mlx", "he"
-    ),
     "nemotron-en": ModelProfile(
         "nemotron-en", "nvidia/nemotron-speech-streaming-en-0.6b", "en", "nemotron"
     ),
@@ -117,8 +111,6 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
 # request; a first download fetches exactly these bytes, never a moved `main`.
 MODEL_REVISIONS: dict[str, str] = {
     "mlx-community/whisper-large-v3-turbo": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
-    "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx": "53ad8c6cd8b32eb0303f093a404ae13c1b1d567f",
-    "mlx-community/ivrit-ai-whisper-large-v3-mlx": "097c0cb2bb4288a3c82f6d524a39c4ce09afa187",
     "mlx-community/parakeet-tdt-0.6b-v3": "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15",
 }
 
@@ -168,7 +160,7 @@ def with_language(config: SpeechConfig, mode: str) -> SpeechConfig:
     if config.profile.backend == "parakeet":
         return replace(config, language=None)  # Parakeet detects its own language
     if config.profile.backend == "nemotron" and language != "en":
-        raise ValueError("Nemotron is English-only; select Whisper for Hebrew or automatic language.")
+        raise ValueError("Nemotron is English-only; select Whisper for other languages or automatic language.")
     return replace(config, language=language)
 
 

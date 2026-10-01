@@ -64,14 +64,14 @@ class SpeechRuntimeTests(unittest.TestCase):
     def _enrolled(self):
         prepared = prepare_canonical(np.array([-.75, -.1, .1, .75], np.float32))
         row = self.coordinator.append_live("model text", prepared, .5, "model",
-                                          language="he", profile="hebrew-turbo",
+                                          language="pt", profile="auto",
                                           raw_samples=np.array([-.5, 0, .5], np.float32),
                                           raw_sample_rate=22_050)
         self.coordinator.correct(row["id"], "human reference")
         return row, self.coordinator.enroll(row["id"])
 
     def test_cli_resolution_precedence_and_short_glossary(self):
-        config = resolve_speech_config("hebrew-quality", model="local/test", language="en")
+        config = resolve_speech_config("auto", model="local/test", language="en")
         self.assertEqual(config.model_repo, "local/test")
         self.assertEqual(config.language, "en")
         fake = _FakeWhisper()
@@ -83,9 +83,9 @@ class SpeechRuntimeTests(unittest.TestCase):
         self.assertEqual(fake.calls[0][1]["initial_prompt"], "Speech context: Sotto.")
         self.assertFalse(fake.calls[0][1]["word_timestamps"])
         self.assertNotIn("hallucination_silence_threshold", fake.calls[0][1])
-        self.assertEqual(metadata["profile"], "hebrew-quality")
+        self.assertEqual(metadata["profile"], "auto")
 
-    def test_multilingual_model_auto_detects_or_accepts_a_hebrew_hint(self):
+    def test_multilingual_model_auto_detects_or_accepts_a_language_hint(self):
         prepared = prepare_canonical(np.zeros(1600, np.float32))
         automatic = _FakeWhisper()
         text, metadata = sotto.transcribe_prepared(
@@ -95,12 +95,12 @@ class SpeechRuntimeTests(unittest.TestCase):
         self.assertNotIn("language", automatic.calls[0][1])
         self.assertIsNone(metadata["language"])
 
-        hebrew = _FakeWhisper()
+        hinted = _FakeWhisper()
         _text, metadata = sotto.transcribe_prepared(
-            hebrew, prepared, resolve_speech_config("auto", language="he"), ()
+            hinted, prepared, resolve_speech_config("auto", language="pt"), ()
         )
-        self.assertEqual(hebrew.calls[0][1]["language"], "he")
-        self.assertEqual(metadata["language"], "he")
+        self.assertEqual(hinted.calls[0][1]["language"], "pt")
+        self.assertEqual(metadata["language"], "pt")
 
     def test_warmup_routing_is_adaptive_receipt_only_or_generic(self):
         config = resolve_speech_config("auto", language="en")
@@ -308,12 +308,12 @@ class SpeechRuntimeTests(unittest.TestCase):
         self.assertIn("separate", ui.correction_disclosure(False))
         self.assertIn("automatically", ui.correction_disclosure(True))
 
-    def test_language_menu_offers_auto_english_and_hebrew(self):
+    def test_language_menu_offers_automatic_english_and_an_outside_choice(self):
         import ui
-        options = ui.language_menu_options("he")
-        self.assertEqual([mode for mode, _label, _selected in options], ["auto", "en", "he"])
-        self.assertEqual([mode for mode, _label, selected in options if selected], ["he"])
-        self.assertIn("English + Hebrew", options[0][1])
+        options = ui.language_menu_options("pt")
+        self.assertEqual([mode for mode, _label, _selected in options], ["auto", "en", "pt"])
+        self.assertEqual([mode for mode, _label, selected in options if selected], ["pt"])
+        self.assertEqual(options[0][1], "Automatic (English)")
 
     def test_nonadaptive_menu_retains_manual_enroll_action(self):
         import ui
@@ -335,7 +335,7 @@ class SpeechRuntimeTests(unittest.TestCase):
     def test_long_capture_disables_glossary_and_exact_prepared_reaches_store(self):
         fake = _FakeWhisper()
         prepared = prepare_canonical(np.linspace(-.2, .2, 16000 * 31, dtype=np.float32))
-        config = resolve_speech_config("hebrew-turbo")
+        config = resolve_speech_config("auto")
         _, metadata = sotto.transcribe_prepared(fake, prepared, config, ("Sotto",))
         self.assertIs(fake.calls[0][0], prepared.asr_samples)
         self.assertNotIn("initial_prompt", fake.calls[0][1])

@@ -33,7 +33,7 @@ class FakeModel:
         self.detections: list = []
         self.fail = fail
         # faster-whisper's detect_language: (top, its probability, all sorted)
-        self.probabilities = probabilities or [("en", 0.6), ("he", 0.3), ("fr", 0.1)]
+        self.probabilities = probabilities or [("en", 0.6), ("pt", 0.3), ("fr", 0.1)]
 
     def transcribe(self, audio, **kwargs):
         self.calls.append((audio, kwargs))
@@ -56,11 +56,7 @@ def write_snapshot(directory: Path, files=win_asr.MODEL_FILES) -> Path:
 class WinAsrProfilesTest(unittest.TestCase):
     def test_profile_ids_are_the_verified_ct2_repos(self) -> None:
         # Verified against the HuggingFace API on 2026-09-20 (ungated, CT2).
-        self.assertEqual(win_asr.PROFILES, {
-            "auto": TURBO,
-            "hebrew-turbo": "ivrit-ai/whisper-large-v3-turbo-ct2",
-            "hebrew-quality": "ivrit-ai/whisper-large-v3-ct2",
-        })
+        self.assertEqual(win_asr.PROFILES, {"auto": TURBO})
 
     def test_every_profile_is_pinned_to_a_full_commit(self) -> None:
         for repo in win_asr.PROFILES.values():
@@ -85,14 +81,12 @@ class WinAsrProfilesTest(unittest.TestCase):
         self.assertEqual(win_asr.required_files(TURBO), win_asr.MODEL_FILES)
 
     def test_repo_for_profile(self) -> None:
-        self.assertEqual(win_asr.repo_for_profile("hebrew-turbo"),
-                         "ivrit-ai/whisper-large-v3-turbo-ct2")
+        self.assertEqual(win_asr.repo_for_profile("auto"), TURBO)
 
     def test_unknown_profile_raises_with_choices(self) -> None:
         with self.assertRaises(ValueError) as ctx:
             win_asr.repo_for_profile("nope")
         self.assertIn("auto", str(ctx.exception))
-        self.assertIn("hebrew-quality", str(ctx.exception))
 
 
 class ResolveModelDirTest(unittest.TestCase):
@@ -228,13 +222,13 @@ class LocalCT2WhisperTest(unittest.TestCase):
         whisper = self.whisper()
         samples = self._samples()
         result = whisper.transcribe(samples, path_or_hf_repo=TURBO, condition_on_previous_text=False,
-                                    word_timestamps=False, language="he",
+                                    word_timestamps=False, language="pt",
                                     initial_prompt="Speech context: foo.", some_future_flag=True)
         self.assertEqual(result, {"text": "hello world"})
         self.assertEqual(self.built, [(str(Path("C:/models/turbo")), "cuda", "float16")])
         audio, kwargs = self.models["cuda"].calls[0]
         self.assertIs(audio, samples)
-        self.assertEqual(kwargs, {"language": "he", "initial_prompt": "Speech context: foo.",
+        self.assertEqual(kwargs, {"language": "pt", "initial_prompt": "Speech context: foo.",
                                   "condition_on_previous_text": False, "word_timestamps": False})
         self.assertNotIn(TURBO, repr(self.built))
 
@@ -285,30 +279,30 @@ class LocalCT2WhisperTest(unittest.TestCase):
 
     def test_automatic_chooses_only_among_the_allowed_languages(self) -> None:
         # French is the model's own top guess, but the user speaks en/he only.
-        self.models["cuda"].probabilities = [("fr", 0.5), ("he", 0.3), ("en", 0.2)]
+        self.models["cuda"].probabilities = [("fr", 0.5), ("pt", 0.3), ("en", 0.2)]
         whisper = self.whisper()
-        result = whisper.transcribe(self._samples(), allowed_languages=("en", "he"))
-        self.assertEqual(self.models["cuda"].calls[-1][1]["language"], "he")
-        self.assertEqual(result, {"text": "hello world", "language": "he"})
+        result = whisper.transcribe(self._samples(), allowed_languages=("en", "pt"))
+        self.assertEqual(self.models["cuda"].calls[-1][1]["language"], "pt")
+        self.assertEqual(result, {"text": "hello world", "language": "pt"})
         self.assertEqual(len(self.models["cuda"].detections), 1)
 
     def test_one_allowed_language_or_a_fixed_language_skips_detection(self) -> None:
         whisper = self.whisper()
-        result = whisper.transcribe(self._samples(), allowed_languages=("he",))
-        self.assertEqual(self.models["cuda"].calls[-1][1]["language"], "he")
-        self.assertEqual(result["language"], "he")
-        result = whisper.transcribe(self._samples(), language="en", allowed_languages=("he", "fr"))
+        result = whisper.transcribe(self._samples(), allowed_languages=("pt",))
+        self.assertEqual(self.models["cuda"].calls[-1][1]["language"], "pt")
+        self.assertEqual(result["language"], "pt")
+        result = whisper.transcribe(self._samples(), language="en", allowed_languages=("pt", "fr"))
         self.assertEqual(self.models["cuda"].calls[-1][1]["language"], "en")
         self.assertNotIn("language", result)
         self.assertEqual(self.models["cuda"].detections, [])
 
     def test_language_restricted_view_passes_the_set_and_reports_the_choice(self) -> None:
         whisper = self.whisper()
-        view = win_asr.LanguageRestricted(whisper, ("en", "he"))
+        view = win_asr.LanguageRestricted(whisper, ("en", "pt"))
         self.assertEqual(view.transcribe(self._samples(), path_or_hf_repo="label")["text"], "hello world")
         self.assertEqual(view.last_language, "en")  # read by sotto.transcribe_canonical_samples
         self.assertEqual(self.models["cuda"].calls[-1][1]["language"], "en")
-        view.transcribe(self._samples(), language="he")
+        view.transcribe(self._samples(), language="pt")
         self.assertIsNone(view.last_language)
 
 
@@ -360,13 +354,13 @@ class OnePassTest(unittest.TestCase):
         model = OnePassModel()
         whisper = win_asr.LocalCT2Whisper(Path("C:/m"), device="cpu", model_factory=lambda *a, **k: model,
                                           cuda_devices=lambda: 0, log=lambda message: None)
-        result = whisper.transcribe(np.zeros(16_000 * 5, dtype=np.float32), allowed_languages=("en", "he"))
-        self.assertEqual(result, {"text": "one pass", "language": "he"})
+        result = whisper.transcribe(np.zeros(16_000 * 5, dtype=np.float32), allowed_languages=("en", "pt"))
+        self.assertEqual(result, {"text": "one pass", "language": "pt"})
         self.assertEqual(len(model.encodes), 1, "one encoder pass for detection and decode")
-        self.assertEqual(model.languages, [("he", ("encoder-output", 1))])
+        self.assertEqual(model.languages, [("pt", ("encoder-output", 1))])
         self.assertNotIn("encode", model.__dict__, "the model's own encode is restored")
         # A second clip reuses nothing from the first.
-        whisper.transcribe(np.ones(16_000 * 3, dtype=np.float32), allowed_languages=("en", "he"))
+        whisper.transcribe(np.ones(16_000 * 3, dtype=np.float32), allowed_languages=("en", "pt"))
         self.assertEqual(len(model.encodes), 2)
 
     def test_long_clip_uses_the_normal_detection(self) -> None:
@@ -377,9 +371,9 @@ class OnePassTest(unittest.TestCase):
 
 class LanguageChoiceTest(unittest.TestCase):
     def test_choose_language_is_argmax_within_the_set_with_user_order_ties(self) -> None:
-        probabilities = {"fr": 0.4, "en": 0.3, "he": 0.3}
-        self.assertEqual(win_asr.choose_language(probabilities, ("he", "en")), "he")
-        self.assertEqual(win_asr.choose_language(probabilities, ("en", "he")), "en")
+        probabilities = {"fr": 0.4, "en": 0.3, "pt": 0.3}
+        self.assertEqual(win_asr.choose_language(probabilities, ("pt", "en")), "pt")
+        self.assertEqual(win_asr.choose_language(probabilities, ("en", "pt")), "en")
         self.assertEqual(win_asr.choose_language({"en": 0.7, "ar": 0.2}, ("ar", "en")), "en")
         self.assertEqual(win_asr.choose_language({}, ("es", "de")), "es")
         with self.assertRaises(ValueError):
@@ -387,9 +381,9 @@ class LanguageChoiceTest(unittest.TestCase):
 
     def test_clearly_other_speech_is_written_in_its_own_language_not_translated(self) -> None:
         # The Mac's rule: allowed all < 0.25 while another language >= 0.5.
-        self.assertEqual(win_asr.choose_language({"es": 0.86, "en": 0.11, "he": 0.01}, ("en", "he")), "es")
-        self.assertEqual(win_asr.choose_language({"es": 0.49, "en": 0.11}, ("en", "he")), "en")
-        self.assertEqual(win_asr.choose_language({"es": 0.6, "en": 0.25}, ("en", "he")), "en")
+        self.assertEqual(win_asr.choose_language({"es": 0.86, "en": 0.11, "pt": 0.01}, ("en", "pt")), "es")
+        self.assertEqual(win_asr.choose_language({"es": 0.49, "en": 0.11}, ("en", "pt")), "en")
+        self.assertEqual(win_asr.choose_language({"es": 0.6, "en": 0.25}, ("en", "pt")), "en")
 
 
 def _cuda_extras_installed() -> bool:

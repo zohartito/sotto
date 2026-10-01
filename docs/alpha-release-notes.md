@@ -11,9 +11,9 @@ Apple Silicon / native arm64 Python 3.12 / macOS 14 or later (the oldest
 release the pinned dependencies install on). Verified candidate host: M4 Max,
 macOS 27.2, CPython 3.12.14. macOS 14–26 and other chips are untested.
 Initial engine: local Whisper large-v3-turbo; Automatic chooses among the
-languages you tick (English + Hebrew by default, 100 available), with an
+languages you tick (English by default, 100 available), with an
 experimental Fast speed. Optional engines: Parakeet v3 (fastest, 25 European
-languages, no Hebrew) and Nemotron en-0.6b (English-only streaming; final text
+languages) and Nemotron en-0.6b (English-only streaming; final text
 is pasted after release). Adaptive routing and background learning workers
 remain off.
 

@@ -37,8 +37,6 @@ from typing import Any, Callable, Iterable, Mapping
 # library=ctranslate2, complete CT2 file sets.
 PROFILES: dict[str, str] = {
     "auto": "deepdml/faster-whisper-large-v3-turbo-ct2",
-    "hebrew-turbo": "ivrit-ai/whisper-large-v3-turbo-ct2",
-    "hebrew-quality": "ivrit-ai/whisper-large-v3-ct2",
 }
 # Settings speed "fast" swaps the auto profile's model for this smaller
 # multilingual port (benchmark: docs/windows-alpha.md, 2026-09-29).
@@ -46,8 +44,6 @@ FAST_REPO = "Systran/faster-whisper-small"
 # Exact commits (HuggingFace API, 2026-09-29).  Only these snapshots load.
 REVISIONS: dict[str, str] = {
     "deepdml/faster-whisper-large-v3-turbo-ct2": "4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
-    "ivrit-ai/whisper-large-v3-turbo-ct2": "72ad623a37947395efcc3933132353790e5a12f5",
-    "ivrit-ai/whisper-large-v3-ct2": "e9ed4a4a98d761b0f617d668303de2c514236c66",
     "Systran/faster-whisper-small": "536b0662742c02347bc0e980a01041f333bce120",
 }
 # Everything WhisperModel reads from a local directory.  tokenizer.json must be

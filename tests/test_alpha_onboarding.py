@@ -415,11 +415,11 @@ class ModelAndTemplateTests(unittest.TestCase):
 
     def test_automatic_chooses_only_among_the_allowed_languages(self):
         local, backend, _snapshot = self.resolve(self.DEFAULT, offline=False, results=[str(self.snapshot)])
-        with patch.object(sotto.LocalWhisper, 'one_pass', return_value=('he', None)) as detect:
-            local.allowed_languages = lambda: ('en', 'he')
+        with patch.object(sotto.LocalWhisper, 'one_pass', return_value=('pt', None)) as detect:
+            local.allowed_languages = lambda: ('en', 'pt')
             local.transcribe([0.1])
-            self.assertEqual(backend.transcribe.call_args.kwargs['language'], 'he')
-            self.assertEqual(local.last_language, 'he')
+            self.assertEqual(backend.transcribe.call_args.kwargs['language'], 'pt')
+            self.assertEqual(local.last_language, 'pt')
             local.transcribe([0.1], language='en')           # an explicit choice is never overridden
             self.assertEqual(backend.transcribe.call_args.kwargs['language'], 'en')
             self.assertIsNone(local.last_language)
@@ -433,19 +433,19 @@ class ModelAndTemplateTests(unittest.TestCase):
 
     def test_short_automatic_clips_use_one_pass_and_fall_back_when_unsure(self):
         local, backend, _snapshot = self.resolve(self.DEFAULT, offline=False, results=[str(self.snapshot)])
-        local.allowed_languages = lambda: ('en', 'he')
+        local.allowed_languages = lambda: ('en', 'pt')
         short, long = [0.0] * 16000, [0.0] * (31 * 16000)
-        with patch.object(sotto.LocalWhisper, 'one_pass', return_value=('he', {'text': 'שלום'})) as one_pass:
-            self.assertEqual(local.transcribe(short)['text'], 'שלום')
+        with patch.object(sotto.LocalWhisper, 'one_pass', return_value=('pt', {'text': 'olá'})) as one_pass:
+            self.assertEqual(local.transcribe(short)['text'], 'olá')
             backend.transcribe.assert_not_called()
         with patch.object(sotto.LocalWhisper, 'one_pass', return_value=('en', None)):
             local.transcribe(short)                            # unsure decode: the full pipeline decides
             self.assertEqual(backend.transcribe.call_args.kwargs['language'], 'en')
-        with patch.object(sotto.LocalWhisper, 'detect_language', return_value='he') as detect:
+        with patch.object(sotto.LocalWhisper, 'detect_language', return_value='pt') as detect:
             local.transcribe(long)                             # beyond one window: detect then transcribe
             self.assertEqual(detect.call_count, 1)
             local.transcribe(short, initial_prompt='Sotto')    # a glossary prompt needs the full path
-            self.assertEqual(backend.transcribe.call_args.kwargs['language'], 'he')
+            self.assertEqual(backend.transcribe.call_args.kwargs['language'], 'pt')
         self.assertEqual(one_pass.call_count, 1)
 
     def test_fast_speed_uses_the_trimmed_one_pass_even_for_a_fixed_language(self):
@@ -486,9 +486,9 @@ class ModelAndTemplateTests(unittest.TestCase):
         with patch.object(sotto.LocalWhisper, '_model', return_value=Mock()), \
              patch.object(sotto.LocalWhisper, '_features', return_value=Mock()):
             with fake_decoding([1] * 224):
-                self.assertEqual(local.one_pass([0.0], (), language='he'), ('he', None))
+                self.assertEqual(local.one_pass([0.0], (), language='pt'), ('pt', None))
             with fake_decoding([1] * 20):
-                self.assertEqual(local.one_pass([0.0], (), language='he')[1]['text'], 'partial')
+                self.assertEqual(local.one_pass([0.0], (), language='pt')[1]['text'], 'partial')
 
     @unittest.skipUnless(sys.platform == 'darwin', 'launchd templates take POSIX absolute paths (macOS-only)')
     def test_template_rendering_preserves_sealed_offline_arguments_and_escapes_home(self):
@@ -508,8 +508,8 @@ class ModelAndTemplateTests(unittest.TestCase):
 class ChooseLanguageTests(unittest.TestCase):
     def test_prefers_the_allowed_set_but_never_translates_clearly_other_speech(self):
         choose = sotto.choose_language
-        self.assertEqual(choose({"en": 0.99, "he": 0.005, "es": 0.005}, ("en", "he")), "en")
-        self.assertEqual(choose({"cy": 0.45, "en": 0.40, "he": 0.01}, ("en", "he")), "en")   # ambiguous: stay
-        self.assertEqual(choose({"es": 0.86, "en": 0.11, "he": 0.001}, ("en", "he")), "es")  # clearly Spanish
-        self.assertEqual(choose({"es": 0.6, "en": 0.3}, ("en", "he")), "en")                 # in-set not weak
+        self.assertEqual(choose({"en": 0.99, "pt": 0.005, "es": 0.005}, ("en", "pt")), "en")
+        self.assertEqual(choose({"cy": 0.45, "en": 0.40, "pt": 0.01}, ("en", "pt")), "en")   # ambiguous: stay
+        self.assertEqual(choose({"es": 0.86, "en": 0.11, "pt": 0.001}, ("en", "pt")), "es")  # clearly Spanish
+        self.assertEqual(choose({"es": 0.6, "en": 0.3}, ("en", "pt")), "en")                 # in-set not weak
         self.assertEqual(choose({"fr": 0.7, "en": 0.2}, ()), "fr")                           # no set: plain argmax

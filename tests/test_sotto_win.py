@@ -43,18 +43,12 @@ class ResolveConfigTest(unittest.TestCase):
         self.assertEqual(config.model_repo, win_asr.PROFILES["auto"])
         self.assertIsNone(config.language)
 
-    def test_hebrew_profiles_carry_he_language(self):
-        for profile in ("hebrew-turbo", "hebrew-quality"):
-            config = self._resolve(profile, None, None)
-            self.assertEqual(config.model_repo, win_asr.PROFILES[profile])
-            self.assertEqual(config.language, "he")
-
     def test_model_override_wins(self):
         config = self._resolve("auto", "org/some-ct2-repo@" + "a" * 40, None, "fast")
         self.assertEqual(config.model_repo, "org/some-ct2-repo@" + "a" * 40)
 
-    def test_language_override_beats_profile_default(self):
-        config = self._resolve("hebrew-turbo", None, "auto")
+    def test_language_override_accepts_any_whisper_language(self):
+        config = self._resolve("auto", None, "auto")
         self.assertIsNone(config.language)
         self.assertEqual(self._resolve("auto", None, "fr").language, "fr")  # any Whisper language
         with self.assertRaises(ValueError):
@@ -62,8 +56,6 @@ class ResolveConfigTest(unittest.TestCase):
 
     def test_fast_speed_swaps_only_the_auto_profile_model(self):
         self.assertEqual(self._resolve("auto", None, None, "fast").model_repo, win_asr.FAST_REPO)
-        self.assertEqual(self._resolve("hebrew-turbo", None, None, "fast").model_repo,
-                         win_asr.PROFILES["hebrew-turbo"])
 
     def test_blank_model_rejected(self):
         with self.assertRaises(ValueError):
@@ -79,7 +71,7 @@ class DeliveryLogicTest(unittest.TestCase):
     def test_prefs_come_from_settings_with_the_shared_automatic_default(self):
         prefs = sotto_win.delivery_prefs(user_settings.DEFAULTS)
         self.assertEqual((prefs.insert_mode, prefs.spacing, prefs.languages),
-                         ("paste", "smart", ("en", "he")))
+                         ("paste", "smart", ("en",)))
         prefs = sotto_win.delivery_prefs(dict(user_settings.DEFAULTS, insert_mode="type",
                                               spacing="none", languages=["fr", "xx", "de"]))
         self.assertEqual((prefs.insert_mode, prefs.spacing, prefs.languages), ("type", "none", ("fr", "de")))
@@ -92,12 +84,12 @@ class DeliveryLogicTest(unittest.TestCase):
                                  sotto.compose_insertion(text, spacing, None), (text, spacing))
 
     def test_automatic_uses_the_macs_language_choice_rule(self):
-        cases = [({"en": 0.6, "he": 0.3, "fr": 0.1}, ("en", "he")),
-                 ({"fr": 0.5, "he": 0.3, "en": 0.2}, ("en", "he")),
-                 ({"es": 0.86, "en": 0.11, "he": 0.01}, ("en", "he")),
-                 ({"es": 0.49, "en": 0.11}, ("en", "he")),
-                 ({"es": 0.6, "en": 0.25}, ("en", "he")),
-                 ({"de": 0.4, "en": 0.3, "he": 0.3}, ("he", "en"))]
+        cases = [({"en": 0.6, "pt": 0.3, "fr": 0.1}, ("en", "pt")),
+                 ({"fr": 0.5, "pt": 0.3, "en": 0.2}, ("en", "pt")),
+                 ({"es": 0.86, "en": 0.11, "pt": 0.01}, ("en", "pt")),
+                 ({"es": 0.49, "en": 0.11}, ("en", "pt")),
+                 ({"es": 0.6, "en": 0.25}, ("en", "pt")),
+                 ({"de": 0.4, "en": 0.3, "pt": 0.3}, ("pt", "en"))]
         for probabilities, allowed in cases:
             self.assertEqual(win_asr.choose_language(probabilities, allowed),
                              sotto.choose_language(probabilities, allowed), (probabilities, allowed))

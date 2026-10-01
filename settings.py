@@ -26,7 +26,7 @@ DEFAULTS = {
     # the Windows alpha has always used.
     "trigger": "right-ctrl" if sys.platform == "win32" else "right-option",
     "hotkey": "" if sys.platform == "win32" else "ctrl-opt-d",
-    "languages": [],          # Automatic chooses among these; empty = English + Hebrew
+    "languages": [],          # Automatic chooses among these; empty = English
     "insert_mode": "paste",
     "spacing": "smart",
     "speed": "accurate",

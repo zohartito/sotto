@@ -174,32 +174,22 @@ After four idle minutes, the next press queues one serialized model refresh
 while speech is being captured, hiding Metal/page-in warmup behind the user's
 utterance instead of adding it after release.
 
-The default `--profile auto` selects the stock multilingual candidate
+The default `--profile auto` selects the stock multilingual model
 `mlx-community/whisper-large-v3-turbo`. The menu-bar `◦` menu defaults to
-`Language: Automatic (English + Hebrew)`: each push-to-talk recording is
-detected independently. Use its Language submenu to force English or Hebrew
-for short or ambiguous phrases; the choice is local, persistent, and applies
-from the next recording without loading another model. For Hebrew, Sotto also offers two
-locally-run candidates selected from external Hebrew evidence (not yet proven
-better on your personal corpus):
+`Language: Automatic (English)`; add your languages under **Settings… →
+Languages** and each push-to-talk recording is detected among them. Use the
+Language submenu to force one language for short or ambiguous phrases; the
+choice is local, persistent, and applies from the next recording without
+loading another model.
 
-| Profile | Repository | Language default |
-| --- | --- | --- |
-| `auto` | `mlx-community/whisper-large-v3-turbo` | auto-detect |
-| `hebrew-turbo` | `mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx` | forced `he` |
-| `hebrew-quality` | `mlx-community/ivrit-ai-whisper-large-v3-mlx` | forced `he` |
-
-Use `--profile auto|hebrew-turbo|hebrew-quality`; use
-`--language auto|he|en` to explicitly override its language decision; and use
-`--model REPOSITORY` only when an explicit repository override is wanted.
+Use `--language CODE` (any Whisper language code, or `auto`) to override the
+language decision, and `--model REPOSITORY` only when an explicit repository
+override is wanted.
 
 ```bash
-# Hebrew, fast candidate; the profile forces Hebrew unless --language overrides it.
-venv/bin/python sotto.py --profile hebrew-turbo
-
 # Explicit language and model overrides remain local.
-venv/bin/python sotto.py --profile auto --language he \
-  --model mlx-community/ivrit-ai-whisper-large-v3-mlx
+venv/bin/python sotto.py --profile auto --language fr \
+  --model mlx-community/whisper-large-v3-turbo
 
 # Offer bounded proper names and terms to short captures.
 venv/bin/python sotto.py --glossary ~/Documents/sotto-glossary.txt

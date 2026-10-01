@@ -190,9 +190,8 @@ about 0.05 s per sentence on an M4 Max once warm, and it writes nothing for
 silence. It detects its own language among Bulgarian, Croatian, Czech, Danish,
 Dutch, English, Estonian, Finnish, French, German, Greek, Hungarian, Italian,
 Latvian, Lithuanian, Maltese, Polish, Portuguese, Romanian, Russian, Slovak,
-Slovenian, Spanish, Swedish and Ukrainian. It does **not** understand Hebrew,
-Arabic or Asian languages (it pastes a Latin-letter guess for them): use
-Whisper for those.
+Slovenian, Spanish, Swedish and Ukrainian. It does **not** understand other
+languages (it pastes a Latin-letter guess for them): use Whisper for those.
 Download it once from **Settings → Download Parakeet (2.5 GB)** (or
 `venv-alpha/bin/python sotto.py setup --profile parakeet`), then choose it
 while idle; Sotto restarts on the new engine. The model is pinned to one
@@ -212,8 +211,8 @@ This downloads the pinned NeMo-Speech.cpp 0.1.0 Metal libraries and Q8 model,
 checks SHA-256 values and retains upstream notices under
 `$SOTTO_DATA_DIR/nemotron/0.1.0`. Choose **Speech engine → Nemotron (English
 streaming)** while idle. Audio is decoded during capture; only finalized,
-validated text is pasted after release. Partial text is not pasted. Hebrew,
-automatic language detection and Whisper glossary prompts are unavailable.
+validated text is pasted after release. Partial text is not pasted. Other
+languages, automatic language detection and Whisper glossary prompts are unavailable.
 Returning to Whisper restores your saved language choice. Native load failure
 falls back to Whisper; it does not turn on adaptive routing.
 
@@ -293,8 +292,10 @@ Deletion cannot guarantee erasure from backups or SSD snapshots.
   Certificates.command`. "Not downloaded yet" means an offline flag is set and
   the model is not cached yet: run once without the offline flags. Do not
   delete a shared cache.
-- **Wrong language:** force English or Hebrew in the Language menu for short
-  phrases; use Whisper for Hebrew. Switching languages does not load a second model.
+- **Wrong language:** add your languages under **Settings… → Languages** so
+  Automatic can pick them, or force one in the Language menu for short phrases.
+  Use Whisper for languages Parakeet and Nemotron do not cover. Switching
+  languages does not load a second model.
 - **"Thank you." appears when you said nothing:** Whisper invents short stock
   phrases for silence. `sotto.py setup` (run by the installer) adds the small
   Silero voice-detection model, which keeps those out of the text field (they

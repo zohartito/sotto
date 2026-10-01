@@ -26,7 +26,7 @@ class FakeModel:
             "engine_labels": {"whisper": "Whisper", "parakeet": "Parakeet", "nemotron": "Nemotron (English streaming)"},
             "engine": "whisper", "engine_switching": True, "nemotron_installed": False,
             "nemotron_installing": False, "fast_available": False, "language_names": WHISPER_LANGUAGES,
-            "automatic_languages": ["en", "he"], "login_enabled": False, "login_available": False,
+            "automatic_languages": ["en", "pt"], "login_enabled": False, "login_available": False,
             "dictionary_rules": 3, "data_dir": "/tmp/sotto-alpha",
         }
         state.update(self.overrides)
@@ -113,10 +113,9 @@ class SettingsWindowTests(unittest.TestCase):
 
 
 class LanguageMenuTests(unittest.TestCase):
-    def test_default_menu_is_unchanged_automatic_english_hebrew(self):
+    def test_default_menu_is_automatic_english_only(self):
         self.assertEqual(ui.language_menu_options("auto"),
-                         (("auto", "Automatic (English + Hebrew)", True),
-                          ("en", "English", False), ("he", "Hebrew", False)))
+                         (("auto", "Automatic (English)", True), ("en", "English", False)))
 
     def test_custom_set_and_an_active_language_outside_it(self):
         options = ui.language_menu_options("ja", ["en", "fr"])

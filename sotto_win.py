@@ -13,7 +13,6 @@ with Windows I/O:
     python sotto_win.py                          # console run (tests, headless)
     python sotto_win.py --tray                   # tray app (win_launch.py for pythonw)
     python sotto_win.py --trigger left-ctrl
-    python sotto_win.py --profile hebrew-turbo
     python sotto_win.py --device cpu             # or SOTTO_DEVICE=cpu
     python sotto_win.py setup                    # download the pinned model + VAD now
     python sotto_win.py doctor                   # device + model + mic checks
@@ -115,7 +114,7 @@ def resolve_config(profile: str, model: str | None, language: str | None,
 
     speech_config.MODEL_PROFILES name the MLX repos for the Mac; the CT2 ids
     live in win_asr (same profile names).  Speed "fast" swaps only the auto
-    profile's model; an explicit --model or Hebrew profile wins.
+    profile's model; an explicit --model wins.
     """
     profile_obj = get_profile(profile)
     if model is not None:
@@ -343,7 +342,7 @@ def history_command(command: str, *, limit: int, entry_id: str | None,
     dependency_guard = AdaptiveLearning(store.base_dir)
     if command == "history":
         # Redirected output would otherwise use the ANSI code page and fail
-        # on Hebrew; a real console already writes UTF-16 either way.
+        # on non-Latin text; a real console already writes UTF-16 either way.
         sys.stdout.reconfigure(encoding="utf-8")
         entries = store.entries(limit=limit)
         for entry in entries:
@@ -1041,7 +1040,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--trigger", default=None, choices=tuple(win_hotkey.TRIGGERS),
                         help="trigger key for this run (default: Settings, else right-ctrl)")
     parser.add_argument("--profile", default="auto",
-                        choices=("auto", "hebrew-turbo", "hebrew-quality"),
+                        choices=("auto",),
                         help="speech profile (default: auto)")
     parser.add_argument("--model", default=None,
                         help="local CTranslate2 model directory, or org/name@<commit>")

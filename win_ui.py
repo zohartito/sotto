@@ -28,13 +28,13 @@ import win_hotkey
 HISTORY_ITEMS = 10
 # Language menu extras (the brief's "common languages"), shown under
 # "Other languages" when they are not already in the user's set.
-COMMON_LANGUAGES = ("en", "he", "ar", "zh", "nl", "fr", "de", "hi", "it", "ja", "ko",
+COMMON_LANGUAGES = ("en", "ar", "zh", "nl", "fr", "de", "he", "hi", "it", "ja", "ko",
                     "pl", "pt", "ru", "es", "tr", "uk")
 PREVIEW_CHARS = 48
 COLORS = {"starting": (140, 140, 140), "idle": (232, 116, 59),
           "recording": (214, 40, 40), "transcribing": (240, 176, 0)}
 SPEED_LABELS = {"accurate": "Accurate — large-v3-turbo",
-                "fast": "Fast — small (quicker on CPU, weaker on Hebrew)"}
+                "fast": "Fast — small (quicker on CPU, weaker outside English)"}
 INSERT_LABELS = {"paste": "Paste (the clipboard is put back)",
                  "type": "Type (the clipboard is never touched)"}
 SPACING_LABELS = {"smart": "Smart (same as trailing on Windows)",

@@ -16,10 +16,10 @@ PAIRED_BOOTSTRAP_REPLICATES = 10_000
 
 
 def tokenize(text: str) -> tuple[str, ...]:
-    """Normalize Hebrew/English text and retain word and numeric tokens.
+    """Normalize text in any script and retain word and numeric tokens.
 
-    NFKC handles compatibility variants, combining marks (such as niqqud) are
-    omitted, and punctuation is a separator.  Hebrew letters and all Unicode
+    NFKC handles compatibility variants, combining marks (vowel points, accents) are
+    omitted, and punctuation is a separator.  Letters of every script and all Unicode
     decimal digits are retained; no ASCII-only filtering is used.
     """
 

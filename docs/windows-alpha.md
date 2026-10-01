@@ -27,7 +27,7 @@ dependencies have their own licenses.
   No CUDA Toolkit install is needed; the pip CUDA extras carry cuBLAS and the
   ctranslate2 wheel carries cuDNN. Without a working GPU Sotto uses the CPU.
 - About 6 GB free disk for the environment, caches and the default model
-  (1.6 GB; the Fast speed adds 0.5 GB, `hebrew-quality` 3.1 GB). Several GB of
+  (1.6 GB; the Fast speed adds 0.5 GB). Several GB of
   RAM (CPU) or about 2 GB of VRAM (GPU) for the default model.
 
 Checked on Windows 11 x64 (build 26200), i9-11900K, RTX 4070 Ti SUPER, NVIDIA
@@ -163,7 +163,7 @@ clipboard (a notification says so) instead of being inserted.
 | Setting | Choices | Applies |
 | --- | --- | --- |
 | Trigger key | Right Ctrl (default), Left Ctrl, Left Alt, Left Shift | Immediately (a `--trigger` flag wins for that run) |
-| Languages for Automatic | Any Whisper languages, 1 to 12 (default English + Hebrew) | Next dictation |
+| Languages for Automatic | Any Whisper languages, 1 to 12 (default English) | Next dictation |
 | Insert text by | Paste (clipboard put back) or Type (clipboard untouched) | Next dictation |
 | Spacing | Smart, Add a space, No space | Next dictation |
 | Speed | Accurate or Fast | After restart |
@@ -173,8 +173,8 @@ Settings also has **Open dictionary**, **Show data folder** and the Progress
 numbers. Settings live in `settings.json` in the data folder.
 
 Trigger keys left out on purpose: Fn (handled by the keyboard itself,
-invisible to Windows); right Alt (it is AltGr on many layouts, including
-Hebrew, and arrives with a synthetic left Ctrl that would cancel every
+invisible to Windows); right Alt (it is AltGr on many non-US layouts, and
+arrives with a synthetic left Ctrl that would cancel every
 capture); right Shift (holding it 8 seconds opens the Filter Keys prompt); the
 Windows key (Start menu, Win+H voice typing, PowerToys hold guides). With
 **Left Alt**, Sotto sends an unassigned key on each press so releasing Alt
@@ -197,8 +197,8 @@ suggested rule; only the rules you confirm are added.
 
 ## Languages
 
-**Automatic** chooses among your languages (Settings → Languages, English and
-Hebrew by default): Sotto detects the language once, takes the most likely of
+**Automatic** chooses among your languages (Settings → Languages, English by
+default): Sotto detects the language once, takes the most likely of
 your languages, and transcribes with that language fixed. Speech that is
 clearly another language (your languages score below 25% and another language
 at least 50%) is written in the language spoken, because forcing it into one
@@ -214,9 +214,8 @@ same for one run.
 **Accurate** uses `deepdml/faster-whisper-large-v3-turbo-ct2`. **Fast** uses
 `Systran/faster-whisper-small` (multilingual, MIT), pinned to commit
 `536b0662742c`, downloaded once on first use (about 0.5 GB) like the other
-models. Fast matters on the CPU; on a GPU both are equally quick. The Hebrew
-profiles (`--profile hebrew-turbo|hebrew-quality`) and `--model` ignore the
-speed setting.
+models. Fast matters on the CPU; on a GPU both are equally quick. `--model`
+ignores the speed setting.
 
 Benchmark, 2026-09-29, this check machine, synthetic speech: 10 dictation-style
 sentences spoken by the 5 installed en-US Windows voices (System.Speech),
@@ -224,7 +223,7 @@ clean and with white noise at 10 dB SNR; seconds per clip (clips average
 4.5 s); word error rate (WER) after lowercasing and removing punctuation.
 CPU: 20 clips, int8, i9-11900K. CUDA: 50 clips, float16, RTX 4070 Ti SUPER.
 
-Shipped Automatic path (English/Hebrew set, one encoder pass):
+Shipped Automatic path (two-language set, one encoder pass):
 
 | Setting (model) | CPU s/clip clean / noisy | CPU WER clean / noisy | CUDA s/clip | CUDA WER clean / noisy |
 | --- | --- | --- | --- | --- |
@@ -238,11 +237,11 @@ a fixed language the CPU times roughly halve (turbo 5.5–6.2 s, small
 1.6–1.7 s). Medium was barely faster than Accurate on the CPU; base was
 faster still but is the weakest multilingual model. Small is the smallest
 multilingual port with a clear CPU gain and a low error rate here. The
-distilled large-v3 ports are English-only and would break Hebrew.
+distilled large-v3 ports are English-only and would break other languages.
 
-No Hebrew voice is installed on the check machine, so Hebrew accuracy was not
-measured; smaller Whisper models are known to be much weaker on Hebrew than
-large ones. Use Accurate for Hebrew.
+Accuracy outside English was not measured per language on the check machine;
+smaller Whisper models are known to be much weaker than large ones on many
+languages. Use Accurate if Fast makes mistakes in yours.
 
 ## Insertion: paste or type
 
@@ -304,9 +303,7 @@ about 0.2 seconds.
 
 - `--tray` runs the tray app; without it Sotto is a console program.
 - `--trigger right-ctrl|left-ctrl|left-option|left-shift` for one run.
-- `--language auto|en|he|…` fixes or frees the decode language for one run.
-- `--profile hebrew-turbo` / `--profile hebrew-quality` use the pinned
-  ivrit.ai Hebrew models (each downloads once on first use).
+- `--language auto|en|fr|…` fixes or frees the decode language for one run.
 - `--glossary FILE` adds a local UTF-8 word list as a decoding hint.
 
 ## History
@@ -377,8 +374,8 @@ History copies are separate.
   busy for longer than that would paste your previous clipboard. A clipboard
   tool that ignores the markers can also keep its own copy of the dictation.
   Use Type for such setups.
-- Tk windows do not reorder right-to-left text: Hebrew in the Correct window
-  may display in visual order, although it is saved correctly.
+- Tk windows do not reorder right-to-left text: Arabic or Hebrew in the
+  Correct window may display in visual order, although it is saved correctly.
 - A console run ends immediately when its window is closed; an unfinished
   dictation is lost. Prefer Ctrl-C or the tray's Quit.
 - A failed CUDA attempt adds a few seconds to startup before the CPU fallback.
@@ -435,7 +432,7 @@ registry key (no personal data, no real login entry):
 | Ctrl-C / Ctrl-Break, console and `--tray`, CUDA and forced CPU | Exit 0 every time; no leftover process |
 | Tray Restart | First process exits 0; the relaunched pythonw copy starts listening, then quits cleanly |
 | pythonw launcher (the Start Menu shortcut's command) | Listening in about 6 s with the given data and model folders |
-| Paste with delayed rendering, private window station | The reading app got the text (Hebrew included); clipboard restored; the session's own clipboard untouched |
+| Paste with delayed rendering, private window station | The reading app got the text (non-Latin text included); clipboard restored; the session's own clipboard untouched |
 | `-Uninstall`, `-Uninstall -RemoveData` | Shortcut, login entry and created venv removed; data kept unless asked |
 
 These checks use synthetic audio, simulated key events and programmatic menu

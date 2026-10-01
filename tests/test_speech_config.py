@@ -24,21 +24,18 @@ from speech_config import (
 
 
 class SpeechConfigTests(unittest.TestCase):
-    def test_profiles_have_expected_hebrew_repositories(self) -> None:
-        self.assertEqual(
-            resolve_speech_config("hebrew-turbo").model_repo,
-            "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
-        )
-        quality = resolve_speech_config("hebrew-quality")
-        self.assertEqual(quality.model_repo, "mlx-community/ivrit-ai-whisper-large-v3-mlx")
-        self.assertEqual(quality.language, "he")
+    def test_built_in_profiles_favour_no_language_besides_english(self) -> None:
+        import speech_config
+        self.assertEqual(resolve_speech_config("auto").model_repo, "mlx-community/whisper-large-v3-turbo")
         self.assertIsNone(resolve_speech_config("auto").language)
+        self.assertEqual(set(speech_config.MODEL_PROFILES), {"auto", "nemotron-en", "parakeet"})
+        self.assertEqual(speech_config.automatic_languages(), ("en",))
 
     def test_model_and_language_overrides_win(self) -> None:
-        config = resolve_speech_config("hebrew-quality", model="local/model", language="en")
+        config = resolve_speech_config("auto", model="local/model", language="en")
         self.assertEqual(config.model_repo, "local/model")
         self.assertEqual(config.language, "en")
-        self.assertIsNone(resolve_speech_config("hebrew-turbo", language="auto").language)
+        self.assertIsNone(resolve_speech_config("auto", language="auto").language)
 
     def test_invalid_profile_or_language_fails(self) -> None:
         with self.assertRaises(ValueError):

@@ -22,9 +22,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.load(self.path), settings.DEFAULTS)
 
     def test_save_validates_persists_privately_and_merges(self):
-        result = settings.save({"trigger": "right-cmd", "languages": ["EN", "he", "en", "x1"]}, self.path)
+        result = settings.save({"trigger": "right-cmd", "languages": ["EN", "pt", "en", "x1"]}, self.path)
         self.assertEqual(result["trigger"], "right-cmd")
-        self.assertEqual(result["languages"], ["en", "he"])
+        self.assertEqual(result["languages"], ["en", "pt"])
         settings.save({"insert_mode": "type"}, self.path)
         loaded = settings.load(self.path)
         self.assertEqual((loaded["trigger"], loaded["insert_mode"]), ("right-cmd", "type"))
