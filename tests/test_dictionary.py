@@ -26,7 +26,7 @@ class ParseTests(unittest.TestCase):
 
 class ApplyTests(unittest.TestCase):
     rules = [Rule("whisper flow", "Wispr Flow"), Rule("open ai", "OpenAI"),
-             Rule("open ai codex", "OpenAI Codex"), Rule("gonna", "going to"), Rule("שלום", "Shalom")]
+             Rule("open ai codex", "OpenAI Codex"), Rule("gonna", "going to"), Rule("привет", "Privet")]
 
     def test_case_insensitive_whole_word_and_whitespace_tolerant(self):
         text, receipt = dictionary.apply("I tried whisper  FLOW today, whisper flowing is not it.", self.rules)
@@ -48,7 +48,7 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(dictionary.apply("die STRAßE und STRASSE", rules)[0], "die Street und Avenue")  # a capital stays a capital
 
     def test_non_latin_words_and_no_rules(self):
-        self.assertEqual(dictionary.apply("אמרתי שלום לכולם", self.rules)[0], "אמרתי Shalom לכולם")
+        self.assertEqual(dictionary.apply("я сказал привет всем", self.rules)[0], "я сказал Privet всем")
         self.assertEqual(dictionary.apply("unchanged", []), ("unchanged", []))
         self.assertEqual(dictionary.apply("", self.rules), ("", []))
 

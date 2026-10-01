@@ -165,7 +165,7 @@ def _eligible(rows: list[dict[str, Any]], split: str) -> list[tuple[str,str,str,
         if not all(isinstance(x,str) and x for x in (ref,speaker,audio_id)) or speaker.casefold() in {"none","unknown"} or canonical is None: continue
         # Preserve the canonical Unicode reference verbatim (apart from
         # deterministic Unicode/whitespace normalization).  The old ASCII
-        # tokenizer could turn ``hello שלום`` into ``hello``, allowing both
+        # tokenizer could turn ``hello 世界`` into ``hello``, allowing both
         # teachers to omit the risky word and still pass reference matching.
         unicode_ref=" ".join(unicodedata.normalize("NFKC",ref).split())
         # Match the consensus canonicalizer for ordinary ASCII, while keeping

@@ -19,7 +19,7 @@ class ParakeetConfigTests(unittest.TestCase):
     def test_engine_profile_pin_and_language_policy(self):
         self.assertIn("parakeet", speech_config.ENGINE_CHOICES)
         self.assertRegex(MODEL_REVISIONS[REPO], r"^[0-9a-f]{40}$")
-        config = resolve_speech_config("parakeet", language="he")
+        config = resolve_speech_config("parakeet", language="pt")
         self.assertEqual((config.profile.backend, config.language), ("parakeet", None))
         self.assertIsNone(with_language(config, "en").language)
         with self.assertRaises(ValueError):

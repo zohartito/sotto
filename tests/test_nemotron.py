@@ -57,7 +57,7 @@ class NemotronTests(unittest.TestCase):
         self.assertEqual(resolve_speech_config().profile.backend, "whisper")
         config = resolve_speech_config("nemotron-en")
         self.assertEqual((config.profile.backend, config.language), ("nemotron", "en"))
-        for language in ("he", "auto"):
+        for language in ("pt", "auto"):
             with self.assertRaises(ValueError):
                 resolve_speech_config("nemotron-en", language=language)
             with self.assertRaises(ValueError):
@@ -83,7 +83,7 @@ class NemotronTests(unittest.TestCase):
                                (["--adaptive"], "auto"), (["--model", "custom"], "auto")):
             with self.subTest(args=args), patch("sys.argv", ["sotto.py", *args]), \
                     patch("speech_config.load_engine_mode", return_value="nemotron"), \
-                    patch("speech_config.load_language_mode", return_value="he"), \
+                    patch("speech_config.load_language_mode", return_value="pt"), \
                     patch.object(sotto, "run") as run:
                 sotto.main()
                 self.assertEqual(run.call_args.kwargs["speech_config"].profile.name, expected)

@@ -78,7 +78,7 @@ class DeliveryLogicTest(unittest.TestCase):
 
     def test_windows_spacing_matches_the_shared_rule_with_unknown_context(self):
         import win_inject
-        for text in ("Hi", "Hi ", "", "שלום", "end.\n"):
+        for text in ("Hi", "Hi ", "", "Γεια", "end.\n"):
             for spacing in ("smart", "trailing", "none"):
                 self.assertEqual(win_inject.spaced(text, spacing),
                                  sotto.compose_insertion(text, spacing, None), (text, spacing))
@@ -95,9 +95,9 @@ class DeliveryLogicTest(unittest.TestCase):
                              sotto.choose_language(probabilities, allowed), (probabilities, allowed))
 
     def test_detected_language_moves_into_preprocessing_like_the_mac(self):
-        metadata, preprocessing = {"detected_language": "he", "profile": "auto"}, {}
+        metadata, preprocessing = {"detected_language": "pt", "profile": "auto"}, {}
         sotto_win.move_detected_language(metadata, preprocessing)
-        self.assertEqual((metadata, preprocessing), ({"profile": "auto"}, {"detected_language": "he"}))
+        self.assertEqual((metadata, preprocessing), ({"profile": "auto"}, {"detected_language": "pt"}))
 
     def test_screen_keeps_back_empty_and_looping_output_and_salvages_a_prefix(self):
         self.assertEqual(sotto_win.screen_transcript("", 1.0, 1.0, {}),
@@ -327,7 +327,7 @@ class RunPipelineTest(unittest.TestCase):
         delivered, hooks, boundaries, logs, delivered_while_held, rows_at_delivery = [], [], [], [], [], []
         whisper_calls: list = []
         FakeWhisper, FakeCapture, FakeHook = _app_fakes(rate, captures, replies, hooks, whisper_calls)
-        saved = dict(user_settings.DEFAULTS, insert_mode="type", spacing="none", languages=["he", "en"])
+        saved = dict(user_settings.DEFAULTS, insert_mode="type", spacing="none", languages=["pt", "en"])
 
         class RecordingBoundary(sotto.ShutdownBoundary):
             def __init__(self):
@@ -399,7 +399,7 @@ class RunPipelineTest(unittest.TestCase):
         self.assertEqual(valid["preprocessing"]["dictionary"], {
             "rules": [{"heard": "hello world", "write": "Hello, World", "count": 1}],
             "asr_text": "hello world"})
-        self.assertEqual(valid["preprocessing"]["detected_language"], "he")
+        self.assertEqual(valid["preprocessing"]["detected_language"], "pt")
         latency = valid["latency"]["release_to_text_seconds"]
         self.assertGreaterEqual(latency, 0.0)
         self.assertLess(latency, 30.0)
@@ -412,7 +412,7 @@ class RunPipelineTest(unittest.TestCase):
         # warmup + the three voiced captures; the all-zero capture never reached the model
         self.assertEqual(len(whisper_calls), 4)
         self.assertTrue(all(np.any(samples) for samples, _ in whisper_calls[1:]))
-        self.assertTrue(all(kwargs["allowed_languages"] == ("he", "en") for _, kwargs in whisper_calls))
+        self.assertTrue(all(kwargs["allowed_languages"] == ("pt", "en") for _, kwargs in whisper_calls))
         self.assertEqual((FakeCapture.opened, FakeCapture.closed), (4, 4))
         self.assertGreaterEqual(FakeCapture.shutdowns, 1)
         self.assertTrue(hooks[0].stopped)
@@ -718,7 +718,7 @@ class IsolatedCliTest(unittest.TestCase):
             "ids = []\n"
             "for i in range(3):\n"
             "    samples = (np.sin(np.arange(16000) / 7) * 0.1).astype(np.float32)\n"
-            "    text = '\\u05e9\\u05dc\\u05d5\\u05dd' if i == 2 else f'entry {i}'\n"
+            "    text = '\\u3053\\u3093\\u306b\\u3061\\u306f' if i == 2 else f'entry {i}'\n"
             "    row = coordinator.append_live(text, prepare_canonical(samples), 1.0, 'm', ts=1.0 + i,\n"
             "        raw_samples=samples, raw_sample_rate=16000, provenance='live', adaptive=False)\n"
             "    ids.append(row['id'])\n"
@@ -732,7 +732,7 @@ class IsolatedCliTest(unittest.TestCase):
         listed = self._run("history")
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertEqual([line.split()[0] for line in listed.stdout.splitlines()], ids[::-1])
-        self.assertIn("שלום", listed.stdout)  # Hebrew, UTF-8 even through a pipe
+        self.assertIn("こんにちは", listed.stdout)  # Japanese, UTF-8 even through a pipe
 
         deleted = self._run("history-delete", "--id", ids[0])
         self.assertEqual(deleted.returncode, 0, deleted.stderr)

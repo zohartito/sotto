@@ -374,8 +374,8 @@ History copies are separate.
   busy for longer than that would paste your previous clipboard. A clipboard
   tool that ignores the markers can also keep its own copy of the dictation.
   Use Type for such setups.
-- Tk windows do not reorder right-to-left text: Arabic or Hebrew in the
-  Correct window may display in visual order, although it is saved correctly.
+- Tk windows do not reorder right-to-left text: in the Correct window it
+  may display in visual order, although it is saved correctly.
 - A console run ends immediately when its window is closed; an unfinished
   dictation is lost. Prefer Ctrl-C or the tray's Quit.
 - A failed CUDA attempt adds a few seconds to startup before the CPU fallback.

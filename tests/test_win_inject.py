@@ -352,7 +352,7 @@ def spawn(watch):
 
 
 paster = win_inject.ClipboardPaster(clipboard, send=app_reads, render_wait=30, grace=0.05, spawn=spawn)
-text = "dictated שלום "
+text = "dictated こんにちは "
 assert paster.paste(text)
 assert restored.wait(20), "no restore after the app read the text"
 assert read["text"] == text, read

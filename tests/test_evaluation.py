@@ -16,18 +16,18 @@ from evaluation import (
 
 
 class EvaluationTests(unittest.TestCase):
-    def test_english_and_hebrew_word_and_character_error_rate(self) -> None:
+    def test_english_and_non_latin_word_and_character_error_rate(self) -> None:
         self.assertEqual(word_error_rate("Hello, world!", "hello world"), 0)
         self.assertEqual(character_error_rate("Hello", "hello"), 0)
-        self.assertEqual(word_error_rate("שלום עולם", "שלום עלם"), 0.5)
-        self.assertGreater(character_error_rate("שלום", "שלו"), 0)
+        self.assertEqual(word_error_rate("γεια κόσμε", "γεια κόσμ"), 0.5)
+        self.assertGreater(character_error_rate("γεια", "γει"), 0)
 
     def test_terms_and_numbers(self) -> None:
         accuracy, matched, total = required_term_accuracy(
-            "Sotto met in תל אביב", ["Sotto", "תל אביב", "missing"]
+            "Sotto met in الدار البيضاء", ["Sotto", "الدار البيضاء", "missing"]
         )
         self.assertEqual((accuracy, matched, total), (2 / 3, 2, 3))
-        numeric, matched_numbers, total_numbers = numeric_token_accuracy("יש 12 תפוחים ו-3 אגסים", "יש 12 תפוחים")
+        numeric, matched_numbers, total_numbers = numeric_token_accuracy("έχω 12 μήλα και 3 αχλάδια", "έχω 12 μήλα")
         self.assertEqual((numeric, matched_numbers, total_numbers), (0.5, 1, 2))
 
     def test_empty_reference_is_explicitly_unscored(self) -> None:
@@ -39,12 +39,12 @@ class EvaluationTests(unittest.TestCase):
     def test_slices_have_counts_and_low_count_flags(self) -> None:
         rows = [
             evaluate_sample("hello", "hello", sample_id="1", language="en", tags=("short",)),
-            evaluate_sample("שלום", "שלום", sample_id="2", language="he", tags=("short", "hebrew")),
+            evaluate_sample("γεια", "γεια", sample_id="2", language="el", tags=("short", "greek")),
         ]
         report = aggregate_results(rows)
         self.assertEqual(report["overall"]["count"], 2)
         self.assertTrue(report["overall"]["low_count"])
-        self.assertEqual(report["by_language"]["he"]["count"], 1)
+        self.assertEqual(report["by_language"]["el"]["count"], 1)
         self.assertTrue(report["by_tag"]["short"]["directional"])
 
     def test_exact_paired_bootstrap_and_fixed_holm_family(self) -> None:

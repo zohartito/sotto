@@ -47,18 +47,18 @@ class SpeechConfigTests(unittest.TestCase):
 
     def test_language_modes_change_only_the_decode_hint(self) -> None:
         config = resolve_speech_config("auto", language="auto")
-        hebrew = with_language(config, "he")
+        hinted = with_language(config, "pt")
         self.assertEqual(language_mode(config.language), "auto")
-        self.assertEqual(hebrew.language, "he")
-        self.assertEqual(hebrew.model_repo, config.model_repo)
+        self.assertEqual(hinted.language, "pt")
+        self.assertEqual(hinted.model_repo, config.model_repo)
         self.assertEqual(with_language(config, "en").language, "en")
 
     def test_language_preference_is_private_atomic_and_fails_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private" / "language-mode"
             self.assertEqual(load_language_mode(path), "auto")
-            self.assertEqual(save_language_mode("he", path), "he")
-            self.assertEqual(load_language_mode(path), "he")
+            self.assertEqual(save_language_mode("pt", path), "pt")
+            self.assertEqual(load_language_mode(path), "pt")
             if sys.platform == "win32":
                 # Windows chmod only supports the read-only bit, so the
                 # 0o600 tightening is a no-op; assert what still matters.
@@ -72,8 +72,8 @@ class SpeechConfigTests(unittest.TestCase):
     def test_text_glossary_deduplicates_and_skips_comments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "terms.txt"
-            path.write_text("# comment\n Sotto \n\nשלום\nSotto\n", encoding="utf-8")
-            self.assertEqual(load_glossary(path), ("Sotto", "שלום"))
+            path.write_text("# comment\n Sotto \n\n東京\nSotto\n", encoding="utf-8")
+            self.assertEqual(load_glossary(path), ("Sotto", "東京"))
 
     def test_json_glossary_and_bounds_are_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -85,7 +85,7 @@ class SpeechConfigTests(unittest.TestCase):
             self.assertLessEqual(len(", ".join(terms)), MAX_GLOSSARY_CHARACTERS)
 
     def test_long_capture_disables_prompt_with_reason(self) -> None:
-        prompt = glossary_prompt(("Sotto", "תל אביב"), GLOSSARY_MAX_CAPTURE_SECONDS + 0.01)
+        prompt = glossary_prompt(("Sotto", "الدار البيضاء"), GLOSSARY_MAX_CAPTURE_SECONDS + 0.01)
         self.assertIsNone(prompt.prompt)
         self.assertIn("exceeds", prompt.reason or "")
         enabled = glossary_prompt(("Sotto",), 30)

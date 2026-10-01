@@ -60,11 +60,11 @@ unbounded instruction.
 # sotto-glossary.txt
 Sotto
 PyObjC
-זוהר
+MLX
 ```
 
 ```json
-["Sotto", "PyObjC", "זוהר"]
+["Sotto", "PyObjC", "MLX"]
 ```
 
 The glossary is supplied as an initial prompt only for captures of **30

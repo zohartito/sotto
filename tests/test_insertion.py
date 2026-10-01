@@ -15,7 +15,7 @@ class ComposeInsertionTests(unittest.TestCase):
         self.assertEqual(compose("world.", "smart", "("), "world.")
         self.assertEqual(compose("world.", "smart", "\n"), "world.")
         self.assertEqual(compose(", then", "smart", "o"), ", then")     # punctuation attaches
-        self.assertEqual(compose("שלום", "smart", "a"), " שלום")
+        self.assertEqual(compose("Γεια", "smart", "a"), " Γεια")
 
     def test_unknown_context_and_other_modes(self):
         compose = sotto.compose_insertion
