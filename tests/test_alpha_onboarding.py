@@ -79,6 +79,7 @@ class RestartTests(unittest.TestCase):
             execute.assert_called_once_with(sys.executable, [sys.executable, *argv])
             launchctl.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Sotto.app is macOS-only')
     def test_sotto_app_restarts_as_a_fresh_process_never_in_place(self):
         restart = controller()
         env = {'SOTTO_LAUNCHER': 'app', 'SOTTO_APP_EXECUTABLE': '/Applications/Sotto.app/Contents/MacOS/Sotto'}

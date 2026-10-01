@@ -332,7 +332,7 @@ class OnePassModel:
         return ("encoder-output", len(self.encodes))
 
     def detect_language(self, encoder_output):  # ctranslate2.models.Whisper.detect_language
-        return [[("<|fr|>", 0.6), ("<|he|>", 0.3), ("<|en|>", 0.1)]]
+        return [[("<|fr|>", 0.6), ("<|pt|>", 0.3), ("<|en|>", 0.1)]]
 
     def transcribe(self, samples, **options):
         from faster_whisper.audio import pad_or_trim
