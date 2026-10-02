@@ -120,7 +120,7 @@ class MenuTest(unittest.TestCase):
         self.app.controller = self.controller
         menu = self.by_text(self.app.items())
         for name in ("Start dictation (hands-free)", "History", "Language", "Speed", "Progress",
-                     "Dictionary", "Settings…", "Restart", "Quit"):
+                     "Dictionary", "Settings…", "Check for updates…", "Restart", "Quit"):
             self.assertIn(name, menu)
         self.assertTrue(menu["Settings…"].default)
         history = self.by_text(menu["History"].submenu.items)

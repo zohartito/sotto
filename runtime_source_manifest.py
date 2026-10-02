@@ -36,6 +36,7 @@ RUNTIME_SOURCE_FILES = (
     "settings_window.py",
     "progress.py",
     "login_item.py",
+    "updates.py",
     "launchd_templates.py",
     "audio_codec.py",
     "comparator_spool.py",

@@ -526,6 +526,28 @@ class Controller:
         threading.Thread(target=when_idle, daemon=True).start()
         return "Restarting after the current dictation…"
 
+    def check_updates(self):
+        """Compare this checkout with GitHub; only when the user asks."""
+        import updates
+        from offline_runtime import offline_requested
+        return updates.check(Path(__file__).resolve().parent, offline=offline_requested())
+
+    def update_and_restart(self) -> str:
+        """Hand the update to scripts/update-windows.ps1: Windows keeps a
+        running Python's files in use, so it waits for Sotto to quit, updates,
+        and starts Sotto again."""
+        if self.busy():
+            return "Finish the current dictation first, then update."
+        root = Path(__file__).resolve().parent
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+                          "-File", str(root / "scripts" / "update-windows.ps1"),
+                          "-DataDir", str(DATA_DIR), "-VenvDir", sys.prefix],
+                         close_fds=True, creationflags=flags, cwd=str(root))
+        log("● updating Sotto; it restarts when the update is done")
+        self.quit()
+        return "Updating — Sotto restarts when it is done."
+
     def quit(self) -> None:
         self.restart_requested = False
         self.shutdown.request()

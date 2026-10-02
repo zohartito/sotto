@@ -97,6 +97,20 @@ def icon_image(state: str):
     return image
 
 
+def update_report(data_dir=None) -> str | None:
+    """The outcome of the last tray update, reported once at the next start."""
+    from pathlib import Path
+    from sotto_paths import DATA_DIR
+    path = Path(data_dir or DATA_DIR) / "update-status.txt"
+    try:
+        line = path.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    path.unlink(missing_ok=True)
+    if line.startswith("ok"):
+        return f"Sotto updated ({line[2:].strip()})."
+    return "Update failed: " + line.removeprefix("failed").strip()
+
 class DialogHost:
     """Every Tk window on one thread, created on first use and stopped once."""
 
@@ -224,7 +238,9 @@ class TrayApp:
     def attach(self, controller) -> None:
         self.controller = controller
         self.set_state("idle")
-        self.notify(f"Ready — hold {win_hotkey.label(controller.hook.trigger)} to dictate.")
+        ready = f"Ready — hold {win_hotkey.label(controller.hook.trigger)} to dictate."
+        report = update_report()
+        self.notify(f"{report} {ready}" if report else ready)
 
     # state -------------------------------------------------------------------
     def _image(self, state: str):
@@ -310,6 +326,7 @@ class TrayApp:
         yield Item("Dictionary", self._act(controller.open_dictionary))
         yield Item("Settings…", self._dialog(self.settings_dialog), default=True)
         yield Menu.SEPARATOR
+        yield Item("Check for updates…", self._act(self._check_updates))
         yield Item("Restart", self._act(controller.restart))
         yield Item("Quit", lambda icon, item: controller.quit())
 
@@ -364,6 +381,28 @@ class TrayApp:
         window.after(300, lambda: window.attributes("-topmost", False))
         window.after(50, window.focus_force)
         return window
+
+    def _check_updates(self) -> None:
+        result = self.controller.check_updates()
+        self.dialogs.call(lambda root: self.update_dialog(root, result))
+
+    def update_dialog(self, root, result) -> None:
+        from tkinter import messagebox
+        import updates
+        title, text = updates.describe(
+            result, "run git pull, then scripts\\install-windows.ps1, from the Sotto folder.")
+        if result.state == "available":
+            if messagebox.askyesno(title, text, parent=root):
+                self._act(self.controller.update_and_restart)(None, None)
+        elif result.state == "not-git":
+            if messagebox.askyesno("Download the latest release",
+                                   f"{result.detail}\n\nOpen the releases page?", parent=root):
+                import webbrowser
+                webbrowser.open(updates.RELEASES_URL)
+        elif result.state == "failed":
+            messagebox.showerror(title, text, parent=root)
+        else:
+            messagebox.showinfo(title, text, parent=root)
 
     def confirm_clear(self, root) -> None:
         from tkinter import messagebox

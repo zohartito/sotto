@@ -242,6 +242,9 @@ class _MenuTarget(AppKit.NSObject):
     def openSettings_(self, _sender):
         self.callbacks["open_settings"]()
 
+    def checkUpdates_(self, _sender):
+        self.callbacks["check_updates"]()
+
 
 def init_app() -> "StatusUI":
     app = AppKit.NSApplication.sharedApplication()
@@ -343,6 +346,7 @@ class StatusUI:
         for label, selector, key in (("Start dictation (hands-free)", "startNow:", ""),
                                      ("Finish recording now", "finishNow:", ""),
                                      ("Settings…", "openSettings:", ","),
+                                     ("Check for Updates…", "checkUpdates:", ""),
                                      ("Restart sotto", "restart:", ""),
                                      ("Quit sotto", "quit:", "")):
             item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -627,6 +631,16 @@ class StatusUI:
         """Show a native informational alert. Call this method on the main thread.
         Not logged: an info message can quote dictated text."""
         self._alert(AppKit.NSAlertStyleInformational, title, message)
+
+    def ask(self, title: str, message: str, yes: str, no: str) -> bool:
+        """A two-button question on the main thread; True for the first button."""
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_(yes)
+        alert.addButtonWithTitle_(no)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        return alert.runModal() == AppKit.NSAlertFirstButtonReturn
 
     @staticmethod
     def _alert(style, title: str, message: str) -> None:

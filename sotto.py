@@ -3448,6 +3448,62 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 settings_view["controller"] = SettingsController.alloc().initWithModel_(SettingsModel())
             settings_view["controller"].show()
 
+        update_state = {"running": False}
+
+        def action_apply_update() -> None:
+            """Update this checkout with the installer, then restart into it."""
+            if update_state["running"]:
+                return
+            if capture.is_active() or jobs.unfinished_tasks:
+                ui_call(status_ui.show_error, "Finish dictation first",
+                        "Update after the current recording and transcription finish.")
+                return
+            update_state["running"] = True
+            log("● updating Sotto")
+
+            def work() -> None:
+                import updates
+                from sotto_paths import DATA_DIR
+                ok, tail = updates.apply_mac(Path(__file__).resolve().parent, sys.executable,
+                                             DATA_DIR / "logs" / "update.log")
+                update_state["running"] = False
+                if ok:
+                    log("✓ update installed — restarting")
+                    action_restart()
+                else:
+                    log("! update failed (see logs/update.log)")
+                    ui_call(status_ui.show_error, "Update failed",
+                            f"{tail}\n\nSotto keeps running the current version. "
+                            "Details are in logs/update.log in the data folder.")
+            threading.Thread(target=work, daemon=True).start()
+
+        def action_check_updates() -> None:
+            """Contact GitHub only now, because the user asked."""
+            def work() -> None:
+                import updates
+                from offline_runtime import offline_requested
+                result = updates.check(Path(__file__).resolve().parent, offline=offline_requested())
+                log(f"update check: {result.state}" + (f", {result.behind} behind" if result.behind else ""))
+
+                def present() -> None:
+                    title, text = updates.describe(
+                        result, "run scripts/install-mac.sh --update in Terminal from the Sotto folder.")
+                    if result.state == "available":
+                        if status_ui.ask(title, text, "Update Now", "Later"):
+                            action_apply_update()
+                    elif result.state == "not-git":
+                        if status_ui.ask("Download the latest release", result.detail,
+                                         "Open Releases Page", "Close"):
+                            import AppKit
+                            AppKit.NSWorkspace.sharedWorkspace().openURL_(
+                                AppKit.NSURL.URLWithString_(updates.RELEASES_URL))
+                    elif result.state == "failed":
+                        status_ui.show_error(title, text)
+                    else:
+                        status_ui.show_info(title, text)
+                ui_call(present)
+            threading.Thread(target=work, daemon=True).start()
+
         status_ui.set_history_callbacks({
             "quit": shutdown.request,
             "restart": only_while_running(action_restart),
@@ -3465,6 +3521,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             "add_rules": only_while_running(action_add_rules),
             "open_dictionary": only_while_running(action_open_dictionary),
             "open_settings": only_while_running(action_open_settings),
+            "check_updates": only_while_running(action_check_updates),
         })
         status_ui.on_wake = lambda: (not shutdown.requested() and
                                      (engine.force_reset(), Quartz.CGEventTapEnable(tap, True)))
