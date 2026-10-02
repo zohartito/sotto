@@ -127,8 +127,13 @@ def totals_line(totals: dict) -> str | None:
     if not totals["dictations"]:
         return None
     minutes = saved_minutes(totals)
-    saved = f"{minutes / 60:.1f} hours" if minutes >= 60 else f"{round(minutes)} minute{'' if round(minutes) == 1 else 's'}"
-    return f"All time: {totals['words']:,} words · about {saved} saved vs typing at {TYPING_WPM} wpm"
+    if minutes >= 60:
+        saved = f"about {minutes / 60:.1f} hours"
+    elif minutes >= 1:
+        saved = f"about {round(minutes)} minute{'' if round(minutes) == 1 else 's'}"
+    else:
+        saved = "less than a minute"
+    return f"All time: {totals['words']:,} words · {saved} saved vs typing at {TYPING_WPM} wpm"
 
 
 def lines(summary: dict, totals: dict | None = None) -> list[str]:

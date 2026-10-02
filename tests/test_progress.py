@@ -69,7 +69,8 @@ class LifetimeTotalsTests(unittest.TestCase):
                    {"text": "   ", "duration": 1.0}]
         self.assertEqual(progress.ensure_totals(self.path, entries),
                          {"dictations": 1, "words": 3, "seconds": 2.0})
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        if os.name == "posix":
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
         self.assertEqual(progress.ensure_totals(self.path, entries * 5)["dictations"], 1)  # only once
         progress.record(self.path, text="four more words here", seconds=3.0)
         self.assertEqual(progress.load_totals(self.path), {"dictations": 2, "words": 7, "seconds": 5.0})
@@ -80,8 +81,10 @@ class LifetimeTotalsTests(unittest.TestCase):
         self.assertAlmostEqual(progress.saved_minutes(totals), 12_400 / 40 - 60)
         self.assertEqual(progress.totals_line(totals),
                          "All time: 12,400 words · about 4.2 hours saved vs typing at 40 wpm")
-        self.assertEqual(progress.totals_line({"dictations": 2, "words": 30, "seconds": 10.0}),
-                         "All time: 30 words · about 1 minute saved vs typing at 40 wpm")
+        self.assertEqual(progress.totals_line({"dictations": 2, "words": 60, "seconds": 10.0}),
+                         "All time: 60 words · about 1 minute saved vs typing at 40 wpm")
+        self.assertEqual(progress.totals_line({"dictations": 1, "words": 3, "seconds": 1.0}),
+                         "All time: 3 words · less than a minute saved vs typing at 40 wpm")
         self.assertIsNone(progress.totals_line({"dictations": 0, "words": 0, "seconds": 0.0}))
         self.assertEqual(progress.saved_minutes({"dictations": 1, "words": 2, "seconds": 600.0}), 0.0)
         lines = progress.lines(progress.summarize([], rules=0, now=NOW), totals)

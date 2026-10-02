@@ -548,7 +548,8 @@ class ControllerTest(unittest.TestCase):
                          ("left-shift", "fast", True))
         self.assertEqual(results["language"], ("fr", "fr"))
         # The shared progress summary (the Mac's wording), from local History.
-        self.assertTrue(results["progress"][0].startswith("Last 7 days: 1 dictation · ready "),
+        self.assertTrue(results["progress"][0].startswith("All time: "), results["progress"])
+        self.assertTrue(results["progress"][1].startswith("Last 7 days: 1 dictation · ready "),
                         results["progress"])
         self.assertIn("Dictionary: 2 rules · fixed 1 word this period", results["progress"])
         self.assertIn("Corrections saved: 1 · in learning set: 0", results["progress"])
