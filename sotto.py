@@ -451,6 +451,29 @@ def microphone_permission(*, request: bool = False) -> bool:
     return False
 
 
+def totals_path():
+    import progress
+    from sotto_paths import DATA_DIR
+    return DATA_DIR / progress.TOTALS_NAME
+
+
+def record_totals(text: str, seconds: float) -> None:
+    """Lifetime counts for Your progress: words and seconds, never text."""
+    import progress
+    try:
+        progress.record(totals_path(), text=text, seconds=seconds)
+    except OSError as exc:
+        log(f"! progress totals not saved ({type(exc).__name__})")
+
+
+def seed_totals(store) -> None:
+    import progress
+    try:
+        progress.ensure_totals(totals_path(), store.entries(limit=HISTORY_KEEP))
+    except OSError as exc:
+        log(f"! progress totals not started ({type(exc).__name__})")
+
+
 def apply_voice_cleanup(text: str, preprocessing: dict, language: str | None) -> tuple[str, str | None]:
     """English voice commands and filler removal, after the dictionary. Returns
     the text to deliver and an action ("scratch" undoes the last dictation)."""
@@ -2337,6 +2360,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     store = HistoryStore()
     learning_store = LearningStore()
     coordinator = LearningCoordinator(store, learning_store)
+    seed_totals(store)
     # Always available, no-model dependency guard: an earlier adaptive session
     # must remain revocation-safe even when this launch is non-adaptive.
     from adaptive_learning import AdaptiveLearning
@@ -2666,6 +2690,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                 if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
                                 raise
                         publication_adopted = (appended_row is not None and not shutdown.requested())
+                        if appended_row is not None and text and not reason and voice_action is None:
+                            record_totals(text, len(raw) / max(native_rate, 1.0))
                         refresh_history()
                     elif adaptive_runtime is not None:
                         # No History append adopted this pre-publication WAV.

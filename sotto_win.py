@@ -496,7 +496,8 @@ class Controller:
     def progress(self) -> list[str]:
         entries = self.store.entries(limit=self.store.keep)
         rules = len(dictionary.load(dictionary.DICTIONARY_PATH))
-        return progress.lines(progress.summarize(entries, rules=rules))
+        return progress.lines(progress.summarize(entries, rules=rules),
+                              progress.load_totals(sotto.totals_path()))
 
     def open_dictionary(self) -> None:
         path = dictionary.ensure_file(dictionary.DICTIONARY_PATH)
@@ -612,6 +613,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
 
     store = HistoryStore()
     coordinator = LearningCoordinator(store, LearningStore())
+    sotto.seed_totals(store)
     from adaptive_learning import AdaptiveLearning
     # The same always-on revocation guard the Mac menu passes.
     dependency_guard = AdaptiveLearning(store.base_dir)
@@ -754,7 +756,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         if reason:
             log(f"! not pasted ({reason}) — kept in history")
             preprocessing["outcome"] = "suspect"
-        sotto.finalize_primary_live_delivery(
+        appended = sotto.finalize_primary_live_delivery(
             append=lambda: coordinator.append_live(
                 text, prepared, prepared_seconds, model_repo, ts=captured_ts,
                 raw_samples=raw, raw_sample_rate=native_rate,
@@ -763,6 +765,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
             inject=None if reason or not (text or voice_action) else lambda: deliveries.put(
                 (SCRATCH if voice_action == "scratch" else text, prefs, copy_only)))
+        if appended is not None and text and not reason and voice_action is None:
+            sotto.record_totals(text, len(raw) / max(native_rate, 1.0))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
             f"(speech model {elapsed:.2f}s) · {len(text)} chars")
 

@@ -444,7 +444,9 @@ class StatusUI:
             "Your progress", None, "")
         progress_menu = AppKit.NSMenu.alloc().init()
         progress_menu.setAutoenablesItems_(False)
-        for line in progress.lines(progress.summarize(entries, rules=rule_count)):
+        from sotto_paths import DATA_DIR
+        totals = progress.load_totals(DATA_DIR / progress.TOTALS_NAME)
+        for line in progress.lines(progress.summarize(entries, rules=rule_count), totals):
             info = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(line, None, "")
             info.setEnabled_(False)
             progress_menu.addItem_(info)
