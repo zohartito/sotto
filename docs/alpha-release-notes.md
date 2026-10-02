@@ -20,7 +20,11 @@ computer; there is no account, cloud service or telemetry.
   about 30 ms with Nemotron.
 - **Learns your spellings.** Correct a transcript in History and Sotto offers
   the change as a dictionary rule for every later dictation. A glossary helps
-  Whisper hear names and terms. **Your progress** shows what it has learned.
+  Whisper hear names and terms. **Your progress** shows what it has learned and
+  your all-time words and time saved versus typing.
+- **Voice commands (English).** "New line", "new paragraph" and "scratch that"
+  (undo the last dictation); um/uh fillers removed. Both can be switched off.
+- **Live words.** With Nemotron, the pill shows your words as you speak.
 - **History.** Copy, Retry, Correct and Delete recent dictations; audio stays on
   your computer.
 - **Careful output.** Paste (clipboard put back) or type; smart spacing; the
@@ -32,13 +36,13 @@ computer; there is no account, cloud service or telemetry.
 ## Install
 
 Mac — Apple Silicon, macOS 14 or later, Python 3.12 and Apple's command line
-tools (`xcode-select --install`):
+tools (`xcode-select --install`). One line in Terminal:
 
 ```bash
-git clone https://github.com/zohartito/sotto.git
-cd sotto
-scripts/install-mac.sh
+curl -fsSL https://raw.githubusercontent.com/zohartito/sotto/main/scripts/get.sh | bash
 ```
+
+or clone it yourself and run `scripts/install-mac.sh`.
 
 The script installs the pinned dependencies, downloads the speech model once
 (about 1.6 GB, pinned to an exact revision) and builds Sotto.app in
@@ -46,9 +50,10 @@ Applications. Open it, allow the Microphone and turn Sotto on under Privacy &
 Security → Accessibility. Update later with **Check for Updates…** in Sotto's
 menu (or `scripts/install-mac.sh --update`).
 
-Windows — Windows 10/11 x64 with 64-bit Python 3.13: clone the repository and
-run `powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1`, then
-start Sotto from the Start menu. Details: [windows-alpha.md](windows-alpha.md).
+Windows — Windows 10/11 x64 with Git and 64-bit Python 3.13. One line in
+PowerShell: `irm https://raw.githubusercontent.com/zohartito/sotto/main/scripts/get.ps1 | iex`
+(or clone it and run `scripts\install-windows.ps1`), then start Sotto from the
+Start menu. Details: [windows-alpha.md](windows-alpha.md).
 
 The source archive attached to the release is built deterministically from the
 tagged commit; check it with `shasum -a 256` against the published SHA-256.

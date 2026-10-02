@@ -169,6 +169,18 @@ Recent items in the menu offer Copy, Retry, Save audio to Desktop, Delete,
 Correct Transcript and Clear history. Copy lets you recover text when an app
 refuses paste. A correction can explicitly enroll paired audio/reference in a
 local learning corpus; this does not start a worker or enable adaptive routing.
+**Your progress** opens with your all-time total, for example "All time: 12,400
+words · about 4.2 hours saved vs typing at 40 wpm" (counts only, kept in
+`stats.json` in the data folder).
+
+## Voice commands and cleanup (English)
+
+Say **"new line"** or **"new paragraph"** as its own phrase for a line break or a
+blank line ("a new line of products" stays as words). Say **"scratch that"** on
+its own to undo your last dictation with the app's own ⌘Z, within a minute of
+Sotto inserting it. Filler words (um, uh) are removed with the comma around them.
+Both apply to English dictation only and can be switched off under
+**Settings… → Cleanup**; History keeps what the model heard.
 
 ## Dictionary: Sotto learns your spellings
 
@@ -221,7 +233,8 @@ This downloads the pinned NeMo-Speech.cpp 0.1.0 Metal libraries and Q8 model,
 checks SHA-256 values and retains upstream notices under
 `$SOTTO_DATA_DIR/nemotron/0.1.0`. Choose **Speech engine → Nemotron (English
 streaming)** while idle. Audio is decoded during capture; only finalized,
-validated text is pasted after release. Partial text is not pasted. Other
+validated text is pasted after release. While you talk, the pill at the top of
+the screen shows the words so far; only the finished text is pasted. Other
 languages, automatic language detection and Whisper glossary prompts are unavailable.
 Returning to Whisper restores your saved language choice. Native load failure
 falls back to Whisper; it does not turn on adaptive routing.
