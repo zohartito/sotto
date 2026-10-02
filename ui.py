@@ -11,6 +11,7 @@ when coming from the tap, audio, or transcription threads.
 from __future__ import annotations
 
 import math
+import time
 
 import AppKit
 import objc
@@ -20,6 +21,8 @@ from speech_config import LANGUAGE_LABELS, WHISPER_LANGUAGES, automatic_label, a
 
 ISLAND_W, ISLAND_H = 88, 34
 HINT_FONT_SIZE = 12.0   # hands-free "tap … to stop" beside the orb
+LIVE_CHARS = 48         # live words shown beside the orb (the newest end)
+LIVE_REFRESH_S = 0.2
 ORB_SIZE = 19.0
 DECAY = 0.85            # per-push falloff — the orb sinks, never snaps
 EASE_S = 0.14           # animation duration per level change
@@ -83,6 +86,18 @@ def show_adaptive_review_actions(*, adaptive_mode: bool, reviewable: bool) -> bo
 
 def _color(rgb: tuple[float, float, float], alpha: float = 1.0) -> AppKit.NSColor:
     return AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(*rgb, alpha)
+
+
+def live_snippet(text: str, limit: int = LIVE_CHARS) -> str:
+    """The newest end of the live words, cut at a word where possible."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    tail = text[-(limit - 1):]
+    space = tail.find(" ")
+    if 0 <= space < limit // 3:
+        tail = tail[space + 1:]
+    return "…" + tail
 
 
 def use_app_icon(icon_path) -> None:
@@ -176,6 +191,8 @@ class _MenuTarget(AppKit.NSObject):
     def levelTick_(self, _timer):
         if self.ui is not None and self.ui.level_source is not None:
             self.ui.push_level(self.ui.level_source())
+        if self.ui is not None:
+            self.ui.refresh_live_text()
 
     def copyEntry_(self, sender):
         self.callbacks["copy"](sender.representedObject())
@@ -282,6 +299,9 @@ class StatusUI:
         self.level_source = None  # callable() -> rms, polled by a main-thread
         self._level_timer = None  # timer — the audio thread never touches UI
         self._hint = None         # hands-free stop hint, shown beside the orb
+        self.live_text_source = None  # callable() -> words so far (streaming engines)
+        self._live_text = ""
+        self._live_checked = 0.0
         self._panel = self._make_island()
         self._orb = self._make_orb()
 
@@ -683,9 +703,24 @@ class StatusUI:
         if self._mode != "idle":
             self._position()
 
+    def refresh_live_text(self) -> None:
+        """Show the streaming engine's words while recording (display only)."""
+        source = getattr(self, "live_text_source", None)
+        if source is None or self._indicator_state != "recording":
+            return
+        now = time.monotonic()
+        if now - self._live_checked < LIVE_REFRESH_S:
+            return
+        self._live_checked = now
+        text = source() or ""
+        if text != self._live_text:
+            self._live_text = text
+            self._position()
+
     def show_transcribing(self) -> None:
         self._mode = "transcribing"
         self._hint = None
+        self._live_text = ""
         self._indicator_state = "transcribing"
         self._stop_level_timer()
         self._apply_indicator_state()
@@ -698,6 +733,7 @@ class StatusUI:
     def hide(self) -> None:
         self._mode = "idle"
         self._hint = None
+        self._live_text = ""
         self._indicator_state = "idle"
         self._visibility_generation += 1
         self._stop_level_timer()
@@ -878,7 +914,8 @@ class StatusUI:
     def _layout_island(self) -> float:
         """Place the orb (and the hands-free hint) and return the island width.
         Runs on every position, so a rebuilt panel gets the same layout."""
-        hint = getattr(self, "_hint", None)
+        live = getattr(self, "_live_text", "")
+        hint = live_snippet(live) if live else getattr(self, "_hint", None)
         root = self._panel.contentView().layer()
         layer = getattr(self, "_hint_layer", None)
         Quartz.CATransaction.begin()

@@ -251,6 +251,51 @@ class HandsFreeHintTests(unittest.TestCase):
         self.assertEqual(status._orb.position().x, ui.ISLAND_W / 2)
 
 
+class LiveWordsTests(unittest.TestCase):
+    """Streaming engines show words while you talk; only finished text is pasted."""
+
+    def test_stream_reports_finals_and_interim_but_nothing_once_closed(self):
+        from streaming_audio import StreamingCapture
+        capture = StreamingCapture(runtime=None)
+        self.assertEqual(capture.live_text(), "")
+        capture.stream = types.SimpleNamespace(finals=["Hello there."], partial="this is live")
+        self.assertEqual(capture.live_text(), "Hello there. this is live")
+        capture.closed = True
+        self.assertEqual(capture.live_text(), "")
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'AppKit overlay')
+    def test_long_text_keeps_its_newest_end(self):
+        import ui
+        self.assertEqual(ui.live_snippet("short  words"), "short words")
+        long = " ".join(f"word{i}" for i in range(30))
+        snippet = ui.live_snippet(long)
+        self.assertTrue(snippet.startswith("…") and snippet.endswith("word29"))
+        self.assertLessEqual(len(snippet), ui.LIVE_CHARS)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'AppKit overlay')
+    def test_live_words_win_over_the_hint_and_refresh_only_while_recording(self):
+        import ui
+        status = ui.StatusUI.__new__(ui.StatusUI)
+        status._panel = status._make_island()
+        status._orb = status._make_orb()
+        status._hint, status._live_text, status._live_checked = 'tap right ⌘ to stop', '', 0.0
+        status._indicator_state = 'recording'
+        words = iter(['Hello', 'Hello world'])
+        status.live_text_source = lambda: next(words)
+        with patch.object(status, '_position') as position:
+            status.refresh_live_text()
+            status.refresh_live_text()                  # throttled: no second read yet
+            status._live_checked = 0.0
+            status.refresh_live_text()
+        self.assertEqual(position.call_count, 2)
+        self.assertEqual(status._live_text, 'Hello world')
+        status._layout_island()
+        self.assertEqual(status._hint_layer.string(), 'Hello world')
+        status._indicator_state = 'transcribing'
+        status.live_text_source = lambda: self.fail('not read outside recording')
+        status.refresh_live_text()
+
+
 class CaptureShutdownTests(unittest.TestCase):
     def test_shutdown_starts_one_teardown_and_restart_wait_is_bounded(self):
         service = sotto.CaptureService()

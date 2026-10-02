@@ -1376,6 +1376,11 @@ class CaptureService:
         with self._lock:
             return self._active is not None
 
+    def live_text(self) -> str:
+        """The streaming engine's words so far, for display only."""
+        stream = self._stream
+        return stream.live_text() if stream is not None and hasattr(stream, "live_text") else ""
+
     def release_soon(self) -> None:
         """Release the input after key-up without blocking the gesture tap.
 
@@ -2377,6 +2382,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     capture.idle_release_s = idle_release
     if status_ui is not None:
         status_ui.level_source = lambda: capture.latest_rms
+        status_ui.live_text_source = capture.live_text if use_nemotron else None
 
     # Single-flight transcription: one prewarmed worker, strict FIFO — live
     # dictations and retries can never run the model (or the clipboard cycle)

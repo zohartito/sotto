@@ -104,6 +104,14 @@ class StreamingCapture:
                 self.error = exc
                 self._close_stream()
 
+    def live_text(self) -> str:
+        """Words so far (completed results plus the current interim), for the
+        overlay only. Never pasted or logged; finish() decides the text."""
+        stream = self.stream
+        if stream is None or self.closed:
+            return ""
+        return " ".join([*list(stream.finals), stream.partial]).strip()
+
     def finish(self) -> tuple[str, PreparedAudio]:
         if self.closed or self.cancelled.is_set():
             raise RuntimeError("Streaming capture was cancelled")
