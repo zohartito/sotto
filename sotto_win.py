@@ -143,6 +143,10 @@ class DeliveryPrefs:
     languages: tuple[str, ...] = field(default_factory=automatic_languages)
 
 
+SCRATCH = object()  # a delivery that undoes the last dictation instead of inserting
+VK_Z = 0x5A
+
+
 def delivery_prefs(saved: dict) -> DeliveryPrefs:
     return DeliveryPrefs(saved.get("insert_mode", "paste"), saved.get("spacing", "smart"),
                          automatic_languages(saved.get("languages")))
@@ -735,9 +739,12 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                         "asr_seconds": round(elapsed, 4)}})
         prepared_seconds = len(prepared.asr_samples) / sotto.SAMPLE_RATE
         text, reason = screen_transcript(text, prepared_seconds, speech_fraction, preprocessing)
+        voice_action = None
         if not reason:
             # After every guard, never on text kept back (the Mac's rule).
             text = sotto.apply_personal_dictionary(text, preprocessing)
+            text, voice_action = sotto.apply_voice_cleanup(
+                text, preprocessing, preprocessing.get("detected_language") or job_config.language)
         # Key release until the text is ready to insert (the Mac's measure,
         # read by the shared progress summary).
         attempt_metadata["latency"]["release_to_text_seconds"] = round(
@@ -754,7 +761,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                 provenance="live_suspect" if reason else "live", adaptive=False,
                 **attempt_metadata),
             adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
-            inject=None if reason else lambda: deliveries.put((text, prefs, copy_only)))
+            inject=None if reason or not (text or voice_action) else lambda: deliveries.put(
+                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only)))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
             f"(speech model {elapsed:.2f}s) · {len(text)} chars")
 
@@ -940,10 +948,27 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             time.sleep(0.05)
         if shutdown.requested():
             return
+        if text is SCRATCH:
+            undo_last_dictation()
+            return
         try:
             win_inject.deliver(text, mode=prefs.insert_mode, spacing=prefs.spacing, log=log)
+            last_delivery["at"] = time.monotonic()
         except OSError as exc:
             log(f"! not inserted ({str(exc)[:120]}) — kept in history")
+
+    last_delivery = {"at": 0.0}
+
+    def undo_last_dictation() -> None:
+        """'scratch that': the app's own Ctrl+Z, only for a dictation Sotto
+        inserted within the last minute."""
+        import voice_commands
+        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
+            log("  scratch that: nothing recent to undo")
+            return
+        win_inject.send_inputs(win_inject.chord_inputs(win_inject.VK_CONTROL, VK_Z))
+        last_delivery["at"] = 0.0
+        log("↶ scratch that — undid the last dictation")
 
     def copy_instead(text: str) -> None:
         """Finished from the tray: the menu took the focus, so copy instead."""
@@ -962,7 +987,10 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             except queue.Empty:
                 continue
             try:
-                copy_instead(text) if copy_only else insert_one(text, prefs)
+                if copy_only and text is SCRATCH:
+                    pass  # finished from the tray: there is no insertion to undo
+                else:
+                    copy_instead(text) if copy_only else insert_one(text, prefs)
             except Exception as exc:
                 log(f"! not inserted ({str(exc)[:120]}) — kept in history")
             finally:

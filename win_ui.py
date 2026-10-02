@@ -530,6 +530,12 @@ class TrayApp:
 
         insert_mode = radios("Insert text by", INSERT_LABELS, saved["insert_mode"])
         spacing = radios("Spacing after each dictation", SPACING_LABELS, saved["spacing"])
+        box = section("Cleanup (English dictation)")
+        fillers = tk.BooleanVar(window, value=bool(saved["remove_fillers"]))
+        ttk.Checkbutton(box, text="Remove filler words (um, uh)", variable=fillers).pack(anchor="w")
+        commands = tk.BooleanVar(window, value=bool(saved["voice_commands"]))
+        ttk.Checkbutton(box, text="Voice commands: new line, new paragraph, scratch that",
+                        variable=commands).pack(anchor="w")
         speed = radios("Speed (applies after restart)", SPEED_LABELS, saved["speed"])
 
         box = section("General")
@@ -561,7 +567,8 @@ class TrayApp:
             by_label = {label: name for name, label in labels.items()}
             updates = {"trigger": by_label[trigger.get()], "languages": languages,
                        "insert_mode": insert_mode.get(), "spacing": spacing.get(),
-                       "speed": speed.get(), "launch_at_login": bool(login.get())}
+                       "speed": speed.get(), "launch_at_login": bool(login.get()),
+                       "remove_fillers": bool(fillers.get()), "voice_commands": bool(commands.get())}
             try:
                 notes = controller.save_settings(updates)
             except Exception as exc:

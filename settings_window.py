@@ -102,7 +102,7 @@ class SettingsController(AppKit.NSObject):
     @objc.python_method
     def _build(self):
         state = self.model.state()
-        height = 740
+        height = 868
         self.window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             AppKit.NSMakeRect(0, 0, WIDTH, height),
             AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable,
@@ -134,7 +134,7 @@ class SettingsController(AppKit.NSObject):
         self._row_label(view, y, "Whisper speed")
         self._popup(view, y, list(SPEED_LABELS.items()), "speedChanged:", key="speed"); y += 32
         self._row_label(view, y, "Automatic language")
-        view.addSubview_(_label("Chooses among these; clearly other speech is never translated.",
+        view.addSubview_(_label("Chooses among these; clearly other speech is written as spoken.",
                                 AppKit.NSMakeRect(CONTROL_X, y + 2, CONTROL_W, 16), small=True)); y += 24
         languages = sorted(state["language_names"].items(), key=lambda item: item[1])
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(CONTROL_X, y, CONTROL_W, 150))
@@ -158,7 +158,12 @@ class SettingsController(AppKit.NSObject):
         self._row_label(view, y, "Insert by")
         self._popup(view, y, list(INSERT_LABELS.items()), "insertChanged:", key="insert_mode"); y += 32
         self._row_label(view, y, "Spacing")
-        self._popup(view, y, list(SPACING_LABELS.items()), "spacingChanged:", key="spacing"); y += 40
+        self._popup(view, y, list(SPACING_LABELS.items()), "spacingChanged:", key="spacing"); y += 32
+        self._row_label(view, y, "Cleanup")
+        self._checkbox(view, y, "Remove filler words (um, uh)", "fillersToggled:", key="remove_fillers"); y += 24
+        self._checkbox(view, y, "Voice commands", "commandsToggled:", key="voice_commands"); y += 22
+        view.addSubview_(_label("Say “new line”, “new paragraph” or “scratch that”. English only.",
+                                AppKit.NSMakeRect(CONTROL_X, y, CONTROL_W, 16), small=True)); y += 30
 
         view.addSubview_(_label("General", AppKit.NSMakeRect(20, y, 300, 20), bold=True)); y += 30
         self._row_label(view, y, "Login")
@@ -219,6 +224,9 @@ class SettingsController(AppKit.NSObject):
             box.setState_(AppKit.NSControlStateValueOn if code in chosen else AppKit.NSControlStateValueOff)
         self._select("insert_mode", prefs["insert_mode"])
         self._select("spacing", prefs["spacing"])
+        for key in ("remove_fillers", "voice_commands"):
+            self.controls[key].setState_(AppKit.NSControlStateValueOn if prefs.get(key, True)
+                                         else AppKit.NSControlStateValueOff)
         self.controls["launch_at_login"].setState_(AppKit.NSControlStateValueOn if state["login_enabled"]
                                                    else AppKit.NSControlStateValueOff)
         self.controls["launch_at_login"].setEnabled_(state["login_available"])
@@ -264,6 +272,12 @@ class SettingsController(AppKit.NSObject):
 
     def spacingChanged_(self, sender):
         self._apply("spacing", sender.selectedItem().representedObject())
+
+    def fillersToggled_(self, sender):
+        self._apply("remove_fillers", sender.state() == AppKit.NSControlStateValueOn)
+
+    def commandsToggled_(self, sender):
+        self._apply("voice_commands", sender.state() == AppKit.NSControlStateValueOn)
 
     def loginToggled_(self, sender):
         self._apply("launch_at_login", sender.state() == AppKit.NSControlStateValueOn)

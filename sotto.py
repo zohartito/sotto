@@ -451,6 +451,21 @@ def microphone_permission(*, request: bool = False) -> bool:
     return False
 
 
+def apply_voice_cleanup(text: str, preprocessing: dict, language: str | None) -> tuple[str, str | None]:
+    """English voice commands and filler removal, after the dictionary. Returns
+    the text to deliver and an action ("scratch" undoes the last dictation)."""
+    import settings
+    import voice_commands
+    preferences = settings.load(settings.SETTINGS_PATH)
+    commands, fillers = preferences["voice_commands"], preferences["remove_fillers"]
+    if not (commands or fillers) or not voice_commands.is_english(language, preferences["languages"]):
+        return text, None
+    cleaned, action = voice_commands.clean(text, fillers=fillers, commands=commands)
+    if action or cleaned != text:
+        preprocessing["voice"] = {"asr_text": text, **({"action": action} if action else {})}
+    return cleaned, action
+
+
 def apply_personal_dictionary(text: str, preprocessing: dict) -> str:
     """The user's own spellings for text that is about to be delivered.
 
@@ -2600,8 +2615,12 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                     "pasting the clean prefix")
                                 hallucinated = None
                         reason = hallucinated or no_speech
+                        voice_action = None
                         if not reason and not entry_adaptive:
                             text = apply_personal_dictionary(text, preprocessing)
+                            text, voice_action = apply_voice_cleanup(
+                                text, preprocessing,
+                                preprocessing.get("detected_language") or job_config.language)
                         attempt_metadata["latency"]["release_to_text_seconds"] = round(
                             time.monotonic() - queued_at, 4)
                         if shutdown.requested():
@@ -2640,7 +2659,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                         entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
                                     adaptive_runtime=adaptive_runtime,appended_publication=publication_meta,
                                     shutdown=shutdown,
-                                    inject=lambda: ui_call(inject_when_clear, text, 0))
+                                    inject=(lambda: ui_call(undo_when_clear, 0)) if voice_action == "scratch"
+                                    else (lambda: ui_call(inject_when_clear, text, 0)) if text else None)
                                 publication_committed = appended_row is not None
                             except Exception:
                                 if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
@@ -2888,6 +2908,32 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         import settings
         preferences = settings.load(settings.SETTINGS_PATH)
         inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
+        last_delivery["at"] = time.monotonic()
+
+    last_delivery = {"at": 0.0}
+
+    def undo_when_clear(attempts: int) -> None:
+        """'scratch that': undo the last dictation with the app's own ⌘Z,
+        only when Sotto pasted something within the last minute."""
+        import voice_commands
+        if shutdown.requested():
+            return
+        if trigger_physically_down() and attempts < 40:
+            timer = threading.Timer(0.15, lambda: AppHelper.callAfter(undo_when_clear, attempts + 1))
+            timer.daemon = True
+            timer.start()
+            return
+        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
+            log("  scratch that: nothing recent to undo")
+            return
+        if secure_input_active():
+            return
+        for key_down in (True, False):
+            event = Quartz.CGEventCreateKeyboardEvent(None, 6, key_down)  # 6 = Z
+            Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+            Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+        last_delivery["at"] = 0.0
+        log("↶ scratch that — undid the last dictation")
 
     tap_watch = {"warned_at": 0.0}
 
