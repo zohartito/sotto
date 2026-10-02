@@ -5,7 +5,8 @@ release; the text lands at the cursor. Whisper only (faster-whisper /
 CTranslate2), on an NVIDIA GPU when one works and on the CPU otherwise.
 
 Sotto runs as a **tray app** (Start Menu shortcut, no console window) with a
-menu for History, Language, Speed, the personal Dictionary and Settings, or as
+menu for History, Language, Speed, the personal Dictionary, Settings and
+**Check for updates…** (it contacts GitHub only when you click it), or as
 a plain **console program** for tests and headless use. Audio and inference
 stay on your PC; installing dependencies and the first model download need
 internet access. No speech-upload service or telemetry is configured.

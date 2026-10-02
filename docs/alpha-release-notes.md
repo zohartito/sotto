@@ -43,7 +43,8 @@ scripts/install-mac.sh
 The script installs the pinned dependencies, downloads the speech model once
 (about 1.6 GB, pinned to an exact revision) and builds Sotto.app in
 Applications. Open it, allow the Microphone and turn Sotto on under Privacy &
-Security → Accessibility. Update later with `scripts/install-mac.sh --update`.
+Security → Accessibility. Update later with **Check for Updates…** in Sotto's
+menu (or `scripts/install-mac.sh --update`).
 
 Windows — Windows 10/11 x64 with 64-bit Python 3.13: clone the repository and
 run `powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1`, then
@@ -60,9 +61,10 @@ tagged commit; check it with `shasum -a 256` against the published SHA-256.
   noisy rooms and whispering have only been tried on the maintainer's machines.
 - Checked on one M4 Max (macOS 27.2) and one Windows 11 desktop (RTX 4070 Ti
   SUPER). Other Macs, macOS 14–26 and ARM Windows are untested.
-- The app is built on your computer and is not notarized, and there are no
-  automatic updates. After an update that rebuilds the app, macOS may need
-  Sotto removed and re-added under Accessibility; the app says so when needed.
+- The app is built on your computer and is not notarized. Updates are manual:
+  Check for Updates contacts GitHub only when you click it. After an update
+  that rebuilds the app, macOS may need Sotto removed and re-added under
+  Accessibility; the app says so when needed.
 - Secure fields and some apps refuse simulated paste. Use History → Copy.
 - A Bluetooth microphone that reconnects can need **Restart Sotto** from the
   menu.

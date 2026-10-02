@@ -57,8 +57,9 @@ Microphone and Accessibility as **Sotto**. Sotto lives in the menu bar; choose
 **Start Sotto when I log in** under **Settings…**. Its log (counts and timings,
 never your words) is `logs/sotto.log` in the data folder.
 
-- Update: `scripts/install-mac.sh --update` (pulls a git clone, reinstalls
-  dependencies; your permissions and settings stay).
+- Update: **Check for Updates…** in Sotto's menu lists what is new and updates
+  a git clone on request, then restarts. It contacts GitHub only when you click
+  it. From a terminal: `scripts/install-mac.sh --update`. Your settings stay.
 - Remove: `scripts/install-mac.sh --uninstall` (removes the app and its login
   item; your data folder stays until you delete it).
 
