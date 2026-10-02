@@ -1,4 +1,4 @@
 # Source alpha: tested on arm64 macOS 27.2, CPython 3.12.14.
 # Exact resolved dependency set; no models, credentials or local file URLs.
 -r requirements.txt
--c requirements-alpha.lock
+-c constraints-alpha.txt

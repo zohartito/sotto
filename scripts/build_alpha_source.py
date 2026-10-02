@@ -89,9 +89,9 @@ WINDOWS_FILES = (
     'scripts/install-windows.ps1',
     'scripts/sotto-win.bat',
     'requirements-alpha-windows.txt',
-    'requirements-alpha-windows.lock',
+    'constraints-alpha-windows.txt',
     'requirements-alpha-windows-cuda.txt',
-    'requirements-alpha-windows-cuda.lock',
+    'constraints-alpha-windows-cuda.txt',
     'docs/windows-alpha.md',
     'tests/test_audio_codec_write.py',
     'tests/test_dictionary.py',
@@ -109,7 +109,7 @@ WINDOWS_FILES = (
 )
 
 PUBLIC_FILES = sorted(set(RUNTIME_SOURCE_FILES) | set(PUBLIC_TEST_FILES) | set(WINDOWS_FILES) | {
-    'README.md', 'LICENSE', 'AGENTS.md', 'requirements-alpha.txt', 'requirements-alpha.lock',
+    'README.md', 'LICENSE', 'AGENTS.md', 'requirements-alpha.txt', 'constraints-alpha.txt',
     'scripts/setup_nemotron.py', 'scripts/test_alpha.py', 'scripts/build_alpha_source.py',
     'scripts/install-mac.sh', 'scripts/install_app.py',
     'scripts/rollout.sh', 'benchmark.py', 'docs/alpha-release-notes.md',

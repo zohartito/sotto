@@ -100,8 +100,8 @@ def _lock(path: Path) -> dict[str, str]:
 
 class WindowsDependencyPinTests(unittest.TestCase):
     def test_locks_are_exact_disjoint_and_cover_every_direct_requirement(self):
-        cpu = _lock(ROOT / "requirements-alpha-windows.lock")
-        cuda = _lock(ROOT / "requirements-alpha-windows-cuda.lock")
+        cpu = _lock(ROOT / "constraints-alpha-windows.txt")
+        cuda = _lock(ROOT / "constraints-alpha-windows-cuda.txt")
         self.assertFalse(set(cpu) & set(cuda), "the CUDA lock only adds packages")
         self.assertLessEqual(_requirement_names(ROOT / "requirements-alpha-windows.txt"), set(cpu))
         self.assertLessEqual(_requirement_names(ROOT / "requirements-alpha-windows-cuda.txt"), set(cuda))
@@ -111,14 +111,14 @@ class WindowsDependencyPinTests(unittest.TestCase):
     def test_requirement_files_reference_only_local_pins(self):
         cpu = (ROOT / "requirements-alpha-windows.txt").read_text("utf-8")
         cuda = (ROOT / "requirements-alpha-windows-cuda.txt").read_text("utf-8")
-        self.assertIn("-c requirements-alpha-windows.lock", cpu.splitlines())
+        self.assertIn("-c constraints-alpha-windows.txt", cpu.splitlines())
         self.assertIn("-r requirements-alpha-windows.txt", cuda.splitlines())
-        self.assertIn("-c requirements-alpha-windows-cuda.lock", cuda.splitlines())
-        for text in (cpu, cuda, (ROOT / "requirements-alpha-windows.lock").read_text("utf-8"),
-                     (ROOT / "requirements-alpha-windows-cuda.lock").read_text("utf-8")):
+        self.assertIn("-c constraints-alpha-windows-cuda.txt", cuda.splitlines())
+        for text in (cpu, cuda, (ROOT / "constraints-alpha-windows.txt").read_text("utf-8"),
+                     (ROOT / "constraints-alpha-windows-cuda.txt").read_text("utf-8")):
             self.assertNotRegex(text, r"(?i)https?://|file:|@|--index-url|--extra-index-url|--find-links")
         cpu_packages = (_requirement_names(ROOT / "requirements-alpha-windows.txt")
-                        | set(_lock(ROOT / "requirements-alpha-windows.lock")))
+                        | set(_lock(ROOT / "constraints-alpha-windows.txt")))
         self.assertFalse([name for name in cpu_packages if name.startswith("nvidia")],
                          "CPU testers must not download CUDA packages")
 

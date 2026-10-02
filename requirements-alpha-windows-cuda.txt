@@ -2,5 +2,5 @@
 # the ctranslate2 wheel).  Needs an NVIDIA driver with CUDA 12 support; without
 # a working GPU Sotto falls back to the CPU.
 -r requirements-alpha-windows.txt
--c requirements-alpha-windows-cuda.lock
+-c constraints-alpha-windows-cuda.txt
 nvidia-cublas-cu12
