@@ -42,7 +42,16 @@ See [Python for macOS](https://www.python.org/downloads/macos/) and
 
 ## Install as an app (recommended)
 
-From the clone (or the extracted source archive):
+One line in Terminal downloads Sotto into `~/sotto` and installs it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zohartito/sotto/main/scripts/get.sh | bash
+```
+
+It needs Apple's command line tools and Python 3.12, and says how to install
+either if one is missing. Prefer to read it first? It is
+[scripts/get.sh](scripts/get.sh). From a clone you made yourself (or the
+extracted source archive):
 
 ```bash
 scripts/install-mac.sh
@@ -311,9 +320,15 @@ recordings, transcripts, caches or a full data folder.
 
 ## Windows
 
-A separate console source alpha runs on Windows 10/11 x64 with Python 3.13:
-`sotto_win.py`, hold right Ctrl, Whisper on an NVIDIA GPU or the CPU. Install,
-data locations and limitations: [docs/windows-alpha.md](docs/windows-alpha.md).
+Sotto also runs on Windows 10/11 x64 as a tray app: hold right Ctrl, Whisper
+on an NVIDIA GPU or the CPU. In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/zohartito/sotto/main/scripts/get.ps1 | iex
+```
+
+It needs Git and 64-bit Python 3.13 and says how to install either. Install
+details, data locations and limitations: [docs/windows-alpha.md](docs/windows-alpha.md).
 
 [Alpha release notes](docs/alpha-release-notes.md) ·
 [Maintainer validation](docs/alpha-validation.md) ·
