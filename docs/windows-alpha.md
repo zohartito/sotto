@@ -358,9 +358,9 @@ History copies are separate.
 
 ## Known limitations
 
-- No verified human microphone → Notepad/Word dictation for this candidate
-  yet; the checks so far use synthetic audio, simulated key events and a
-  readiness/shutdown test.
+- Real microphone dictation has been checked by a person on one Windows 11
+  desktop only; the automated checks use synthetic audio, simulated key
+  events and a readiness/shutdown test.
 - The tray menu and dialogs were exercised from a non-interactive session
   (menu callbacks invoked in a real process); a real right-click and the
   Settings/Correct windows on a desktop have not been verified by a person.

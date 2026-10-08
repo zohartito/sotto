@@ -506,6 +506,17 @@ def apply_personal_dictionary(text: str, preprocessing: dict) -> str:
     return updated
 
 
+def live_preview(text: str) -> str:
+    """The pill's live words with the user's spellings, so they match what gets pasted."""
+    if not text:
+        return text
+    import dictionary
+    try:
+        return dictionary.apply(text, dictionary.load(dictionary.DICTIONARY_PATH))[0]
+    except Exception:  # display only: a broken dictionary leaves the words as heard
+        return text
+
+
 def choose_language(probabilities: dict, allowed) -> str:
     """Automatic's pick. Prefer the user's languages, but speech that is
     clearly another language (the allowed ones score < 0.25 while it scores
@@ -2421,7 +2432,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     capture.idle_release_s = idle_release
     if status_ui is not None:
         status_ui.level_source = lambda: capture.latest_rms
-        status_ui.live_text_source = capture.live_text if use_nemotron else None
+        status_ui.live_text_source = (
+            (lambda: live_preview(capture.live_text())) if use_nemotron else None)
 
     # Single-flight transcription: one prewarmed worker, strict FIFO — live
     # dictations and retries can never run the model (or the clipboard cycle)
