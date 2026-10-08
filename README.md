@@ -20,7 +20,7 @@ their own licenses.
   ([Windows instructions](docs/windows-alpha.md)).
 - **macOS 14 (Sonoma) or later**, **Python 3.12**, Git, and a local graphical
   login. macOS 14 is the oldest release the pinned dependencies install on.
-  This candidate was only checked on macOS 27.2 / M4 Max / Python 3.12.14;
+  This alpha was only checked on macOS 27.2 / M4 Max / Python 3.12.14;
   macOS 14–26 and other Apple Silicon chips are untested, so please report
   results.
 - A microphone, permission to use it, and Accessibility permission for the
@@ -77,7 +77,7 @@ with any source install; keep it in a folder only you control.
 
 ## Install and first launch from a terminal
 
-Once this candidate is approved and available on `master`:
+To run Sotto from a terminal instead of the app:
 
 ```bash
 git clone https://github.com/zohartito/sotto.git
@@ -96,10 +96,8 @@ venv-alpha/bin/python sotto.py doctor
 venv-alpha/bin/python sotto.py run --idle-release 0
 ```
 
-While the repo is private, a clone requires authorized GitHub access. Reviewers
-can use `git clone --branch codex/public-alpha ...` after that branch is shared,
-or use the prepared source archive. Nothing in these commands installs a
-LaunchAgent or enables adaptive routing/background learning. Re-export the two
+Nothing in these commands installs a LaunchAgent or enables adaptive
+routing/background learning. Re-export the two
 variables in each new terminal before launching. To use a different folder,
 set absolute paths for both variables consistently.
 
