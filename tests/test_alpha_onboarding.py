@@ -263,6 +263,17 @@ class LiveWordsTests(unittest.TestCase):
         capture.closed = True
         self.assertEqual(capture.live_text(), "")
 
+    def test_live_words_use_the_personal_dictionary(self):
+        import dictionary
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dictionary.txt"
+            path.write_text("soto => Sotto\n", encoding="utf-8")
+            with patch.object(dictionary, "DICTIONARY_PATH", path):
+                self.assertEqual(sotto.live_preview("Soto turns what I say"), "Sotto turns what I say")
+                self.assertEqual(sotto.live_preview(""), "")
+            with patch.object(dictionary, "load", side_effect=OSError("unreadable")):
+                self.assertEqual(sotto.live_preview("soto as heard"), "soto as heard")
+
     @unittest.skipUnless(sys.platform == 'darwin', 'AppKit overlay')
     def test_long_text_keeps_its_newest_end(self):
         import ui
