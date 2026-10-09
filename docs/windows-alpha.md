@@ -166,6 +166,13 @@ Right-click the tray icon (left-click opens Settings):
 - **Progress** — see below. **Dictionary** — opens your dictionary in Notepad.
 - **Settings…**, **Restart** (finishes a dictation in flight first, however
   long the model takes, and ignores new presses meanwhile), **Quit**.
+- **Check for updates…** — compares this git copy with GitHub. **Update**
+  waits for Sotto to quit, installs the new version's pinned packages (the CPU
+  or CUDA set recorded at install) before it switches the source, and puts the
+  previous packages back if that fails, so the source never runs on the wrong
+  packages. Sotto starts again either way, and the tray then says whether the
+  update worked; the details are in `update.log` in the data folder. The
+  one-line `get.ps1` refuses to update a copy while Sotto runs from it.
 
 Opening the tray menu takes the focus away from the app you were dictating
 into, so a dictation finished with **Finish dictation** is copied to the
