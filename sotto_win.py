@@ -63,9 +63,11 @@ from history import HistoryStore
 from learning import LearningCoordinator, LearningStore
 
 INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History only
-# Restart waits this long for the dictation in flight: a long CPU dictation
-# finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
-RESTART_DRAIN_CAP_S = 300.0
+# Restart waits for the dictation in flight: the longest recording (the
+# hands-free watchdog) plus time to transcribe it on the CPU, then goes ahead
+# anyway, so a wedged CUDA/CT2 call cannot block recovery for good.
+RESTART_TRANSCRIBE_S = 300.0  # a long CPU dictation transcribes well inside this
+RESTART_DRAIN_CAP_S = sotto.HANDS_FREE_MAX_S + RESTART_TRANSCRIBE_S
 # Quit finishes the dictation in flight, up to this long: the Mac's
 # sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
 QUIT_DRAIN_S = 10.0

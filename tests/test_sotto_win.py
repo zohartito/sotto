@@ -223,26 +223,56 @@ class RestartTest(unittest.TestCase):
         self.assertFalse(waiting.restart_requested, "Quit wins over a pending restart")
 
     def test_restart_and_speed_change_never_abandon_a_slow_dictation(self):
-        # [F30] A long dictation on the CPU outlasts the old 20 s drain deadline;
-        # Restart and a Speed change must still wait for it (deadline shrunk here).
+        # [F30] A long dictation on the CPU outlasts the Mac's 20 s restart
+        # deadline (sotto.RESTART_DRAIN_DEADLINE_S, which sotto_win never
+        # reads); Restart and a Speed change must still wait for it.  [N44]
+        # This used to patch that unread constant and wait 0.8 s of real
+        # time; it now runs the drain on the controller's virtual clock.
+        slow_s = 3 * sotto.RESTART_DRAIN_DEADLINE_S
         for start in ("restart", "speed"):
             controller, jobs = self.controller(busy=True)
             controller.speed = "accurate"
-            with mock.patch.object(sotto, "RESTART_DRAIN_DEADLINE_S", 0.2), \
-                    mock.patch.object(sotto_win.user_settings, "save"), \
+            stopped_while_busy: list = []
+
+            def on_sleep(now, controller=controller, jobs=jobs, stopped=stopped_while_busy):
+                stopped.append(controller.shutdown.requested())
+                if now >= slow_s and jobs.unfinished_tasks:
+                    jobs.get_nowait()
+                    jobs.task_done()
+
+            clock = self.virtual_clock(controller, on_sleep)
+            with mock.patch.object(sotto_win.user_settings, "save"), \
                     mock.patch.object(sotto_win, "log"):
                 message = controller.restart() if start == "restart" else controller.set_speed("fast")
                 self.assertIn("after the current dictation", message)
-                time.sleep(0.8)
-                self.assertFalse(controller.shutdown.requested(),
-                                 f"{start}: a dictation still transcribing is never abandoned")
+                self.assertTrue(controller.shutdown.event.wait(5), f"{start}: restarts once idle")
+            self.assertTrue(stopped_while_busy, f"{start}: the drain polls the virtual clock")
+            self.assertFalse(any(stopped_while_busy),
+                             f"{start}: a dictation still transcribing is never abandoned")
+            self.assertGreaterEqual(clock["now"], slow_s)
+            self.assertTrue(controller.restart_requested)
+
+    def test_restart_outlasts_the_longest_hands_free_recording_and_its_transcription(self):
+        # [N22] The 300 s cap was shorter than the 600 s hands-free watchdog,
+        # so Restart abandoned a long hands-free dictation still recording.
+        controller, jobs = self.controller(busy=True)
+        slow_s = sotto.HANDS_FREE_MAX_S + 200.0  # recorded to the max, then a slow CPU decode
+        stopped_while_busy = []
+
+        def on_sleep(now):
+            stopped_while_busy.append(controller.shutdown.requested())
+            if now >= slow_s and jobs.unfinished_tasks:
                 jobs.get_nowait()
                 jobs.task_done()
-                deadline = time.monotonic() + 5
-                while not controller.shutdown.requested() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-            self.assertTrue(controller.shutdown.requested(), f"{start}: restarts once idle")
-            self.assertTrue(controller.restart_requested)
+
+        self.virtual_clock(controller, on_sleep)
+        logs: list = []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.restart()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertFalse(any(stopped_while_busy), "the dictation was abandoned")
+        self.assertFalse([line for line in logs if "abandoned" in line], logs)
+        self.assertGreater(sotto_win.RESTART_DRAIN_CAP_S, sotto.HANDS_FREE_MAX_S)
 
     @staticmethod
     def virtual_clock(controller, on_sleep=lambda now: None) -> dict:
