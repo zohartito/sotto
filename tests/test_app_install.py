@@ -128,6 +128,23 @@ class InstallLocationTests(unittest.TestCase):
             self.assertTrue(other.exists())
             self.assertFalse(install_app.ours(other))
 
+    def test_an_install_killed_mid_swap_keeps_the_old_app_when_the_next_copy_fails(self):
+        # [F3b] Killed between the two renames, the old app survives only as
+        # .Sotto.app.outgoing; the next run deleted it before copying, so a
+        # failed copy left no app at all.
+        with tempfile.TemporaryDirectory() as temporary:
+            applications = Path(temporary)
+            app = applications / install_app.APP_NAME
+            old = self.make_app(applications, install_app.BUNDLE_ID)
+            (old / "Contents" / "old.txt").write_text("the working app")
+            old.rename(applications / f".{install_app.APP_NAME}.outgoing")  # the interrupted swap
+            (applications / f".{install_app.APP_NAME}.incoming").mkdir()
+            staging = self.make_app(applications / "staging", install_app.BUNDLE_ID)
+            with unittest.mock.patch.object(install_app.shutil, "copytree", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    install_app._swap_in(staging, app)
+            self.assertEqual((app / "Contents" / "old.txt").read_text(), "the working app")
+
     @unittest.skipUnless(sys.platform == "darwin", "Sotto.app is macOS only")
     def test_dialogs_use_the_icon_of_the_app_that_launched_python(self):
         import sotto

@@ -167,6 +167,8 @@ def _swap_in(staging: Path, app: Path) -> None:
     failed copy never leaves the user without a working app."""
     incoming = app.with_name(f".{APP_NAME}.incoming")
     outgoing = app.with_name(f".{APP_NAME}.outgoing")
+    if outgoing.exists() and not app.exists():
+        outgoing.rename(app)  # a swap interrupted between its renames: the old app is the working one
     for leftover in (incoming, outgoing):  # names only this installer uses
         if leftover.exists():
             shutil.rmtree(leftover)
