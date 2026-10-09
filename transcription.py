@@ -19,7 +19,6 @@ from __future__ import annotations
 import queue
 import time
 
-import numpy as np
 
 from pipeline import screen
 from sotto import (DEAD_ROUTE_TEXT, LONG_CAPTURE_S, SAMPLE_RATE, LocalWhisper, _transcription_kwargs,
@@ -163,7 +162,6 @@ class TranscriptionWorker:
         samples = (stream_prepared.asr_samples if stream_prepared is not None
                    else prepare_for_whisper(raw, native_rate))
         seconds = len(samples) / SAMPLE_RATE
-        rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
         if seconds < 0.2:
             self.log("○ sub-0.2s capture dropped (key-tap artifact)")
             return
@@ -354,7 +352,8 @@ class TranscriptionWorker:
                             text, prepared, prepared_seconds, actual_model,
                             ts=captured_ts, raw_samples=raw,
                             raw_sample_rate=native_rate, provenance="live_suspect",
-                            adaptive=entry_adaptive, entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
+                            adaptive=entry_adaptive, entry_id=capture_id if entry_adaptive else None,
+                            **attempt_metadata),
                         adaptive_runtime=self.adaptive_runtime,appended_publication=publication_meta,
                         shutdown=self.shutdown,inject=None)
                     self._publication_committed = appended_row is not None
@@ -555,7 +554,8 @@ class TranscriptionWorker:
         if self.adaptive_runtime is not None and self._publication is not None:
             if committed is None:
                 self.adaptive_runtime.cancel_comparator_publication(publication_meta)
-            elif not self.shutdown.requested() and not self.adaptive_runtime.acknowledge_comparator_publication(publication_meta):
+            elif (not self.shutdown.requested()
+                  and not self.adaptive_runtime.acknowledge_comparator_publication(publication_meta)):
                 # Retry's old revision revoke can have an exact
                 # scrub marker in flight.  Keep the adopted
                 # prepared row for restart reconciliation rather
