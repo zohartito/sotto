@@ -300,5 +300,66 @@ class IdleReleaseTest(unittest.TestCase):
         self.assertGreaterEqual(len(raw) / 48000, 3.0)       # pre-roll + the 3 s spoken
 
 
+# -- F17: per-block sample rates survive a mid-recording route change ----------
+
+class InlineThread:
+    """threading.Thread stand-in that runs the target on start(): the route
+    rebuild happens right where the test can see it."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+def dominant_hz(samples, rate):
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
+    return np.fft.rfftfreq(len(samples), 1 / rate)[int(np.argmax(spectrum))]
+
+
+class JoinCaptureBlocksTest(unittest.TestCase):
+    def test_same_rate_blocks_concatenate_untouched(self):
+        blocks = [tone(440, 0.1, 48000), tone(440, 0.1, 48000)]
+        joined = sotto.join_capture_blocks(blocks, [48000.0, 48000.0], 48000.0)
+        np.testing.assert_array_equal(joined, np.concatenate(blocks))
+
+    def test_each_same_rate_run_is_resampled_before_joining(self):
+        blocks = [tone(440, 0.5, 48000), tone(440, 0.5, 48000), tone(440, 1.0, 24000)]
+        joined = sotto.join_capture_blocks(blocks, [48000.0, 48000.0, 24000.0], 24000.0)
+        self.assertEqual(len(joined), 48000)                 # 2.0 s at 24 kHz
+        self.assertAlmostEqual(dominant_hz(joined[:24000], 24000), 440, delta=5)
+        self.assertAlmostEqual(dominant_hz(joined[24000:], 24000), 440, delta=5)
+
+
+class RouteChangeMidCaptureTest(unittest.TestCase):
+    def test_batch_audio_keeps_true_duration_and_pitch(self):
+        node = FakeNode(rate=48000.0)
+        engine = FakeEngine(node)
+        capture = sotto.CaptureService()
+        capture._engine_obj = engine
+        with fake_avfoundation(lambda: engine), \
+             mock.patch.object(sotto, "log", lambda msg: None), \
+             mock.patch.object(sotto, "_pin_input_to_builtin", lambda n: 77), \
+             mock.patch.object(sotto.threading, "Thread", InlineThread):
+            capture._start_engine()                          # built-in mic, 48 kHz
+            capture.begin()                                  # key down
+            feed(capture, tone(440, 1.0, 48000), 48000)      # 1 s spoken at 48 kHz
+            node.rate = 24000.0                              # headset connects:
+            capture._engine_started_at -= 5
+            capture._on_config_change()                      # real rebuild path, now 24 kHz
+            self.assertFalse(capture._route_rebuilding)
+            self.assertEqual(node.calls[-1], "installTap@24000")
+            feed(capture, tone(440, 1.0, 24000), 24000)      # 1 s spoken at 24 kHz
+            raw = capture.end()
+        rate = capture.native_rate                           # what on_finish enqueues
+        self.assertEqual(rate, 24000.0)
+        self.assertAlmostEqual(len(raw) / rate, 2.0, delta=0.05)
+        whisper_in = sotto.prepare_for_whisper(raw, rate)
+        third = len(whisper_in) // 3
+        self.assertAlmostEqual(dominant_hz(whisper_in[:third], 16000), 440, delta=10)
+        self.assertAlmostEqual(dominant_hz(whisper_in[-third:], 16000), 440, delta=10)
+
+
 if __name__ == "__main__":
     unittest.main()

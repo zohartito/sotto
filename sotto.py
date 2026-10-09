@@ -1016,9 +1016,10 @@ class CaptureService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
-        self._ring: list[np.ndarray] = []
+        self._ring: list[tuple[np.ndarray, float]] = []   # (block, its rate)
         self._ring_samples = 0
         self._active: list[np.ndarray] | None = None
+        self._active_rates: list[float] = []   # per-block rates, parallel to _active
         self._stream = None
         self._stream_enqueue = None
         self._next_expected = None
@@ -1378,6 +1379,7 @@ class CaptureService:
                 return
             if all(not block.any() for block in self._active):
                 self._active = []
+                self._active_rates = []
 
     def _tap(self, buffer, when) -> None:
         n = int(buffer.frameLength())
@@ -1414,19 +1416,25 @@ class CaptureService:
             self.native_rate = float(buffer.format().sampleRate())
         except Exception:
             pass
+        rate = self.native_rate
         with self._lock:
             if self._active is not None:
+                # Each block keeps its own rate: a route change mid-recording
+                # (built-in 48 kHz -> AirPods 24 kHz) rebuilds the engine
+                # under a live capture, and end() must not read the earlier
+                # blocks at the later device's rate.
                 self._active.append(block)
+                self._active_rates.append(rate)
                 if self._stream is not None:
                     # Only queue references on the tap. Resampling and ASR run
                     # on the existing serialized transcription worker.
-                    self._stream_enqueue(("stream-audio", self._stream, block, self.native_rate))
+                    self._stream_enqueue(("stream-audio", self._stream, block, rate))
             else:
-                self._ring.append(block)
+                self._ring.append((block, rate))
                 self._ring_samples += len(block)
-                limit = int(RING_S * self.native_rate)
+                limit = int(RING_S * rate)
                 while self._ring_samples > limit and len(self._ring) > 1:
-                    self._ring_samples -= len(self._ring.pop(0))
+                    self._ring_samples -= len(self._ring.pop(0)[0])
 
     def begin(self, *, stream=None, enqueue=None) -> None:
         cold_start = False
@@ -1437,18 +1445,21 @@ class CaptureService:
                 self._stream.cancelled.set()
                 self._stream_enqueue(("stream-close", self._stream))
             preroll: list[np.ndarray] = []
+            preroll_rates: list[float] = []
             needed = int(PREROLL_S * self.native_rate)
             collected = 0
-            for block in reversed(self._ring):
+            for block, rate in reversed(self._ring):
                 preroll.insert(0, block)
+                preroll_rates.insert(0, rate)
                 collected += len(block)
                 if collected >= needed:
                     break
             self._active = preroll
+            self._active_rates = preroll_rates
             self._stream, self._stream_enqueue = stream, enqueue
             if stream is not None:
-                for block in preroll:
-                    enqueue(("stream-audio", stream, block, self.native_rate))
+                for block, rate in zip(preroll, preroll_rates):
+                    enqueue(("stream-audio", stream, block, rate))
             self._last_use = time.monotonic()
             # A start that never completed must not block every future wake —
             # treat a stale "starting" flag as dead and try again.
@@ -1472,13 +1483,17 @@ class CaptureService:
     def end(self, *, include_stream=False):
         with self._lock:
             frames, self._active = self._active or [], None
+            rates, self._active_rates = self._active_rates, []
             stream, self._stream = self._stream, None
             self._stream_enqueue = None
             self._last_use = time.monotonic()
         if not frames:
             empty = np.zeros(0, dtype=np.float32)
             return (empty, stream) if include_stream else empty
-        samples = np.concatenate(frames).reshape(-1)
+        # Blocks placed directly (tests, old callers) carry no rate: they are
+        # at the current one, which is also what the caller reads next.
+        rates = rates + [self.native_rate] * (len(frames) - len(rates))
+        samples = join_capture_blocks(frames, rates, self.native_rate)
         # A hold shorter than the in-capture silence watch (3s) ends before
         # tick() can react, so short presses would keep landing on the same
         # wedged input unit forever (2026-09-20: 1.37s and 1.88s holds, peak
@@ -1497,6 +1512,7 @@ class CaptureService:
                 self._stream_enqueue(("stream-close", self._stream))
             self._stream = self._stream_enqueue = None
             self._active = None
+            self._active_rates = []
             self._last_use = time.monotonic()
 
     def is_active(self) -> bool:
@@ -1544,6 +1560,33 @@ class CaptureService:
             thread.join(timeout)
         return thread is None or not thread.is_alive()
 
+
+def join_capture_blocks(frames: list, rates: list, target_rate: float) -> np.ndarray:
+    """Join tap blocks into one signal at target_rate.
+
+    A route change mid-recording (built-in mic at 48 kHz, then AirPods at
+    24 kHz) leaves blocks of both rates in one capture. Reading them all at
+    the last device's rate stretched the earlier speech to twice its length
+    and halved its pitch; instead every run of same-rate blocks is resampled
+    on its own before the runs are concatenated."""
+    runs: list[tuple[list, float]] = []
+    for block, rate in zip(frames, rates):
+        if runs and runs[-1][1] == rate:
+            runs[-1][0].append(block)
+        else:
+            runs.append(([block], rate))
+    pieces = []
+    for blocks, rate in runs:
+        samples = np.concatenate(blocks).reshape(-1)
+        if rate != target_rate and rate > 0 and target_rate > 0:
+            from fractions import Fraction
+
+            from scipy.signal import resample_poly
+            ratio = Fraction(int(target_rate), int(rate)).limit_denominator(1000)
+            samples = resample_poly(samples, ratio.numerator,
+                                    ratio.denominator).astype(np.float32)
+        pieces.append(samples)
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
 
 
 def prepare_for_whisper(raw: np.ndarray, native_rate: float) -> np.ndarray:
