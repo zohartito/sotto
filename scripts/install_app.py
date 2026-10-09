@@ -138,6 +138,9 @@ def compile_launcher(source: str, output: Path, compiler: str = "clang") -> Path
 
 def build(*, applications: Path, data_dir: Path, hf_home: Path, python: Path, compiler: str = "clang") -> Path:
     app = applications / APP_NAME
+    if app.exists() and not ours(app):
+        raise SystemExit(f"{app} was not made by Sotto's installer, so it is left alone. "
+                         "Move or rename it, then run the installer again.")
     executable = app / "Contents" / "MacOS" / "Sotto"
     source = launcher_source(python=python, script=ROOT / "sotto.py", data_dir=data_dir,
                              hf_home=hf_home, app_executable=executable)
@@ -155,10 +158,29 @@ def build(*, applications: Path, data_dir: Path, hf_home: Path, python: Path, co
         if app.exists() and _same_bundle(app, staging):
             return app
         applications.mkdir(parents=True, exist_ok=True)
-        if app.exists():
-            shutil.rmtree(app)
-        shutil.copytree(staging, app, symlinks=True)
+        _swap_in(staging, app)
     return app
+
+
+def _swap_in(staging: Path, app: Path) -> None:
+    """Copy the new bundle beside the old one, then swap them by rename, so a
+    failed copy never leaves the user without a working app."""
+    incoming = app.with_name(f".{APP_NAME}.incoming")
+    outgoing = app.with_name(f".{APP_NAME}.outgoing")
+    for leftover in (incoming, outgoing):  # names only this installer uses
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    shutil.copytree(staging, incoming, symlinks=True)
+    if app.exists():
+        app.rename(outgoing)
+    try:
+        incoming.rename(app)
+    except OSError:
+        if outgoing.exists():
+            outgoing.rename(app)
+        raise
+    if outgoing.exists():
+        shutil.rmtree(outgoing)
 
 
 def _same_bundle(installed: Path, staged: Path) -> bool:
