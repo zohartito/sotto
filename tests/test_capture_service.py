@@ -497,5 +497,47 @@ class FailedMicStartTest(unittest.TestCase):
         self.assertLessEqual(sum("captured" in line for line in self.logs), 1)
 
 
+# -- F41: doctor probes the input the capture path records from ---------------
+
+class DoctorProbeTest(unittest.TestCase):
+    def test_probe_pins_the_capture_mic_then_reads_the_input_bus(self):
+        node = FakeNode(rate=48000.0)
+        engine = FakeEngine(node)
+        pinned = []
+
+        def pin(target_node):
+            pinned.append(target_node)
+            node.calls.append("pin")
+            return 77
+
+        out = __import__("io").StringIO()
+        with fake_avfoundation(lambda: engine), \
+             mock.patch.object(sotto, "_pin_input_to_builtin", pin), \
+             contextlib.redirect_stdout(out):
+            status = sotto.doctor_input_probe()
+        self.assertEqual(status, 0)
+        self.assertEqual(pinned, [node])
+        self.assertEqual(node.calls, ["pin", "inputFormat"],
+                         "probe must pin first, then read the INPUT bus — never the output bus")
+        self.assertEqual(out.getvalue().strip(), "48000 Hz, 1 ch")
+
+    def test_doctor_runs_the_probe_through_sotto_not_an_unpinned_output_bus(self):
+        logs = []
+        completed = types.SimpleNamespace(returncode=0, stdout="48000 Hz, 1 ch\n",
+                                          stderr="  mic: built-in mic\n")
+        with mock.patch("subprocess.run", return_value=completed) as run, \
+             mock.patch.object(sotto, "microphone_permission", return_value=True), \
+             mock.patch("ApplicationServices.AXIsProcessTrusted", return_value=True), \
+             mock.patch.object(sotto, "log", logs.append):
+            sotto.doctor()
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], sys.executable)
+        probe = " ".join(command)
+        self.assertIn("doctor_input_probe", probe)
+        self.assertNotIn("outputFormatForBus_", probe)
+        self.assertEqual(run.call_args.kwargs.get("cwd"), str(Path(sotto.__file__).resolve().parent))
+        self.assertIn("✓ input device: 48000 Hz, 1 ch (built-in mic)", logs)
+
+
 if __name__ == "__main__":
     unittest.main()

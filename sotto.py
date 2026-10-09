@@ -3883,6 +3883,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             nemotron.close()
 
 
+def doctor_input_probe() -> int:
+    """The doctor's input check, run in a subprocess (see doctor): pin the
+    same mic a key press pins, THEN read the input bus format the tap will
+    use. The output bus of an unpinned engine describes the system default
+    device — a USB interface at 96 kHz / 2 ch, say — while dictation records
+    the pinned built-in or headset mic at its own rate."""
+    from AVFoundation import AVAudioEngine
+    engine = AVAudioEngine.alloc().init()
+    node = engine.inputNode()
+    _pin_input_to_builtin(node)   # logs "mic: <which one>" on stderr
+    fmt = node.inputFormatForBus_(0)
+    print(f"{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch")
+    return 0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1
+
+
 def doctor() -> None:
     import subprocess
     import ApplicationServices
@@ -3897,20 +3912,22 @@ def doctor() -> None:
     # Probe the input device in a subprocess: CoreAudio hard-crashes (a native
     # SIGSEGV, not a catchable exception) in sessions with no usable audio
     # context, and a diagnostic must survive the conditions it diagnoses.
-    probe = ("from AVFoundation import AVAudioEngine; "
-             "engine = AVAudioEngine.alloc().init(); "
-             "node = engine.inputNode(); fmt = node.outputFormatForBus_(0); "
-             "print(f'{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch'); "
-             "raise SystemExit(0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1)")
+    # The probe is doctor_input_probe: the capture path's own pin + input bus.
+    probe = "import sotto; raise SystemExit(sotto.doctor_input_probe())"
     try:
         result = subprocess.run([sys.executable, "-c", probe],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30,
+                                cwd=str(Path(__file__).resolve().parent))
     except subprocess.TimeoutExpired:
         log("✗ input device: probe timed out (waiting on a permission prompt?)")
     else:
         if result.returncode == 0:
             usable_input = True
-            log(f"✓ input device: {result.stdout.strip()} (AVAudioEngine)")
+            mics = [line.strip()[len("mic:"):].strip()
+                    for line in result.stderr.splitlines()
+                    if line.strip().startswith("mic:")]
+            log(f"✓ input device: {result.stdout.strip()} "
+                f"({mics[0] if mics else 'AVAudioEngine'})")
         else:
             log("✗ input device: no usable audio input in this session "
                 "(microphone permission missing, or headless/SSH context)")
