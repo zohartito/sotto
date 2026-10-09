@@ -394,6 +394,79 @@ class QuitAndUpdateTest(unittest.TestCase):
         self.assertIn("stopping", message)
         self.assertFalse(controller.restart_requested, "a Quit is never turned into a restart")
 
+    def test_update_closes_the_capture_gate_before_it_checks_for_work(self):
+        # [F-update race] A key press between the busy check and the quit
+        # started a recording that the quit then threw away.
+        controller, _jobs = self.controller(busy=False)
+        self.virtual_clock(controller)
+        presses = []
+
+        def launch(*args, **kwargs):
+            with controller.capture_gate.starting() as may_start:  # a key press lands now
+                presses.append(may_start)
+            return mock.Mock()
+
+        with mock.patch.object(sotto_win.subprocess, "Popen", side_effect=launch), \
+                mock.patch.object(sotto_win, "log"):
+            self.assertIn("Updating", controller.update_and_restart())
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertEqual(presses, [False], "no recording starts once the update is under way")
+
+    def test_update_quits_through_the_drain(self):
+        # A Retry chosen from History while the updater starts is not gated:
+        # the final quit still lets it finish.
+        controller, jobs = self.controller(busy=False)
+        clock, polls = self.drain_polls(controller, {jobs: 2.0})
+
+        def launch(*args, **kwargs):
+            jobs.put("retry")
+            return mock.Mock()
+
+        with mock.patch.object(sotto_win.subprocess, "Popen", side_effect=launch), \
+                mock.patch.object(sotto_win, "log"):
+            controller.update_and_restart()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertTrue(polls, "the update's quit waits for the work in flight")
+        self.assertFalse(any(stopped for stopped, _ in polls))
+        self.assertEqual(jobs.unfinished_tasks, 0)
+
+    def test_a_refused_or_failed_update_reopens_the_gate_but_not_a_restarts(self):
+        busy, _jobs = self.controller(busy=True)
+        with mock.patch.object(sotto_win.subprocess, "Popen") as popen, \
+                mock.patch.object(sotto_win, "log"):
+            self.assertIn("Finish the current dictation", busy.update_and_restart())
+        popen.assert_not_called()
+        failed, _jobs = self.controller(busy=False)
+        with mock.patch.object(sotto_win.subprocess, "Popen", side_effect=OSError("no powershell")), \
+                mock.patch.object(sotto_win, "log"):
+            with self.assertRaises(OSError):
+                failed.update_and_restart()
+        for controller in (busy, failed):
+            with controller.capture_gate.starting() as may_start:
+                self.assertTrue(may_start, "dictation works again")
+            self.assertFalse(controller.shutdown.requested())
+        restarting, jobs = self.controller(busy=True)
+        quit_chosen = threading.Event()
+
+        def on_sleep(now):
+            quit_chosen.wait(5)  # the restart's drain holds until Quit is chosen
+            if jobs.unfinished_tasks:
+                jobs.get_nowait()
+                jobs.task_done()
+
+        self.virtual_clock(restarting, on_sleep)
+        with mock.patch.object(sotto_win.subprocess, "Popen") as popen, \
+                mock.patch.object(sotto_win, "log"):
+            restarting.restart()
+            self.assertIn("restart", restarting.update_and_restart().lower())
+            with restarting.capture_gate.starting() as may_start:
+                self.assertFalse(may_start, "the restart's gate stays closed")
+            restarting.quit()
+            quit_chosen.set()
+            self.assertTrue(restarting.shutdown.event.wait(5))
+        popen.assert_not_called()
+        self.assertFalse(restarting.restart_requested)
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class ConsoleCloseHandlerTest(unittest.TestCase):

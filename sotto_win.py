@@ -449,7 +449,7 @@ class Controller:
     def __init__(self, **parts) -> None:
         self.__dict__.update(parts)
         self.restart_requested = False
-        # Restart and Quit close the capture gate under this lock, so
+        # Restart, Update and Quit close the capture gate under this lock, so
         # one of them never reopens a gate another has closed.
         self._lifecycle_lock = threading.Lock()
 
@@ -655,15 +655,29 @@ class Controller:
     def update_and_restart(self) -> str:
         """Hand the update to scripts/update-windows.ps1: Windows keeps a
         running Python's files in use, so it waits for Sotto to quit, updates,
-        and starts Sotto again."""
-        if self.busy():
-            return "Finish the current dictation first, then update."
-        root = Path(__file__).resolve().parent
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
-                          "-File", str(root / "scripts" / "update-windows.ps1"),
-                          "-DataDir", str(DATA_DIR), "-VenvDir", sys.prefix],
-                         close_fds=True, creationflags=flags, cwd=str(root))
+        and starts Sotto again.
+
+        Side effects: closes the capture gate before the busy check, so no
+        recording can start between the check and the quit; reopens it when
+        the update is refused or the updater cannot be started.
+        """
+        with self._lifecycle_lock:
+            if self.shutdown.requested() or self.lifecycle["closed"]:
+                return "Sotto is already restarting or quitting."
+            self._close_gate("updating")
+        try:
+            if self.busy():
+                self._reopen_gate("updating")
+                return "Finish the current dictation first, then update."
+            root = Path(__file__).resolve().parent
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy",
+                              "Bypass", "-File", str(root / "scripts" / "update-windows.ps1"),
+                              "-DataDir", str(DATA_DIR), "-VenvDir", sys.prefix],
+                             close_fds=True, creationflags=flags, cwd=str(root))
+        except BaseException:
+            self._reopen_gate("updating")
+            raise
         log("● updating Sotto; it restarts when the update is done")
         self.quit()
         return "Updating — Sotto restarts when it is done."
@@ -701,6 +715,13 @@ class Controller:
         """Refuse new recordings; on_start logs ``reason``.  Caller holds _lifecycle_lock."""
         self.lifecycle["closed"] = reason  # set first: whoever sees the gate closed reads it
         self.capture_gate.close()
+
+    def _reopen_gate(self, reason: str) -> None:
+        """Reopen the gate, only if ``reason`` still holds it (a Quit may have taken over)."""
+        with self._lifecycle_lock:
+            if self.lifecycle["closed"] == reason:
+                self.capture_gate.reopen()
+                self.lifecycle["closed"] = None
 
 
 def run(trigger: str, profile: str, model: str | None, language: str | None,
@@ -775,7 +796,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     deliveries: queue.Queue = queue.Queue()
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
     vad_warnings: set[str] = set()
-    # Restart and Quit close the gate (the reason goes in lifecycle);
+    # Restart, Update and Quit close the gate (the reason goes in lifecycle);
     # on_start decides and begins a capture under it, so a closer either sees
     # that capture as in flight or the capture is refused.
     capture_gate = sotto.CaptureGate()
@@ -1057,7 +1078,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             return
         with capture_gate.starting() as may_start:
             if not may_start:
-                # A restart or Quit is draining: a new capture would
+                # A restart, update or Quit is draining: a new capture would
                 # keep it waiting and then be cut off.  The mic stays closed.
                 log(f"○ {lifecycle['closed']} — this press is ignored")
                 return
