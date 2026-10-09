@@ -753,10 +753,20 @@ class Controller:
         threading.Thread(target=finish_then_stop, daemon=True, name="sotto-quit").start()
 
     def console_stop(self, *_signal) -> None:
-        """Ctrl-C, Ctrl-Break or SIGTERM in a console run: stop, and never
-        restart — a restart waiting for the dictation in flight is cancelled.
-        Runs as a signal handler on the main thread, which never holds
-        _lifecycle_lock."""
+        """Ctrl-C, Ctrl-Break or SIGTERM in a console run: the first one
+        quits like the tray's Quit, finishing the dictation in flight (up to
+        QUIT_DRAIN_S); another one while that drain runs stops at once.
+        Never a restart.  Runs as a signal handler on the main thread, which
+        never holds _lifecycle_lock."""
+        with self._lifecycle_lock:
+            draining = self.lifecycle["closed"] == "quitting"
+        if draining or self.shutdown.requested():
+            self.stop_now()
+        else:
+            self.quit()  # also cancels a restart waiting for the dictation
+
+    def stop_now(self) -> None:
+        """Stop without waiting for the work in flight, and never restart."""
         with self._lifecycle_lock:
             self.restart_requested = False
             self.shutdown.request()
@@ -1311,8 +1321,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         + ("· tray menu for options" if tray else "· ^C to quit"))
     if ui is not None:
         ui.attach(controller)
-    # The handlers stay installed through teardown, so a second Ctrl-C during
-    # the drain only re-requests shutdown instead of interrupting it.
+    # The handlers stay installed through teardown, so a Ctrl-C during the
+    # teardown only re-requests shutdown instead of interrupting it.
     with console_signal_handlers(controller.console_stop):
         try:
             # Short waits keep the main thread returning to the interpreter,
@@ -1320,7 +1330,9 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             while not shutdown.event.wait(0.2):
                 pass
         except KeyboardInterrupt:
-            controller.console_stop()
+            # Only without the handlers above (run() off the main thread);
+            # the teardown below starts at once, so there is no drain.
+            controller.stop_now()
         finally:
             log("shutting down")
             shutdown.stop_capture(capture)

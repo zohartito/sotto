@@ -1534,6 +1534,34 @@ class QuitRunTest(unittest.TestCase):
                 self.assertFalse(results["restart"], f"{signum!r} stops Sotto, never restarts it")
                 self.assertIn("✓ stopped", logs)
 
+    def test_a_console_signal_finishes_the_dictation_in_flight_like_quit(self):
+        # Ctrl-C and Ctrl-Break skipped Quit's drain: the recording in
+        # progress was thrown away.  Now they quit like the tray's Quit.
+        for signum in (signal.SIGINT, signal.SIGBREAK):
+            with self.subTest(signal=signum.name):
+                _results, copied, texts, logs = self.console_signal_during_a_restart(signum)
+                self.assertEqual(texts, ["said before the signal"], logs)
+                self.assertEqual(copied, ["said before the signal"], "copied, as Quit does")
+
+    def test_a_second_console_signal_stops_at_once(self):
+        # The first Ctrl-C waits for the dictation (up to QUIT_DRAIN_S); a
+        # second one does not wait any longer.
+        controller, _jobs = RestartTest.controller(self, busy=True)  # never finishes
+        polls: list = []
+
+        def on_sleep(now):
+            polls.append(now)
+            if len(polls) == 3:
+                controller.console_stop()  # the second Ctrl-C
+
+        RestartTest.virtual_clock(controller, on_sleep)
+        with mock.patch.object(sotto_win, "log"):
+            controller.console_stop()  # the first Ctrl-C
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertTrue(polls, "the first Ctrl-C waits for the dictation in flight")
+        self.assertLess(max(polls), 1.0, "stopped at the second signal, not after the drain")
+        self.assertFalse(controller.restart_requested)
+
     def test_a_start_refused_by_the_closed_gate_leaves_the_gesture_idle(self):
         # The engine marked itself recording before on_start met the closed
         # gate: the tray offered "Finish dictation" and a hands-free start
