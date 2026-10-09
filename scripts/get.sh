@@ -37,8 +37,14 @@ main() {
         fail "First install Apple's command line tools: xcode-select --install  (then run this line again)"
     fi
     if [ -z "$python" ]; then
+        # The first native one: an Intel Homebrew's python3.12 may come first on PATH.
+        local candidate found
         for candidate in python3.12 /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12; do
-            if command -v "$candidate" >/dev/null 2>&1; then python="$(command -v "$candidate")"; break; fi
+            found="$(command -v "$candidate" 2>/dev/null)" || continue
+            if [ "$("$found" -c 'import platform; print(platform.machine())' 2>/dev/null)" = arm64 ]; then
+                python="$found"
+                break
+            fi
         done
     fi
     if [ -z "$python" ]; then

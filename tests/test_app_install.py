@@ -392,6 +392,24 @@ class UpdateOrderTests(unittest.TestCase):
         self.assertEqual(from_app.returncode, 0, from_app.stderr)
         self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.new)
 
+    @unittest.skipUnless(any(Path(p).is_file() for p in ("/opt/homebrew/bin/python3.12", "/usr/local/bin/python3.12")),
+                         "needs a native Python 3.12 in /opt/homebrew or /usr/local")
+    def test_an_intel_python_first_on_path_is_skipped_for_a_native_one(self):
+        # [N30] Discovery took the first python3.12 on PATH and failed if it was x86_64.
+        bin_dir = self.user.parent / "bin"
+        bin_dir.mkdir()
+        intel = bin_dir / "python3.12"
+        intel.write_text(FAKE_PYTHON)
+        intel.chmod(0o755)
+        result = subprocess.run(["/bin/bash", str(self.user / "scripts/install-mac.sh"), "--update"],
+                                env=dict(self.env, FAKE_ARCH="x86_64", PATH=f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin"),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.new)
+        explicit = subprocess.run(["/bin/bash", str(self.user / "scripts/install-mac.sh"), "--python", str(intel)],
+                                  env=dict(self.env, FAKE_ARCH="x86_64"), capture_output=True, text=True)
+        self.assertIn("is not a native arm64 Python", explicit.stderr)  # a named Python is never swapped
+
     def test_a_copy_that_is_not_a_git_clone_refuses_to_update(self):
         copy = self.user.parent / "archive-copy"
         shutil.copytree(self.user, copy, ignore=shutil.ignore_patterns(".git"))

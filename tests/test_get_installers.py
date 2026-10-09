@@ -172,6 +172,26 @@ class MacInstallerTests(unittest.TestCase):
             self.assertNotIn("would run", refused.stdout)
             self.assertEqual(self.git(dest, "rev-parse", "HEAD"), before)
 
+    @unittest.skipUnless(any(Path(p).is_file() for p in ("/opt/homebrew/bin/python3.12", "/usr/local/bin/python3.12")),
+                         "needs a native Python 3.12 in /opt/homebrew or /usr/local")
+    def test_an_intel_python_first_on_path_is_skipped_for_a_native_one(self):
+        # [N30] Discovery took the first python3.12 on PATH even when it was x86_64.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            bin_dir = folder / "bin"
+            bin_dir.mkdir()
+            intel = bin_dir / "python3.12"
+            intel.write_text(FAKE_VENV_PYTHON)
+            intel.chmod(0o755)
+            env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)),
+                       SOTTO_SOURCE=str(folder / "sotto"), SOTTO_GET_DRY_RUN="1", FAKE_ARCH="x86_64",
+                       PATH=f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin")
+            env.pop("SOTTO_PYTHON", None)
+            result = self.run_piped(env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("would run", result.stdout)
+            self.assertNotIn(str(intel), result.stdout)
+
     def test_the_same_repository_matches_in_https_and_ssh_form(self):
         script = (ROOT / "scripts" / "get.sh").read_text(encoding="utf-8")
         check = script + '\nsame_repo "git@github.com:zohartito/sotto.git" "https://github.com/zohartito/sotto.git" ' \

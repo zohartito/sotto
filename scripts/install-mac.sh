@@ -89,12 +89,18 @@ if [ "$MODE" = update ]; then
     fi
 fi
 
+native_python() {  # is $1 a native arm64 Python 3.12?
+    [ "$("$1" -c 'import platform; print(platform.machine())' 2>/dev/null)" = arm64 ] \
+        && [ "$("$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" = 3.12 ]
+}
 if [ -z "$PYTHON" ]; then
+    # The first native one: an Intel Homebrew's python3.12 may come first on PATH.
     for candidate in python3.12 /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12; do
-        if command -v "$candidate" >/dev/null 2>&1; then PYTHON="$(command -v "$candidate")"; break; fi
+        found="$(command -v "$candidate" 2>/dev/null)" || continue
+        if native_python "$found"; then PYTHON="$found"; break; fi
     done
 fi
-[ -n "$PYTHON" ] || fail "Python 3.12 not found. Install it (e.g. brew install python@3.12) or pass --python PATH."
+[ -n "$PYTHON" ] || fail "No native arm64 Python 3.12 found. Install it (e.g. brew install python@3.12) or pass --python PATH."
 [ "$("$PYTHON" -c 'import platform; print(platform.machine())')" = arm64 ] || fail "$PYTHON is not a native arm64 Python."
 [ "$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')" = 3.12 ] || fail "$PYTHON is not Python 3.12."
 
