@@ -5,9 +5,25 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+HAVE_CLANG = sys.platform == "darwin" and subprocess.run(
+    ["/usr/bin/xcrun", "--find", "clang"], capture_output=True).returncode == 0
+
+# Stands in for Python 3.12 and the venv in install-mac.sh: answers its checks;
+# with PIP_FAILS=1 every package install from a requirements file fails.
+FAKE_VENV_PYTHON = """#!/bin/bash
+case "$1 $2" in
+    "-c import platform"*) echo "${FAKE_ARCH:-arm64}"; exit 0 ;;
+    "-c import sys"*) echo 3.12; exit 0 ;;
+esac
+if [ "$1 $2 $3" = "-m pip install" ]; then
+    for arg in "$@"; do [ "$arg" = -r ] && [ "${PIP_FAILS:-0}" = 1 ] && exit 1; done
+fi
+exit 0
+"""
 
 
 def bare_copy_of_this_checkout(folder: Path) -> Path:
@@ -93,6 +109,68 @@ class MacInstallerTests(unittest.TestCase):
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn("not Sotto", refused.stderr)
             self.assertNotIn("would run", refused.stdout)
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+                              cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    def installed_copy(self, folder: Path) -> tuple[dict, Path, str]:
+        """A copy downloaded by get.sh, with a stand-in venv, and a newer version on 'GitHub'."""
+        dest = folder / "sotto"
+        remote = bare_copy_of_this_checkout(folder)
+        env = dict(os.environ, SOTTO_REPO=str(remote), SOTTO_SOURCE=str(dest), SOTTO_PYTHON=sys.executable,
+                   SOTTO_GET_DRY_RUN="1")
+        first = self.run_piped(env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        upstream = folder / "upstream"
+        self.git(folder, "clone", "--quiet", str(remote), str(upstream))
+        (upstream / "CHANGES.txt").write_text("new version\n", encoding="utf-8")
+        self.git(upstream, "add", "CHANGES.txt")
+        self.git(upstream, "commit", "--quiet", "-m", "new version")
+        self.git(upstream, "push", "--quiet", "origin", "HEAD:main")
+        return env, dest, self.git(dest, "rev-parse", "HEAD")
+
+    @unittest.skipUnless(HAVE_CLANG, "install-mac.sh needs Apple's command line tools")
+    def test_an_update_whose_packages_fail_leaves_the_source_where_it_was(self):
+        # [N5] A re-run fast-forwarded the source first, then installed packages
+        # with no rollback, leaving new source on old packages.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            env, dest, before = self.installed_copy(folder)
+            fake = dest / "venv-alpha" / "bin" / "python"
+            fake.parent.mkdir(parents=True)
+            fake.write_text(FAKE_VENV_PYTHON)
+            fake.chmod(0o755)
+            bin_dir = folder / "bin"
+            bin_dir.mkdir()
+            opener = bin_dir / "open"  # never start a real Sotto
+            opener.write_text(f'#!/bin/bash\necho "$@" >> "{folder / "opened.txt"}"\n')
+            opener.chmod(0o755)
+            env = dict(env, SOTTO_PYTHON=str(fake), PIP_FAILS="1", SOTTO_DATA_DIR=str(folder / "data"),
+                       PATH=f"{bin_dir}:{os.environ['PATH']}")
+            env.pop("SOTTO_GET_DRY_RUN")
+            failed = self.run_piped(env)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("source was not switched", failed.stderr)
+            self.assertEqual(self.git(dest, "rev-parse", "HEAD"), before)
+            self.assertFalse((folder / "opened.txt").exists())
+
+    def test_an_update_refuses_while_sotto_runs_from_the_copy(self):
+        # [N26] get.sh pulled and reinstalled under a running Sotto.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            env, dest, before = self.installed_copy(folder)
+            running = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", str(dest.resolve() / "sotto.py")])
+            try:
+                time.sleep(0.2)
+                refused = self.run_piped(env)
+            finally:
+                running.kill()
+                running.wait()
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(f"Sotto is running from {dest} (process {running.pid})", refused.stderr)
+            self.assertNotIn("would run", refused.stdout)
+            self.assertEqual(self.git(dest, "rev-parse", "HEAD"), before)
 
     def test_the_same_repository_matches_in_https_and_ssh_form(self):
         script = (ROOT / "scripts" / "get.sh").read_text(encoding="utf-8")
