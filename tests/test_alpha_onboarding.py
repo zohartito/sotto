@@ -459,14 +459,15 @@ class ModelAndTemplateTests(unittest.TestCase):
         self.assertTrue(snapshot.call_args.kwargs['local_files_only'])
 
     @unittest.skipUnless(sys.platform == 'darwin', 'LaunchAgent templates use POSIX paths')
-    def test_every_test_module_and_top_level_source_ships_in_the_archive(self):
+    def test_every_test_module_source_and_workflow_ships_in_the_archive(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('build_alpha_source', ROOT / 'scripts/build_alpha_source.py')
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
         shipped = set(builder.PUBLIC_FILES)
         missing = [path.relative_to(ROOT).as_posix()
-                   for path in [*ROOT.glob('tests/*.py'), *ROOT.glob('*.py')]
+                   for path in [*ROOT.glob('tests/*.py'), *ROOT.glob('*.py'),
+                                *ROOT.glob('.github/workflows/*.yml')]
                    if path.relative_to(ROOT).as_posix() not in shipped]
         self.assertEqual(missing, [])
 
