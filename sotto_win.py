@@ -65,7 +65,11 @@ INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History
 # Restart waits this long for the dictation in flight: a long CPU dictation
 # finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
 RESTART_DRAIN_CAP_S = 300.0
+# Quit finishes the dictation in flight, up to this long: the Mac's
+# sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
+QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
+UNREAD_PASTE = "a paste the app has not read yet"  # in_flight()'s words for it
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
@@ -390,13 +394,26 @@ def doctor(profile: str, model: str | None, device: str, speed: str = "accurate"
 
 
 @contextmanager
-def console_close_handler(shutdown: sotto.ShutdownBoundary):
-    """Ctrl-Break and closing the console window arrive as SIGBREAK on Windows."""
-    previous = signal.signal(signal.SIGBREAK, shutdown.request)
+def console_signal_handlers(stop):
+    """Ctrl-C (SIGINT), Ctrl-Break (SIGBREAK) and SIGTERM call ``stop``; the
+    previous handlers come back afterwards.  Only the main thread installs
+    them (an embedded caller keeps its own).
+
+    Closing the console window also raises SIGBREAK, but Windows ends the
+    process as soon as the C runtime's console handler returns, before any
+    Python handler runs (measured: gone within 0.01 s), so a console close
+    never reaches ``stop`` or the teardown.
+    """
+    previous: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGBREAK):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, stop)
     try:
         yield
     finally:
-        signal.signal(signal.SIGBREAK, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def history_command(command: str, *, limit: int, entry_id: str | None,
@@ -446,24 +463,51 @@ class Controller:
     def __init__(self, **parts) -> None:
         self.__dict__.update(parts)
         self.restart_requested = False
+        # Restart, Update and Quit close the capture gate under this lock, so
+        # one of them never reopens a gate another has closed.
+        self._lifecycle_lock = threading.Lock()
 
     # dictation
-    def start_now(self) -> None:
-        if not self.shutdown.requested() and self.engine.force_start():
+    def start_now(self) -> str | None:
+        """Hands-free from the tray; refused (with a message) while a
+        Restart, Update or Quit drains.  A start that races the gate closing
+        is refused by on_start, which ends the gesture again."""
+        if self.shutdown.requested():
+            return None
+        closed = self.lifecycle["closed"]
+        if closed:
+            log(f"○ {closed} — dictation not started")
+            return f"Sotto is {closed}; dictation was not started."
+        if self.engine.force_start() and self.recording():
             log("● dictation started from the tray (hands-free)")
+        return None
 
     def finish_now(self) -> None:
         """Finish from the menu.  The menu took the focus away from the app
         being dictated into, so this dictation is copied, not inserted."""
         if self.shutdown.requested():
             return
-        # The finish may run later on whichever thread is draining gesture
-        # actions, so "copy" travels with it.
-        if self.engine.force_finish(finish=lambda: self.on_finish(copy_only=True)):
+        ended = self._end_recording()
+        if ended == "gesture":
             log("● finished from the tray (the text is copied)")
-        elif self.capture.is_active():
-            self.on_finish(copy_only=True)  # gesture engine desynced; end the capture anyway
+        elif ended == "orphan":
             log("● orphan capture finished from the tray")
+
+    def _end_recording(self) -> str | None:
+        """End the recording in progress so it is transcribed, not dropped.
+        A tray action took the focus, so its text is copied, not inserted.
+        The finish may run later on whichever thread is draining gesture
+        actions, so "copy" travels with it.
+
+        Returns "gesture", "orphan" (the capture outlived the gesture engine's
+        state and was ended directly) or None when nothing was recording.
+        """
+        if self.engine.force_finish(finish=lambda: self.on_finish(copy_only=True)):
+            return "gesture"
+        if self.capture.is_active():
+            self.on_finish(copy_only=True)  # gesture engine desynced; end the capture anyway
+            return "orphan"
+        return None
 
     def recording(self) -> bool:
         return self.engine.snapshot()[0]
@@ -477,6 +521,8 @@ class Controller:
             work.append(f"{self.jobs.unfinished_tasks} transcription job(s)")
         if self.deliveries.unfinished_tasks:
             work.append(f"{self.deliveries.unfinished_tasks} insertion(s)")
+        if win_inject.paste_settling():
+            work.append(UNREAD_PASTE)
         return work
 
     def busy(self) -> bool:
@@ -492,9 +538,18 @@ class Controller:
         if entry:
             win_inject.copy_text(entry["text"])
 
-    def retry(self, entry_id: str) -> None:
-        self.shutdown.enqueue(self.jobs, ("retry", entry_id, time.monotonic(), uuid.uuid4().hex,
-                                          self.current_speech_config()))
+    def retry(self, entry_id: str) -> str:
+        """Transcribe a History entry again; returns the tray's message.
+        Refused while a Restart, Update or Quit drains: new work would keep
+        it waiting.  Checked and queued under _lifecycle_lock, so a drain
+        that closes the gate afterwards sees this Retry as in flight."""
+        with self._lifecycle_lock:
+            closed = self.lifecycle["closed"]
+            if closed or self.shutdown.requested():
+                return f"Not retried: Sotto is {closed or 'stopping'}."
+            self.shutdown.enqueue(self.jobs, ("retry", entry_id, time.monotonic(),
+                                              uuid.uuid4().hex, self.current_speech_config()))
+        return "Retrying — the new text is copied when ready."
 
     def delete(self, entry_id: str) -> None:
         if not self.shutdown.requested():
@@ -587,17 +642,20 @@ class Controller:
         transcribed or inserted finishes first, however slowly the model runs
         (a long dictation on the CPU can take well over 20 s), up to
         RESTART_DRAIN_CAP_S: past that the model call is taken to be wedged,
-        and the restart goes ahead and logs what it abandoned.  Quit still
-        stops at once.
+        and the restart goes ahead and logs what it abandoned.  A Quit chosen
+        meanwhile takes over (and waits at most QUIT_DRAIN_S).
 
         Side effects: refuses new captures from now on; requests shutdown once idle.
         """
-        if self.shutdown.requested():
-            return "Sotto is already stopping."
-        if self.restart_requested:
-            return "Restarting…"
-        self.restart_requested = True
-        self.lifecycle["restarting"] = True  # on_start takes no new capture from now on
+        with self._lifecycle_lock:
+            if self.shutdown.requested() or self.lifecycle["closed"] == "quitting":
+                return "Sotto is already stopping."
+            if self.restart_requested:
+                return "Restarting…"
+            if self.lifecycle["closed"]:
+                return "Sotto is updating; it restarts when that is done."
+            self.restart_requested = True
+            self._close_gate("restarting")  # on_start takes no new capture from now on
         if not self.busy():
             log("● restart requested from the tray")
             self.shutdown.request()
@@ -628,22 +686,109 @@ class Controller:
     def update_and_restart(self) -> str:
         """Hand the update to scripts/update-windows.ps1: Windows keeps a
         running Python's files in use, so it waits for Sotto to quit, updates,
-        and starts Sotto again."""
-        if self.busy():
-            return "Finish the current dictation first, then update."
-        root = Path(__file__).resolve().parent
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
-                          "-File", str(root / "scripts" / "update-windows.ps1"),
-                          "-DataDir", str(DATA_DIR), "-VenvDir", sys.prefix],
-                         close_fds=True, creationflags=flags, cwd=str(root))
+        and starts Sotto again.
+
+        Side effects: closes the capture gate before the busy check, so no
+        recording can start between the check and the quit; reopens it when
+        the update is refused or the updater cannot be started.
+        """
+        with self._lifecycle_lock:
+            if self.shutdown.requested() or self.lifecycle["closed"]:
+                return "Sotto is already restarting or quitting."
+            self._close_gate("updating")
+        try:
+            work = self.in_flight()
+            if work:
+                self._reopen_gate("updating")
+                if work == [UNREAD_PASTE]:
+                    # A Ctrl+V the app never reads holds Update until the
+                    # clipboard is put back, at most RENDER_WAIT_S.
+                    return ("The last paste has not been read by its app yet; "
+                            f"try again in {win_inject.RENDER_WAIT_S:.0f} seconds.")
+                return "Finish the current dictation first, then update."
+            root = Path(__file__).resolve().parent
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy",
+                              "Bypass", "-File", str(root / "scripts" / "update-windows.ps1"),
+                              "-DataDir", str(DATA_DIR), "-VenvDir", sys.prefix],
+                             close_fds=True, creationflags=flags, cwd=str(root))
+        except BaseException:
+            self._reopen_gate("updating")
+            raise
         log("● updating Sotto; it restarts when the update is done")
         self.quit()
         return "Updating — Sotto restarts when it is done."
 
     def quit(self) -> None:
-        self.restart_requested = False
-        self.shutdown.request()
+        """Quit once the dictation in flight is done: recorded, transcribed
+        and inserted (the app has read its paste), waiting at most
+        QUIT_DRAIN_S — the Mac's Quit.  Returns at once: the tray calls this
+        on its menu thread, so the drain runs on a thread of its own.
+
+        Side effects: refuses new recordings from now on; ends a recording in
+        progress (even one the gesture engine lost) as the tray's Finish does;
+        requests shutdown once idle or when the wait runs out.
+        """
+        with self._lifecycle_lock:
+            self.restart_requested = False  # Quit wins over a pending restart
+            if self.shutdown.requested() or self.lifecycle["closed"] == "quitting":
+                return
+            self._close_gate("quitting")
+
+        def finish_then_stop() -> None:
+            # Whatever fails here, Quit stops Sotto: the gate is already
+            # closed as "quitting", so a later Quit would return at once.
+            try:
+                try:
+                    ended = self._end_recording()
+                except Exception as exc:
+                    ended = None
+                    log(f"! could not finish the recording before quitting: {str(exc)[:160]}")
+                if ended:
+                    log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} "
+                        "before quitting (the text is copied)")
+                if not drain_until_idle(lambda: self.busy() and not self.shutdown.requested(),
+                                        deadline_s=QUIT_DRAIN_S, clock=self.clock,
+                                        sleep=self.sleep):
+                    log(f"! quitting anyway after {QUIT_DRAIN_S:.0f}s; "
+                        f"abandoned: {', '.join(self.in_flight())}")
+            except Exception as exc:
+                log(f"! quitting without waiting: {str(exc)[:160]}")
+            finally:
+                self.shutdown.request()
+
+        threading.Thread(target=finish_then_stop, daemon=True, name="sotto-quit").start()
+
+    def console_stop(self, *_signal) -> None:
+        """Ctrl-C, Ctrl-Break or SIGTERM in a console run: the first one
+        quits like the tray's Quit, finishing the dictation in flight (up to
+        QUIT_DRAIN_S); another one while that drain runs stops at once.
+        Never a restart.  Runs as a signal handler on the main thread, which
+        never holds _lifecycle_lock."""
+        with self._lifecycle_lock:
+            draining = self.lifecycle["closed"] == "quitting"
+        if draining or self.shutdown.requested():
+            self.stop_now()
+        else:
+            self.quit()  # also cancels a restart waiting for the dictation
+
+    def stop_now(self) -> None:
+        """Stop without waiting for the work in flight, and never restart."""
+        with self._lifecycle_lock:
+            self.restart_requested = False
+            self.shutdown.request()
+
+    def _close_gate(self, reason: str) -> None:
+        """Refuse new recordings; on_start logs ``reason``.  Caller holds _lifecycle_lock."""
+        self.lifecycle["closed"] = reason  # set first: whoever sees the gate closed reads it
+        self.capture_gate.close()
+
+    def _reopen_gate(self, reason: str) -> None:
+        """Reopen the gate, only if ``reason`` still holds it (a Quit may have taken over)."""
+        with self._lifecycle_lock:
+            if self.lifecycle["closed"] == reason:
+                self.capture_gate.reopen()
+                self.lifecycle["closed"] = None
 
 
 def run(trigger: str, profile: str, model: str | None, language: str | None,
@@ -726,7 +871,11 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     deliveries: queue.Queue = queue.Queue()
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
     vad_warnings: set[str] = set()
-    lifecycle = {"restarting": False}
+    # Restart, Update and Quit close the gate (the reason goes in lifecycle);
+    # on_start decides and begins a capture under it, so a closer either sees
+    # that capture as in flight or the capture is refused.
+    capture_gate = sotto.CaptureGate()
+    lifecycle: dict = {"closed": None}
     # Captures between capture.end() and their enqueue still count as busy.
     finishing_lock = threading.Lock()
     finishing_count = [0]
@@ -1001,12 +1150,18 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     def on_start() -> None:
         if shutdown.requested():
             return
-        if lifecycle["restarting"]:
-            # A restart is draining: a new capture would keep it waiting and
-            # then be cut off by the shutdown.  The mic stays closed.
-            log("○ restarting — this press is ignored")
+        with capture_gate.starting() as may_start:
+            if may_start:
+                cold = capture.begin()
+        if not may_start:
+            # A restart, update or Quit is draining: a new capture would
+            # keep it waiting and then be cut off.  The mic stays closed, and
+            # the gesture ends too (the Mac's on_mic_failed does the same), or
+            # the engine would believe it is recording: the tray would offer
+            # "Finish dictation" and a hands-free start would stay armed.
+            log(f"○ {lifecycle['closed']} — this press is ignored")
+            engine.force_finish()
             return
-        cold = capture.begin()
         ui_state("recording")
         now = time.monotonic()
         # CPU int8 needs no rewarm, and one decode there costs about as much
@@ -1166,7 +1321,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         on_finish=on_finish, current_speech_config=current_speech_config,
         language_lock=language_lock, language_state=language_state, speed=speed,
         trigger_locked=trigger_locked, model_repo=model_repo, whisper=whisper,
-        lifecycle=lifecycle, finishing=finishing)
+        lifecycle=lifecycle, finishing=finishing, capture_gate=capture_gate)
 
     transcription_thread.start()
     delivery_thread = threading.Thread(target=delivery_worker, daemon=True)
@@ -1178,16 +1333,18 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         + ("· tray menu for options" if tray else "· ^C to quit"))
     if ui is not None:
         ui.attach(controller)
-    # The handlers stay installed through teardown, so a second Ctrl-C during
-    # the drain only re-requests shutdown instead of interrupting it.
-    with sotto.shutdown_signal_handlers(shutdown), console_close_handler(shutdown):
+    # The handlers stay installed through teardown, so a Ctrl-C during the
+    # teardown only re-requests shutdown instead of interrupting it.
+    with console_signal_handlers(controller.console_stop):
         try:
             # Short waits keep the main thread returning to the interpreter,
             # which is where Windows delivers Ctrl-C and Ctrl-Break.
             while not shutdown.event.wait(0.2):
                 pass
         except KeyboardInterrupt:
-            shutdown.request()
+            # Only without the handlers above (run() off the main thread);
+            # the teardown below starts at once, so there is no drain.
+            controller.stop_now()
         finally:
             log("shutting down")
             shutdown.stop_capture(capture)

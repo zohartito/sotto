@@ -175,19 +175,27 @@ class WindowsUpdateTests(unittest.TestCase):
         import win_ui
         capture = mock.Mock()
         capture.is_active.return_value = False
+        engine = mock.Mock()
+        engine.force_finish.return_value = False  # nothing is recording
+
+        def lifecycle_parts():
+            return dict(engine=engine, on_finish=mock.Mock(),
+                        capture_gate=sotto.CaptureGate(), lifecycle={"closed": None})
+
         busy_jobs = queue.Queue()
         busy_jobs.put("live")
         busy = sotto_win.Controller(shutdown=sotto.ShutdownBoundary(), capture=capture, jobs=busy_jobs,
                                     deliveries=queue.Queue(), finishing=lambda: False,
-                                    lifecycle={"restarting": False})
+                                    **lifecycle_parts())
         with mock.patch("subprocess.Popen") as spawn:
             self.assertIn("Finish the current dictation", busy.update_and_restart())
         spawn.assert_not_called()
         idle = sotto_win.Controller(shutdown=sotto.ShutdownBoundary(), capture=capture, jobs=queue.Queue(),
                                     deliveries=queue.Queue(), finishing=lambda: False,
-                                    lifecycle={"restarting": False})
+                                    **lifecycle_parts())
         with mock.patch("subprocess.Popen") as spawn, mock.patch.object(sotto_win, "log"):
             idle.update_and_restart()
+            idle.shutdown.event.wait(5)  # the quit drains on its own thread
         argv = spawn.call_args.args[0]
         self.assertTrue(argv[0].lower().startswith("powershell"))
         self.assertTrue(argv[argv.index("-File") + 1].endswith("update-windows.ps1"))

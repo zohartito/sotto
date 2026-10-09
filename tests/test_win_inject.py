@@ -284,6 +284,43 @@ class ClipboardPasterTest(unittest.TestCase):
             self.assertFalse(paster.paste("x"))
         self.assertEqual(self.sent, [])
 
+    def test_a_paste_settles_once_the_app_has_read_it_or_the_wait_ran_out(self) -> None:
+        # Ctrl+V is only queued for the app: until it reads the offer (or the
+        # wait runs out) the dictation is not delivered, so Quit counts it.
+        with mock.patch.object(win_inject, "_paster", self.paster):
+            self.assertFalse(win_inject.paste_settling())
+            self.paster.paste("dictated ")
+            self.assertTrue(win_inject.paste_settling(), "sent, but the app has not read it yet")
+            self.target_reads_and_watch()
+            self.assertFalse(win_inject.paste_settling())
+            self.paster.paste("unread ")
+            self.watchers[-1]()  # render_wait elapses without a read
+            self.assertFalse(win_inject.paste_settling())
+        with mock.patch.object(win_inject, "_paster", None):
+            self.assertFalse(win_inject.paste_settling(), "no paste yet: nothing to settle")
+
+    def test_a_paste_whose_watch_cannot_start_is_not_left_settling(self) -> None:
+        # The Ctrl+V was counted, then the watch thread could not start: the
+        # count never dropped, so every Quit waited out its drain, Restart its
+        # cap, and Update was refused for good.
+        logs: list = []
+
+        def no_thread(function):
+            raise RuntimeError("can't start new thread")
+
+        paster = win_inject.ClipboardPaster(self.clipboard, send=self.sent.append,
+                                            spawn=no_thread, log=logs.append)
+        outcome: list = []
+        try:
+            outcome.append(paster.paste("dictated "))
+        except RuntimeError as exc:
+            outcome.append(exc)
+        self.assertFalse(paster.settling(), "no watch will ever settle this paste")
+        self.assertEqual(outcome, [True], "the Ctrl+V was sent: the text was pasted")
+        self.assertEqual(len(logs), 1, logs)
+        paster.flush()  # the restore is still pending: the shutdown flush puts it back
+        self.assertEqual(self.clipboard.text(), "user")
+
     def test_flush_restores_immediately_at_shutdown(self) -> None:
         self.paster.paste("dictated ")
         self.paster.flush()

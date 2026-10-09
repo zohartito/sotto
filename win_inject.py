@@ -544,6 +544,7 @@ class ClipboardPaster:
         self._lock = threading.RLock()
         self._pending: _Pending | None = None
         self._generation = 0
+        self._unread = 0  # pastes whose Ctrl+V is sent but whose watch has not ended
 
     @property
     def clipboard(self):
@@ -595,13 +596,32 @@ class ClipboardPaster:
                     pass
                 self._restore(generation)  # nothing was pasted: put the clipboard back now
                 raise
-        self._spawn(lambda: self._watch(generation))
+            self._unread += 1
+        try:
+            self._spawn(lambda: self._watch(generation))
+        except Exception as exc:  # "can't start new thread"
+            with self._lock:
+                self._unread -= 1  # no watch will ever settle this paste
+            # The restore stays pending: the next paste reuses its snapshot,
+            # and the shutdown flush puts it back.
+            self._log(f"! clipboard restore not scheduled ({str(exc)[:80]}); "
+                      "it is put back on the next paste or at quit")
         return True
 
+    def settling(self) -> bool:
+        """A Ctrl+V was sent and the app has not read the text yet (nor has
+        the render wait run out): the paste is not delivered until then."""
+        with self._lock:
+            return self._unread > 0
+
     def _watch(self, generation: int) -> None:
-        if self.clipboard.rendered.wait(self._render_wait):
-            self._sleep(self._grace)
-        self._restore(generation)
+        try:
+            if self.clipboard.rendered.wait(self._render_wait):
+                self._sleep(self._grace)
+            self._restore(generation)
+        finally:
+            with self._lock:
+                self._unread -= 1
 
     def _restore(self, generation: int, attempts: int = RESTORE_ATTEMPTS) -> None:
         """Put the snapshot back; a busy clipboard is retried, and a restore
@@ -646,6 +666,13 @@ def flush_clipboard() -> None:
         current = _paster
     if current is not None:
         current.flush()
+
+
+def paste_settling() -> bool:
+    """A paste is still waiting for the app to read it (Quit waits for it)."""
+    with _paster_lock:
+        current = _paster
+    return current is not None and current.settling()
 
 
 def copy_text(text: str) -> None:
