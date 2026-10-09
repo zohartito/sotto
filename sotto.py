@@ -845,9 +845,15 @@ def _audio_devices() -> list[dict]:
         get_data(dev_id, fourcc("lnam"), fourcc("glob"), ref)
         if not ref.value:
             return ""
-        buf = ctypes.create_string_buffer(256)
-        cf.CFStringGetCString(ref, buf, 256, 0x08000100)
-        return buf.value.decode("utf-8", "replace")
+        try:
+            buf = ctypes.create_string_buffer(256)
+            cf.CFStringGetCString(ref, buf, 256, 0x08000100)
+            return buf.value.decode("utf-8", "replace")
+        finally:
+            # kAudioObjectPropertyName hands out a +1 CFStringRef that the
+            # caller owns; the idle device scan runs every 5 s, so an
+            # unreleased name leaked a string per device per scan.
+            cf.CFRelease(ref)
 
     def terminals(dev_id, scope) -> list[int]:
         arr = (ctypes.c_uint32 * 32)()
@@ -989,9 +995,10 @@ class CaptureService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
-        self._ring: list[np.ndarray] = []
+        self._ring: list[tuple[np.ndarray, float]] = []   # (block, its rate)
         self._ring_samples = 0
         self._active: list[np.ndarray] | None = None
+        self._active_rates: list[float] = []   # per-block rates, parallel to _active
         self._stream = None
         self._stream_enqueue = None
         self._next_expected = None
@@ -1009,6 +1016,7 @@ class CaptureService:
         self._process_started_at = time.monotonic()
         self._restart_deferred_at = 0.0
         self.restart_callback = None
+        self.on_start_failed = None   # runtime hook: the mic never came up under a capture
         self._release_thread = None
         self._last_device_scan = 0.0
         self._device_id = None
@@ -1024,13 +1032,17 @@ class CaptureService:
         # overlap. A release racing the next press used to be able to stop the
         # newly started capture.
         with self._lifecycle_lock:
-            self._start_engine_locked()
+            started = self._start_engine_locked()
+        if not started:
+            self._report_start_failure()
 
-    def _start_engine_locked(self) -> None:
+    def _start_engine_locked(self) -> bool:
         """Build, pin, and start the capture engine. NEVER raises — an audio
         error must not kill the daemon (a stale tap format threw straight out
         of installTapOnBus and took the whole process down, which launchd then
         restarted in a loop while dictations silently captured nothing).
+        Returns whether the engine is live afterwards; a False under an
+        in-flight capture is surfaced by _report_start_failure.
 
         The format must be re-read on a FRESH engine AFTER pinning: a device
         switch (AirPods run at 24 kHz, built-in at 48 kHz) briefly leaves the
@@ -1047,11 +1059,11 @@ class CaptureService:
         try:
             with self._lock:
                 if self._closed:
-                    return
+                    return False
             for attempt in range(5):
                 with self._lock:
                     if self._closed:
-                        return
+                        return False
                 # ONE engine for the process lifetime. Allocating a new
                 # AVAudioEngine per wake leaked its CoreAudio threads (43
                 # threads / 10 audio threads observed after ~50 wake cycles,
@@ -1100,18 +1112,37 @@ class CaptureService:
                             engine.stop()
                         except Exception:
                             pass
-                        return
+                        return False
                 self._engine = engine
                 self._node = node
                 self._last_block_at = time.monotonic()
                 self._engine_started_at = time.monotonic()
                 self._zero_since = None
-                return
+                return True
             log("! could not start the mic after 5 tries")
+            return False
         except Exception as exc:
             log(f"! mic engine error: {str(exc)[:150]}")
+            return False
         finally:
             self._starting = False
+
+    def _report_start_failure(self) -> None:
+        """The engine never came up: stop pretending. Clear the waking flag
+        so the overlay cannot flip to "mic live", and if a capture is waiting
+        on this engine hand it to the runtime hook, which ends the gesture
+        and tells the user once. Idle failures (the device scan switching
+        mics) stay quiet: the next press retries and reports then."""
+        with self._lock:
+            self._waking = False
+            pending = (self._active is not None and self._engine is None
+                       and not self._closed)
+        handler = self.on_start_failed
+        if pending and handler is not None:
+            try:
+                handler()
+            except Exception as exc:
+                log(f"! mic failure handler failed: {str(exc)[:120]}")
 
     def _release_engine(self, *, only_if_idle: bool = False) -> bool:
         with self._lifecycle_lock:
@@ -1119,7 +1150,13 @@ class CaptureService:
 
     def _release_engine_locked(self, *, only_if_idle: bool = False) -> bool:
         """Stop capture but KEEP the engine object — see _start_engine: a new
-        AVAudioEngine per wake leaks CoreAudio threads and CPU forever."""
+        AVAudioEngine per wake leaks CoreAudio threads and CPU forever.
+
+        Every teardown step runs even when an earlier one raises: a tap
+        removal that threw used to skip engine.stop(), and with the handle
+        already cleared nothing ever stopped that engine — idle Sotto kept
+        the microphone open. Returns True only when the engine actually
+        stopped; otherwise the handle stays so the next tick retries."""
         with self._lock:
             if only_if_idle and self._active is not None:
                 return False
@@ -1133,9 +1170,16 @@ class CaptureService:
         try:
             if node is not None:
                 node.removeTapOnBus_(0)
+        except Exception as exc:
+            log(f"! mic tap not removed: {str(exc)[:120]}")
+        try:
             engine.stop()
         except Exception as exc:
-            log(f"! mic release failed: {str(exc)[:120]}")
+            log(f"! mic engine not stopped: {str(exc)[:120]}")
+            with self._lock:
+                if not self._closed:
+                    self._engine, self._node = engine, node
+            return False
         return True
 
     def _observe_config_changes(self, engine) -> None:
@@ -1216,9 +1260,13 @@ class CaptureService:
                     self._release_engine()
                     self._start_engine()
                     return
-            if not active and idle_for > self.idle_release_s:
-                self._release_engine()
-                log("○ mic released (idle) — wakes on next press")
+            # Negative = never, exactly as release_soon reads it. only_if_idle:
+            # "idle" was decided under the lock a moment ago, and a press that
+            # lands in between must keep the engine it is about to record on.
+            if (not active and self.idle_release_s >= 0
+                    and idle_for > self.idle_release_s):
+                if self._release_engine(only_if_idle=True):
+                    log("○ mic released (idle) — wakes on next press")
         except Exception as exc:
             log(f"! mic health check failed: {str(exc)[:120]}")
 
@@ -1334,6 +1382,7 @@ class CaptureService:
                 return
             if all(not block.any() for block in self._active):
                 self._active = []
+                self._active_rates = []
 
     def _tap(self, buffer, when) -> None:
         n = int(buffer.frameLength())
@@ -1370,19 +1419,25 @@ class CaptureService:
             self.native_rate = float(buffer.format().sampleRate())
         except Exception:
             pass
+        rate = self.native_rate
         with self._lock:
             if self._active is not None:
+                # Each block keeps its own rate: a route change mid-recording
+                # (built-in 48 kHz -> AirPods 24 kHz) rebuilds the engine
+                # under a live capture, and end() must not read the earlier
+                # blocks at the later device's rate.
                 self._active.append(block)
+                self._active_rates.append(rate)
                 if self._stream is not None:
                     # Only queue references on the tap. Resampling and ASR run
                     # on the existing serialized transcription worker.
-                    self._stream_enqueue(("stream-audio", self._stream, block, self.native_rate))
+                    self._stream_enqueue(("stream-audio", self._stream, block, rate))
             else:
-                self._ring.append(block)
+                self._ring.append((block, rate))
                 self._ring_samples += len(block)
-                limit = int(RING_S * self.native_rate)
+                limit = int(RING_S * rate)
                 while self._ring_samples > limit and len(self._ring) > 1:
-                    self._ring_samples -= len(self._ring.pop(0))
+                    self._ring_samples -= len(self._ring.pop(0)[0])
 
     def begin(self, *, stream=None, enqueue=None) -> None:
         cold_start = False
@@ -1393,18 +1448,21 @@ class CaptureService:
                 self._stream.cancelled.set()
                 self._stream_enqueue(("stream-close", self._stream))
             preroll: list[np.ndarray] = []
+            preroll_rates: list[float] = []
             needed = int(PREROLL_S * self.native_rate)
             collected = 0
-            for block in reversed(self._ring):
+            for block, rate in reversed(self._ring):
                 preroll.insert(0, block)
+                preroll_rates.insert(0, rate)
                 collected += len(block)
                 if collected >= needed:
                     break
             self._active = preroll
+            self._active_rates = preroll_rates
             self._stream, self._stream_enqueue = stream, enqueue
             if stream is not None:
-                for block in preroll:
-                    enqueue(("stream-audio", stream, block, self.native_rate))
+                for block, rate in zip(preroll, preroll_rates):
+                    enqueue(("stream-audio", stream, block, rate))
             self._last_use = time.monotonic()
             # A start that never completed must not block every future wake —
             # treat a stale "starting" flag as dead and try again.
@@ -1425,16 +1483,25 @@ class CaptureService:
         """True until audio actually flows after a cold start (up to ~5s)."""
         return self._waking
 
+    def is_live(self) -> bool:
+        """An engine is up; False after a start that failed every try."""
+        with self._lock:
+            return self._engine is not None
+
     def end(self, *, include_stream=False):
         with self._lock:
             frames, self._active = self._active or [], None
+            rates, self._active_rates = self._active_rates, []
             stream, self._stream = self._stream, None
             self._stream_enqueue = None
             self._last_use = time.monotonic()
         if not frames:
             empty = np.zeros(0, dtype=np.float32)
             return (empty, stream) if include_stream else empty
-        samples = np.concatenate(frames).reshape(-1)
+        # Blocks placed directly (tests, old callers) carry no rate: they are
+        # at the current one, which is also what the caller reads next.
+        rates = rates + [self.native_rate] * (len(frames) - len(rates))
+        samples = join_capture_blocks(frames, rates, self.native_rate)
         # A hold shorter than the in-capture silence watch (3s) ends before
         # tick() can react, so short presses would keep landing on the same
         # wedged input unit forever (2026-09-20: 1.37s and 1.88s holds, peak
@@ -1453,6 +1520,7 @@ class CaptureService:
                 self._stream_enqueue(("stream-close", self._stream))
             self._stream = self._stream_enqueue = None
             self._active = None
+            self._active_rates = []
             self._last_use = time.monotonic()
 
     def is_active(self) -> bool:
@@ -1500,6 +1568,33 @@ class CaptureService:
             thread.join(timeout)
         return thread is None or not thread.is_alive()
 
+
+def join_capture_blocks(frames: list, rates: list, target_rate: float) -> np.ndarray:
+    """Join tap blocks into one signal at target_rate.
+
+    A route change mid-recording (built-in mic at 48 kHz, then AirPods at
+    24 kHz) leaves blocks of both rates in one capture. Reading them all at
+    the last device's rate stretched the earlier speech to twice its length
+    and halved its pitch; instead every run of same-rate blocks is resampled
+    on its own before the runs are concatenated."""
+    runs: list[tuple[list, float]] = []
+    for block, rate in zip(frames, rates):
+        if runs and runs[-1][1] == rate:
+            runs[-1][0].append(block)
+        else:
+            runs.append(([block], rate))
+    pieces = []
+    for blocks, rate in runs:
+        samples = np.concatenate(blocks).reshape(-1)
+        if rate != target_rate and rate > 0 and target_rate > 0:
+            from fractions import Fraction
+
+            from scipy.signal import resample_poly
+            ratio = Fraction(int(target_rate), int(rate)).limit_denominator(1000)
+            samples = resample_poly(samples, ratio.numerator,
+                                    ratio.denominator).astype(np.float32)
+        pieces.append(samples)
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
 
 
 def prepare_for_whisper(raw: np.ndarray, native_rate: float) -> np.ndarray:
@@ -1581,11 +1676,16 @@ def collapse_silence(samples: np.ndarray) -> np.ndarray:
 class GestureEngine:
     """Press/release edges -> hold / double-tap / discard decisions.
 
-    Every deadline carries an epoch token: any newer event invalidates it, so
-    a Timer callback that already fired but is waiting on the lock can never
-    act on stale state. Callbacks are invoked OUTSIDE the lock. The second
-    press of a double-tap is classified on its RELEASE: held short = arm
-    hands-free, held long = it was a deliberate push-to-talk.
+    Every key deadline carries an epoch token: any newer key event invalidates
+    it, so a Timer callback that already fired but is waiting on the lock can
+    never act on stale state. The hands-free watchdog is the exception: it
+    belongs to the capture, not the key epoch, so a stop tap whose release is
+    lost cannot disarm it — only ending or re-arming hands-free does.
+    Callbacks run OUTSIDE the lock, one at a time, in the order their
+    decisions were made: a decision queues its actions while it still holds
+    the lock, and whichever thread finds nobody draining runs the queue (see
+    _drain). The second press of a double-tap is classified on its RELEASE:
+    held short = arm hands-free, held long = it was a deliberate push-to-talk.
     """
 
     def __init__(self, on_start, on_finish, on_discard, on_hands_free=None) -> None:
@@ -1595,20 +1695,45 @@ class GestureEngine:
         self._on_hands_free = on_hands_free
         self._lock = threading.Lock()
         self._epoch = 0
+        self._hands_free_token = 0
         self._recording = False
         self._hands_free = False
         self._tap_pending = False      # a lone short tap awaits its verdict
         self._second_candidate = False
         self._pressed_at = 0.0
         self._last_tap_at = -1e9
+        self._pending: list = []       # actions decided, not yet run (in order)
+        self._draining = False
 
     def snapshot(self) -> tuple[bool, bool]:
         """(recording, hands_free) — for the lost-release resync poller."""
         with self._lock:
             return self._recording, self._hands_free
 
-    def _fire(self, callbacks) -> None:
-        for callback in callbacks:
+    def _queue(self, callbacks) -> None:
+        """Caller holds the lock: actions join the queue in decision order."""
+        self._pending.extend(callbacks)
+
+    def _drain(self) -> None:
+        """Run queued actions one at a time, in order, outside the lock.
+
+        The thread that finds nobody draining becomes the drainer and runs
+        everything queued, including what other threads add meanwhile; a
+        thread that arrives while another is draining has already queued its
+        actions under the lock and returns at once. So the event tap never
+        waits on a timer thread's callback, and a discard decided before a
+        start (the tap-expiry timer racing the next press) can never run
+        after it and kill the new capture."""
+        with self._lock:
+            if self._draining:
+                return
+            self._draining = True
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._draining = False
+                    return
+                callback = self._pending.pop(0)
             try:
                 callback()
             except Exception as exc:
@@ -1634,7 +1759,8 @@ class GestureEngine:
                 self._recording = True
                 fires.append(self._on_start)
             self._pressed_at = now
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def released(self) -> None:
         fires = []
@@ -1653,7 +1779,7 @@ class GestureEngine:
             elif self._second_candidate:
                 self._hands_free = True
                 self._epoch += 1
-                self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
+                self._arm_hands_free_watchdog()
                 log("● hands-free (tap again to stop)")
                 if self._on_hands_free is not None:
                     fires.append(self._on_hands_free)
@@ -1663,7 +1789,8 @@ class GestureEngine:
                 self._epoch += 1
                 self._schedule(DOUBLE_TAP_WINDOW_S, self._expire_tap)
             self._second_candidate = False
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_start(self) -> bool:
         """Menu-driven start: arm a hands-free recording without any key
@@ -1677,12 +1804,21 @@ class GestureEngine:
             self._tap_pending = False
             self._recording = True
             self._hands_free = True
-            self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
-        self._fire([self._on_start] + ([self._on_hands_free] if self._on_hands_free is not None else []))
+            self._arm_hands_free_watchdog()
+            fires.append(self._on_start)
+            if self._on_hands_free is not None:
+                fires.append(self._on_hands_free)
+            self._queue(fires)
+        self._drain()
         return True
 
-    def force_finish(self) -> bool:
-        """Menu escape hatch: end any in-flight recording as a normal finish."""
+    def force_finish(self, finish=None) -> bool:
+        """Menu escape hatch: end any in-flight recording as a normal finish.
+
+        `finish` replaces on_finish for this one decision. It may run after
+        this returns (another thread is draining), so anything the caller
+        wants that finish to know must travel inside it — never in state the
+        caller sets around this call."""
         fires = []
         with self._lock:
             self._epoch += 1
@@ -1691,8 +1827,9 @@ class GestureEngine:
             if self._recording:
                 self._recording = False
                 self._hands_free = False
-                fires.append(self._on_finish)
-        self._fire(fires)
+                fires.append(finish or self._on_finish)
+            self._queue(fires)
+        self._drain()
         return was_recording
 
     def chorded(self) -> None:
@@ -1708,7 +1845,8 @@ class GestureEngine:
             self._second_candidate = False
             self._recording = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_reset(self) -> None:
         """Sleep/lock/tap-disable recovery: drop any in-flight recording."""
@@ -1721,12 +1859,23 @@ class GestureEngine:
                 self._recording = False
                 self._hands_free = False
                 fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
-    def _schedule(self, delay: float, handler) -> None:
-        timer = threading.Timer(delay, handler, args=(self._epoch,))
+    def _schedule(self, delay: float, handler, token: int | None = None) -> None:
+        timer = threading.Timer(delay, handler,
+                                args=(self._epoch if token is None else token,))
         timer.daemon = True
         timer.start()
+
+    def _arm_hands_free_watchdog(self) -> None:
+        """Caller holds the lock. The watchdog is bound to THIS hands-free
+        capture: pressing the key again must not disarm it (a stop tap whose
+        release is lost used to leave the mic open forever), and a re-armed
+        hands-free gets a fresh token so the old deadline cannot end it."""
+        self._hands_free_token += 1
+        self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout,
+                       self._hands_free_token)
 
     def _expire_tap(self, epoch: int) -> None:
         fires = []
@@ -1736,18 +1885,20 @@ class GestureEngine:
             self._recording = False
             self._tap_pending = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
-    def _hands_free_timeout(self, epoch: int) -> None:
+    def _hands_free_timeout(self, token: int) -> None:
         fires = []
         with self._lock:
-            if epoch != self._epoch or not self._hands_free:
+            if token != self._hands_free_token or not self._hands_free:
                 return
             self._hands_free = False
             self._recording = False
             log(f"! hands-free watchdog ({HANDS_FREE_MAX_S:.0f}s) — finishing")
             fires.append(self._on_finish)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
 
 # -- clipboard injection (main thread only) ---------------------------------
@@ -2435,7 +2586,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 deadline = time.monotonic() + 10
                 while capture.is_waking() and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if engine.snapshot()[0]:
+                # A start that failed every try also ends the wait: say
+                # "live" only when an engine actually exists.
+                if engine.snapshot()[0] and capture.is_live():
                     ui_call(status_ui.show_recording)
                     log("● recording (mic live)")
 
@@ -2474,7 +2627,23 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if status_ui:
             ui_call(status_ui.show_hands_free, hands_free_hint(binding["trigger"]))
 
+    def on_mic_failed() -> None:
+        """The engine never started under this capture (device busy or gone).
+        End the gesture so the key-up finds nothing to finish, and say so
+        once — a dead mic used to show "recording" and then lose the dictation
+        without a word. Finishing (not discarding) keeps whatever a
+        mid-capture rebuild had already recorded."""
+        if engine.force_finish():
+            log("✗ could not start the microphone — dictation cancelled")
+        if status_ui:
+            ui_call(status_ui.show_error, "Could not start the microphone",
+                    "Sotto could not open the input device. Check that another app "
+                    "is not holding it and that Sotto may use the microphone "
+                    "(System Settings → Privacy & Security → Microphone), then "
+                    "press the key again.")
+
     engine = GestureEngine(on_start, on_finish, on_discard, on_hands_free=on_hands_free)
+    capture.on_start_failed = on_mic_failed
     hotkey = parse_hotkey(hotkey_spec) if hotkey_spec else None
     hotkey_state: dict = {"pressed_at": None, "skip_up": False}
     if hotkey_spec and hotkey is None:
@@ -3255,6 +3424,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             nemotron.close()
 
 
+def doctor_input_probe() -> int:
+    """The doctor's input check, run in a subprocess (see doctor): pin the
+    same mic a key press pins, THEN read the input bus format the tap will
+    use. The output bus of an unpinned engine describes the system default
+    device — a USB interface at 96 kHz / 2 ch, say — while dictation records
+    the pinned built-in or headset mic at its own rate."""
+    from AVFoundation import AVAudioEngine
+    engine = AVAudioEngine.alloc().init()
+    node = engine.inputNode()
+    _pin_input_to_builtin(node)   # logs "mic: <which one>" on stderr
+    fmt = node.inputFormatForBus_(0)
+    print(f"{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch")
+    return 0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1
+
+
 def doctor() -> None:
     import subprocess
     import ApplicationServices
@@ -3269,20 +3453,22 @@ def doctor() -> None:
     # Probe the input device in a subprocess: CoreAudio hard-crashes (a native
     # SIGSEGV, not a catchable exception) in sessions with no usable audio
     # context, and a diagnostic must survive the conditions it diagnoses.
-    probe = ("from AVFoundation import AVAudioEngine; "
-             "engine = AVAudioEngine.alloc().init(); "
-             "node = engine.inputNode(); fmt = node.outputFormatForBus_(0); "
-             "print(f'{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch'); "
-             "raise SystemExit(0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1)")
+    # The probe is doctor_input_probe: the capture path's own pin + input bus.
+    probe = "import sotto; raise SystemExit(sotto.doctor_input_probe())"
     try:
         result = subprocess.run([sys.executable, "-c", probe],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30,
+                                cwd=str(Path(__file__).resolve().parent))
     except subprocess.TimeoutExpired:
         log("✗ input device: probe timed out (waiting on a permission prompt?)")
     else:
         if result.returncode == 0:
             usable_input = True
-            log(f"✓ input device: {result.stdout.strip()} (AVAudioEngine)")
+            mics = [line.strip()[len("mic:"):].strip()
+                    for line in result.stderr.splitlines()
+                    if line.strip().startswith("mic:")]
+            log(f"✓ input device: {result.stdout.strip()} "
+                f"({mics[0] if mics else 'AVAudioEngine'})")
         else:
             log("✗ input device: no usable audio input in this session "
                 "(microphone permission missing, or headless/SSH context)")
