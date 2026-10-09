@@ -397,6 +397,13 @@ class QuitDrainTests(unittest.TestCase):
             self.assertNotIn("jobs.unfinished_tasks", source, name)
             self.assertIn("dictation_in_flight(capture, jobs, pending_deliveries)", source, name)
 
+    def test_the_update_restart_wait_has_a_deadline(self):
+        # The gate is closed while it waits, so a wedged native call (or a paste
+        # count that never drops) must not refuse recordings forever.
+        source = _closure_source("action_apply_update")
+        self.assertIn("deadline_s=UPDATE_DRAIN_DEADLINE_S", source)
+        self.assertGreater(sotto.UPDATE_DRAIN_DEADLINE_S, sotto.HANDS_FREE_MAX_S)  # outlasts any recording
+
 
 class FinishCaptureNowTests(unittest.TestCase):
     """Finish now and Quit both end a capture the gesture engine lost track of."""

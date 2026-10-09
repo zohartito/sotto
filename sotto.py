@@ -58,6 +58,9 @@ HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
 QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
+# An installed update restarts once dictation is done: the longest recording
+# (the hands-free watchdog) plus time to transcribe and paste it, then anyway.
+UPDATE_DRAIN_DEADLINE_S = HANDS_FREE_MAX_S + 120.0
 RESTART_RELEASE_WAIT_S = 2.0     # bounded wait for the async mic teardown before exec
 FAST_MARGIN_FRAMES = 500         # Fast: encode the speech plus 5 s, not a padded 30 s
 MODEL_REWARM_AFTER_S = 240.0
@@ -3780,7 +3783,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     # and the user may have dictated while the update ran. Refuse new
                     # recordings first, then drain, so none can start in between.
                     capture_gate.close()
-                    wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries))
+                    if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                                           deadline_s=UPDATE_DRAIN_DEADLINE_S):
+                        log(f"! dictation still running after {UPDATE_DRAIN_DEADLINE_S:.0f}s — "
+                            "restarting into the update anyway")
                     action_restart(after_failure=capture_gate.reopen)
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
