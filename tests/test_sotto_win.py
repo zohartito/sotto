@@ -189,9 +189,14 @@ class RestartTest(unittest.TestCase):
             jobs.put("live")
         capture = mock.Mock()
         capture.is_active.return_value = False
+        engine = mock.Mock()
+        engine.force_finish.return_value = False  # nothing is recording
         return sotto_win.Controller(shutdown=sotto.ShutdownBoundary(), capture=capture,
                                     jobs=jobs, deliveries=deliveries, finishing=lambda: False,
-                                    lifecycle={"restarting": False}), jobs
+                                    engine=engine, on_finish=mock.Mock(),
+                                    finish_from_menu=threading.Event(),
+                                    capture_gate=sotto.CaptureGate(),
+                                    lifecycle={"closed": None}), jobs
 
     def test_restart_waits_for_in_flight_work_and_quit_cancels_it(self):
         controller, jobs = self.controller(busy=True)
@@ -211,10 +216,11 @@ class RestartTest(unittest.TestCase):
             self.assertEqual(idle.restart(), "Restarting…")
         self.assertTrue(idle.shutdown.requested())
         waiting, _jobs = self.controller(busy=True)
+        self.virtual_clock(waiting)
         with mock.patch.object(sotto_win, "log"):
             waiting.restart()
             waiting.quit()
-        self.assertTrue(waiting.shutdown.requested())
+            self.assertTrue(waiting.shutdown.event.wait(5))
         self.assertFalse(waiting.restart_requested, "Quit wins over a pending restart")
 
     def test_restart_and_speed_change_never_abandon_a_slow_dictation(self):
@@ -289,6 +295,104 @@ class RestartTest(unittest.TestCase):
         abandoned = [line for line in logs if "abandoned" in line]
         self.assertEqual(len(abandoned), 1, logs)
         self.assertIn("1 transcription job(s)", abandoned[0])
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class QuitAndUpdateTest(unittest.TestCase):
+    """Quit finishes the dictation in flight (up to QUIT_DRAIN_S, the Mac's
+    value); Update closes the capture gate before it checks for work."""
+
+    controller = RestartTest.controller
+    virtual_clock = staticmethod(RestartTest.virtual_clock)
+
+    def drain_polls(self, controller, done_at: dict) -> tuple[dict, list]:
+        """Virtual clock whose polls record (stopped, on the caller's thread);
+        each queue in ``done_at`` finishes its task at that virtual second."""
+        caller, polls = threading.current_thread(), []
+
+        def on_sleep(now):
+            polls.append((controller.shutdown.requested(), threading.current_thread() is caller))
+            for work, at in done_at.items():
+                if now >= at and work.unfinished_tasks:
+                    work.get_nowait()
+                    work.task_done()
+
+        return self.virtual_clock(controller, on_sleep), polls
+
+    def test_quit_waits_for_the_dictation_in_flight_off_the_callers_thread(self):
+        controller, jobs = self.controller(busy=True)
+        clock, polls = self.drain_polls(controller, {jobs: 3.0})
+        logs: list = []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.quit()  # the tray's menu thread: it returns at once
+            self.assertTrue(controller.shutdown.event.wait(5), "Quit stops once the dictation is done")
+        self.assertTrue(polls, "Quit waits for the dictation in flight")
+        self.assertFalse(any(stopped for stopped, _ in polls), "never stopped before it was done")
+        self.assertFalse(any(on_caller for _, on_caller in polls), "the drain runs off the tray thread")
+        self.assertGreaterEqual(clock["now"], 3.0)
+        self.assertFalse([line for line in logs if "anyway" in line], logs)
+        with controller.capture_gate.starting() as may_start:
+            self.assertFalse(may_start, "no new recording once Quit was chosen")
+
+    def test_quit_counts_a_pending_insertion_and_a_paste_the_app_has_not_read(self):
+        # A text queued for insertion, and then a Ctrl+V the app has not read
+        # yet (the clipboard offer is still ours), are both still in flight.
+        controller, _jobs = self.controller(busy=False)
+        controller.deliveries.put("text")
+        clock, polls = self.drain_polls(controller, {controller.deliveries: 2.0})
+        unread_until = 4.0
+        with mock.patch.object(sotto_win.win_inject, "paste_settling", create=True,
+                               new=lambda: clock["now"] < unread_until), \
+                mock.patch.object(sotto_win, "log"):
+            controller.quit()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertTrue(polls, "Quit waits for the insertion")
+        self.assertFalse(any(stopped for stopped, _ in polls))
+        self.assertGreaterEqual(clock["now"], unread_until, "and for the app to read the paste")
+
+    def test_quit_stops_waiting_after_the_macs_quit_drain(self):
+        controller, _jobs = self.controller(busy=True)  # a model call that never returns
+        clock, logs = self.virtual_clock(controller), []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.quit()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        anyway = [line for line in logs if "quitting anyway" in line]
+        self.assertEqual(len(anyway), 1, logs)
+        self.assertIn("1 transcription job(s)", anyway[0])
+        self.assertEqual(sotto_win.QUIT_DRAIN_S, 10.0, "the Mac's QUIT_DRAIN_S")
+        self.assertAlmostEqual(clock["now"], sotto_win.QUIT_DRAIN_S, delta=0.5)
+
+    def test_quit_ends_the_recording_in_progress_even_an_orphan(self):
+        for orphan in (False, True):
+            controller, _jobs = self.controller(busy=False)
+            self.virtual_clock(controller)
+            copied_finish = []
+            controller.engine.force_finish.side_effect = lambda: (
+                copied_finish.append(controller.finish_from_menu.is_set()), not orphan)[1]
+            controller.capture.is_active.return_value = orphan  # the engine lost track of it
+
+            def end_orphan():
+                copied_finish.append(controller.finish_from_menu.is_set())
+                controller.capture.is_active.return_value = False
+
+            controller.on_finish.side_effect = end_orphan
+            with mock.patch.object(sotto_win, "log"):
+                controller.quit()
+                self.assertTrue(controller.shutdown.event.wait(5))
+            # Ended like the tray's Finish: the menu took the focus, so it is copied.
+            self.assertEqual(copied_finish, [True, True] if orphan else [True], f"orphan={orphan}")
+            self.assertEqual(controller.on_finish.call_count, 1 if orphan else 0)
+            self.assertFalse(controller.finish_from_menu.is_set())
+
+    def test_a_restart_is_refused_while_quitting(self):
+        controller, jobs = self.controller(busy=True)
+        clock, _polls = self.drain_polls(controller, {jobs: 1.0})
+        with mock.patch.object(sotto_win, "log"):
+            controller.quit()
+            message = controller.restart()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertIn("stopping", message)
+        self.assertFalse(controller.restart_requested, "a Quit is never turned into a restart")
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
@@ -1058,6 +1162,147 @@ class FailureAndTeardownTest(unittest.TestCase):
         self.assertEqual(hooks[0].checks, 1)
         self.assertEqual(hooks[0].starts, 1, logs)
         self.assertNotIn("! keyboard listener died — restarting it", logs)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class QuitRunTest(unittest.TestCase):
+    """Quit in the running app: the dictation in flight is finished, never dropped."""
+
+    def run_app(self, fakes, drive, data, *, logs, boundaries, controllers, extra=()):
+        import contextlib
+        delivered, copied, results = [], [], {}
+
+        def guarded():
+            try:
+                drive(results)
+            except BaseException as exc:
+                results["error"] = exc
+                boundaries[0].request()
+
+        with contextlib.ExitStack() as stack:
+            _patched_run(stack, data, fakes, logs=logs, boundaries=boundaries, controllers=controllers)
+            stack.enter_context(mock.patch.object(
+                sotto_win.win_inject, "deliver", lambda text, **kwargs: delivered.append(text)))
+            stack.enter_context(mock.patch.object(sotto_win.win_inject, "copy_text", copied.append))
+            for patch in extra:
+                stack.enter_context(patch)
+            driver = threading.Thread(target=guarded, daemon=True)
+            driver.start()
+            results["restart"] = sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+            results["delivered_at_stop"] = list(delivered)
+            driver.join(10)
+        self.assertNotIn("error", results, results)
+        return results, delivered, copied
+
+    def test_quit_finishes_the_recording_in_progress_and_copies_it(self):
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs = [], [], [], []
+        fakes = _app_fakes(rate, [voiced], ["said before quitting"], hooks, [])
+
+        def drive(results):
+            _wait_for(lambda: controllers and hooks, "listening")
+            controllers[0].start_now()  # hands-free, from the tray
+            time.sleep(0.3)
+            controllers[0].quit()
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-quit-") as temporary:
+            data = Path(temporary)
+            results, delivered, copied = self.run_app(fakes, drive, data, logs=logs,
+                                                      boundaries=boundaries, controllers=controllers)
+            texts = [entry["text"] for entry in HistoryStore(data).entries(10)]
+
+        self.assertEqual(copied, ["said before quitting"], logs)  # like the tray's Finish
+        self.assertEqual(delivered, [])
+        self.assertEqual(texts, ["said before quitting"])
+        self.assertFalse(results["restart"], "Quit never restarts")
+
+    def test_quit_waits_for_the_transcription_and_its_insertion(self):
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs, whisper_calls = [], [], [], [], []
+        FakeWhisper, FakeCapture, FakeHook = _app_fakes(rate, [voiced], ["slow but finished"],
+                                                        hooks, whisper_calls)
+        model_started, model_release = threading.Event(), threading.Event()
+
+        class SlowWhisper(FakeWhisper):
+            def transcribe(self, samples, **kwargs):
+                if whisper_calls:  # past the startup warmup
+                    model_started.set()
+                    model_release.wait(10)
+                return super().transcribe(samples, **kwargs)
+
+        def drive(results):
+            _wait_for(lambda: controllers and hooks, "listening")
+            controller, hook = controllers[0], hooks[0]
+            hook.engine.pressed()
+            time.sleep(0.45)
+            hook.engine.released()
+            self.assertTrue(model_started.wait(10), "the model is transcribing")
+            controller.quit()
+            hook.engine.pressed()  # while Quit drains: refused, the mic stays closed
+            hook.engine.released()
+            hook.modifiers_held = True  # holds the insertion (and the drain) back
+            model_release.set()
+            _wait_for(lambda: any("insert deferred" in line for line in logs), "the deferred insert",
+                      timeout=10)
+            results["stopped_while_inserting"] = boundaries[0].requested()
+            results["opened"] = FakeCapture.opened
+            hook.modifiers_held = False
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-quit-") as temporary:
+            data = Path(temporary)
+            results, delivered, copied = self.run_app(
+                (SlowWhisper, FakeCapture, FakeHook), drive, data, logs=logs,
+                boundaries=boundaries, controllers=controllers)
+            texts = [entry["text"] for entry in HistoryStore(data).entries(10)]
+
+        self.assertEqual(results["delivered_at_stop"], ["slow but finished"], logs)
+        self.assertEqual(texts, ["slow but finished"])
+        self.assertFalse(results["stopped_while_inserting"], "Quit waits for the insertion")
+        self.assertEqual(results["opened"], 1, "no new capture while quitting")
+        self.assertIn("○ quitting — this press is ignored", logs)
+        self.assertNotIn("  an in-flight transcription was abandoned (never pasted or saved)", logs)
+
+    def test_quit_never_inserts_after_its_drain_gives_up(self):
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs = [], [], [], []
+        fakes = _app_fakes(rate, [voiced], ["kept in history"], hooks, [])
+
+        def drive(results):
+            _wait_for(lambda: controllers and hooks, "listening")
+            hook = hooks[0]
+            hook.modifiers_held = True  # a stuck modifier: the text can never be inserted
+            hook.engine.pressed()
+            time.sleep(0.45)
+            hook.engine.released()
+            _wait_for(lambda: any("insert deferred" in line for line in logs), "the deferred insert")
+            controllers[0].quit()
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-quit-") as temporary:
+            data = Path(temporary)
+            results, delivered, copied = self.run_app(
+                fakes, drive, data, logs=logs, boundaries=boundaries, controllers=controllers,
+                extra=[mock.patch.object(sotto_win, "QUIT_DRAIN_S", 0.5, create=True)])
+            hooks[0].modifiers_held = False  # released only after the app stopped
+            time.sleep(0.3)
+            texts = [entry["text"] for entry in HistoryStore(data).entries(10)]
+
+        self.assertEqual(delivered, [], "nothing is inserted after shutdown")
+        self.assertEqual(texts, ["kept in history"])
+        anyway = [line for line in logs if "quitting anyway" in line]
+        self.assertEqual(len(anyway), 1, logs)
+        self.assertIn("1 insertion(s)", anyway[0])
 
     def test_a_queued_insertion_never_outlives_its_own_wait(self):
         # [F46] Each queued text got a fresh modifier wait after the ones ahead

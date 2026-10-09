@@ -65,6 +65,9 @@ INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History
 # Restart waits this long for the dictation in flight: a long CPU dictation
 # finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
 RESTART_DRAIN_CAP_S = 300.0
+# Quit finishes the dictation in flight, up to this long: the Mac's
+# sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
+QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
@@ -446,6 +449,9 @@ class Controller:
     def __init__(self, **parts) -> None:
         self.__dict__.update(parts)
         self.restart_requested = False
+        # Restart and Quit close the capture gate under this lock, so
+        # one of them never reopens a gate another has closed.
+        self._lifecycle_lock = threading.Lock()
 
     # dictation
     def start_now(self) -> None:
@@ -457,13 +463,27 @@ class Controller:
         being dictated into, so this dictation is copied, not inserted."""
         if self.shutdown.requested():
             return
+        ended = self._end_recording()
+        if ended == "gesture":
+            log("● finished from the tray (the text is copied)")
+        elif ended == "orphan":
+            log("● orphan capture finished from the tray")
+
+    def _end_recording(self) -> str | None:
+        """End the recording in progress so it is transcribed, not dropped.
+        A tray action took the focus, so its text is copied, not inserted.
+
+        Returns "gesture", "orphan" (the capture outlived the gesture engine's
+        state and was ended directly) or None when nothing was recording.
+        """
         self.finish_from_menu.set()  # on_finish runs synchronously below
         try:
             if self.engine.force_finish():
-                log("● finished from the tray (the text is copied)")
-            elif self.capture.is_active():
+                return "gesture"
+            if self.capture.is_active():
                 self.on_finish()  # gesture engine desynced; end the capture anyway
-                log("● orphan capture finished from the tray")
+                return "orphan"
+            return None
         finally:
             self.finish_from_menu.clear()
 
@@ -479,6 +499,8 @@ class Controller:
             work.append(f"{self.jobs.unfinished_tasks} transcription job(s)")
         if self.deliveries.unfinished_tasks:
             work.append(f"{self.deliveries.unfinished_tasks} insertion(s)")
+        if win_inject.paste_settling():
+            work.append("a paste the app has not read yet")
         return work
 
     def busy(self) -> bool:
@@ -589,17 +611,20 @@ class Controller:
         transcribed or inserted finishes first, however slowly the model runs
         (a long dictation on the CPU can take well over 20 s), up to
         RESTART_DRAIN_CAP_S: past that the model call is taken to be wedged,
-        and the restart goes ahead and logs what it abandoned.  Quit still
-        stops at once.
+        and the restart goes ahead and logs what it abandoned.  A Quit chosen
+        meanwhile takes over (and waits at most QUIT_DRAIN_S).
 
         Side effects: refuses new captures from now on; requests shutdown once idle.
         """
-        if self.shutdown.requested():
-            return "Sotto is already stopping."
-        if self.restart_requested:
-            return "Restarting…"
-        self.restart_requested = True
-        self.lifecycle["restarting"] = True  # on_start takes no new capture from now on
+        with self._lifecycle_lock:
+            if self.shutdown.requested() or self.lifecycle["closed"] == "quitting":
+                return "Sotto is already stopping."
+            if self.restart_requested:
+                return "Restarting…"
+            if self.lifecycle["closed"]:
+                return "Sotto is updating; it restarts when that is done."
+            self.restart_requested = True
+            self._close_gate("restarting")  # on_start takes no new capture from now on
         if not self.busy():
             log("● restart requested from the tray")
             self.shutdown.request()
@@ -644,8 +669,38 @@ class Controller:
         return "Updating — Sotto restarts when it is done."
 
     def quit(self) -> None:
-        self.restart_requested = False
-        self.shutdown.request()
+        """Quit once the dictation in flight is done: recorded, transcribed
+        and inserted (the app has read its paste), waiting at most
+        QUIT_DRAIN_S — the Mac's Quit.  Returns at once: the tray calls this
+        on its menu thread, so the drain runs on a thread of its own.
+
+        Side effects: refuses new recordings from now on; ends a recording in
+        progress (even one the gesture engine lost) as the tray's Finish does;
+        requests shutdown once idle or when the wait runs out.
+        """
+        with self._lifecycle_lock:
+            self.restart_requested = False  # Quit wins over a pending restart
+            if self.shutdown.requested() or self.lifecycle["closed"] == "quitting":
+                return
+            self._close_gate("quitting")
+
+        def finish_then_stop() -> None:
+            ended = self._end_recording()
+            if ended:
+                log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} "
+                    "before quitting (the text is copied)")
+            if not drain_until_idle(lambda: self.busy() and not self.shutdown.requested(),
+                                    deadline_s=QUIT_DRAIN_S, clock=self.clock, sleep=self.sleep):
+                log(f"! quitting anyway after {QUIT_DRAIN_S:.0f}s; "
+                    f"abandoned: {', '.join(self.in_flight())}")
+            self.shutdown.request()
+
+        threading.Thread(target=finish_then_stop, daemon=True, name="sotto-quit").start()
+
+    def _close_gate(self, reason: str) -> None:
+        """Refuse new recordings; on_start logs ``reason``.  Caller holds _lifecycle_lock."""
+        self.lifecycle["closed"] = reason  # set first: whoever sees the gate closed reads it
+        self.capture_gate.close()
 
 
 def run(trigger: str, profile: str, model: str | None, language: str | None,
@@ -720,7 +775,11 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     deliveries: queue.Queue = queue.Queue()
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
     vad_warnings: set[str] = set()
-    lifecycle = {"restarting": False}
+    # Restart and Quit close the gate (the reason goes in lifecycle);
+    # on_start decides and begins a capture under it, so a closer either sees
+    # that capture as in flight or the capture is refused.
+    capture_gate = sotto.CaptureGate()
+    lifecycle: dict = {"closed": None}
     finish_from_menu = threading.Event()
     # Captures between capture.end() and their enqueue still count as busy.
     finishing_lock = threading.Lock()
@@ -996,12 +1055,13 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     def on_start() -> None:
         if shutdown.requested():
             return
-        if lifecycle["restarting"]:
-            # A restart is draining: a new capture would keep it waiting and
-            # then be cut off by the shutdown.  The mic stays closed.
-            log("○ restarting — this press is ignored")
-            return
-        cold = capture.begin()
+        with capture_gate.starting() as may_start:
+            if not may_start:
+                # A restart or Quit is draining: a new capture would
+                # keep it waiting and then be cut off.  The mic stays closed.
+                log(f"○ {lifecycle['closed']} — this press is ignored")
+                return
+            cold = capture.begin()
         ui_state("recording")
         now = time.monotonic()
         # CPU int8 needs no rewarm, and one decode there costs about as much
@@ -1162,7 +1222,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         on_finish=on_finish, current_speech_config=current_speech_config,
         language_lock=language_lock, language_state=language_state, speed=speed,
         trigger_locked=trigger_locked, model_repo=model_repo, whisper=whisper,
-        lifecycle=lifecycle, finish_from_menu=finish_from_menu, finishing=finishing)
+        lifecycle=lifecycle, finish_from_menu=finish_from_menu, finishing=finishing,
+        capture_gate=capture_gate)
 
     transcription_thread.start()
     delivery_thread = threading.Thread(target=delivery_worker, daemon=True)

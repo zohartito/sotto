@@ -284,6 +284,21 @@ class ClipboardPasterTest(unittest.TestCase):
             self.assertFalse(paster.paste("x"))
         self.assertEqual(self.sent, [])
 
+    def test_a_paste_settles_once_the_app_has_read_it_or_the_wait_ran_out(self) -> None:
+        # Ctrl+V is only queued for the app: until it reads the offer (or the
+        # wait runs out) the dictation is not delivered, so Quit counts it.
+        with mock.patch.object(win_inject, "_paster", self.paster):
+            self.assertFalse(win_inject.paste_settling())
+            self.paster.paste("dictated ")
+            self.assertTrue(win_inject.paste_settling(), "sent, but the app has not read it yet")
+            self.target_reads_and_watch()
+            self.assertFalse(win_inject.paste_settling())
+            self.paster.paste("unread ")
+            self.watchers[-1]()  # render_wait elapses without a read
+            self.assertFalse(win_inject.paste_settling())
+        with mock.patch.object(win_inject, "_paster", None):
+            self.assertFalse(win_inject.paste_settling(), "no paste yet: nothing to settle")
+
     def test_flush_restores_immediately_at_shutdown(self) -> None:
         self.paster.paste("dictated ")
         self.paster.flush()
