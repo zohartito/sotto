@@ -455,9 +455,19 @@ class Controller:
         self._lifecycle_lock = threading.Lock()
 
     # dictation
-    def start_now(self) -> None:
-        if not self.shutdown.requested() and self.engine.force_start():
+    def start_now(self) -> str | None:
+        """Hands-free from the tray; refused (with a message) while a
+        Restart, Update or Quit drains.  A start that races the gate closing
+        is refused by on_start, which ends the gesture again."""
+        if self.shutdown.requested():
+            return None
+        closed = self.lifecycle["closed"]
+        if closed:
+            log(f"○ {closed} — dictation not started")
+            return f"Sotto is {closed}; dictation was not started."
+        if self.engine.force_start() and self.recording():
             log("● dictation started from the tray (hands-free)")
+        return None
 
     def finish_now(self) -> None:
         """Finish from the menu.  The menu took the focus away from the app
@@ -1095,12 +1105,17 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         if shutdown.requested():
             return
         with capture_gate.starting() as may_start:
-            if not may_start:
-                # A restart, update or Quit is draining: a new capture would
-                # keep it waiting and then be cut off.  The mic stays closed.
-                log(f"○ {lifecycle['closed']} — this press is ignored")
-                return
-            cold = capture.begin()
+            if may_start:
+                cold = capture.begin()
+        if not may_start:
+            # A restart, update or Quit is draining: a new capture would
+            # keep it waiting and then be cut off.  The mic stays closed, and
+            # the gesture ends too (the Mac's on_mic_failed does the same), or
+            # the engine would believe it is recording: the tray would offer
+            # "Finish dictation" and a hands-free start would stay armed.
+            log(f"○ {lifecycle['closed']} — this press is ignored")
+            engine.force_finish()
+            return
         ui_state("recording")
         now = time.monotonic()
         # CPU int8 needs no rewarm, and one decode there costs about as much

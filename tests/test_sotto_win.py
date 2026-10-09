@@ -1491,6 +1491,46 @@ class QuitRunTest(unittest.TestCase):
         self.assertEqual(sum(line.startswith("! not inserted (a modifier key held") for line in logs), 2, logs)
         self.assertEqual(texts, ["first words", "second words"], "both stay in History")
 
+    def test_a_start_refused_by_the_closed_gate_leaves_the_gesture_idle(self):
+        # The engine marked itself recording before on_start met the closed
+        # gate: the tray offered "Finish dictation" and a hands-free start
+        # stayed armed with no microphone open.
+        import numpy as np
+
+        hooks, boundaries, controllers, logs = [], [], [], []
+        silence = np.zeros(0, dtype=np.float32)
+        fakes = _app_fakes(16_000, [silence, silence, silence], [], hooks, [])
+        seen: dict = {}
+
+        def drive(results):
+            _wait_for(lambda: controllers and hooks, "listening")
+            controller, engine = controllers[0], hooks[0].engine
+
+            def launch(*args, **kwargs):  # Update has closed the gate by now
+                seen["tray message"] = controller.start_now()
+                seen["after tray start"] = engine.snapshot()
+                engine.force_start()  # a tray start that raced the gate closing
+                seen["after raced tray start"] = engine.snapshot()
+                engine.pressed()  # the hotkey
+                seen["after key press"] = engine.snapshot()
+                engine.released()
+                return mock.Mock()
+
+            with mock.patch.object(sotto_win.subprocess, "Popen", side_effect=launch):
+                results["update"] = controller.update_and_restart()
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-gate-") as temporary:
+            results, _delivered, _copied = self.run_app(
+                fakes, drive, Path(temporary), logs=logs, boundaries=boundaries,
+                controllers=controllers)
+
+        self.assertEqual(seen["after tray start"], (False, False), "no phantom hands-free recording")
+        self.assertEqual(seen["after raced tray start"], (False, False), "on_start ends the gesture")
+        self.assertEqual(seen["after key press"], (False, False), "no phantom push-to-talk recording")
+        self.assertIn("updating", seen["tray message"])
+        self.assertIn("○ updating — this press is ignored", logs)
+        self.assertIn("Updating", results["update"])
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class ConsoleLogTest(unittest.TestCase):
