@@ -1,6 +1,7 @@
 """What happens to a finished transcript before anything is delivered.
 
-One path for live dictation and Retry, on macOS and Windows:
+One path for live dictation and Retry on macOS (Windows calls the same pieces
+through sotto's re-exports):
 
     raw transcript -> no-speech verdict -> hallucination guard (with
     repetition-loop salvage) -> personal dictionary -> English voice cleanup
