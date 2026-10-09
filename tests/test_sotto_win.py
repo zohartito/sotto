@@ -735,7 +735,7 @@ class RunPipelineTest(unittest.TestCase):
                     mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook), \
                     mock.patch.object(sotto_win.win_inject, "deliver", fake_deliver), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=saved), \
                     mock.patch.object(dictionary, "DICTIONARY_PATH", rules_file), \
@@ -785,6 +785,22 @@ class RunPipelineTest(unittest.TestCase):
     def test_an_unreadable_history_does_not_stop_dictation(self):
         """F16b: a damaged history.jsonl used to raise before the hotkey was
         armed, at every login. Now dictation works and the file is untouched."""
+        delivered, logs = self._dictate_once_with_damaged(
+            "history.jsonl", '{"id": "abc123", "text": "kept"}\n{"id": "def456", "text": "cut of')
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("hello world", delivered[0].lower())
+        self.assertEqual(sum(line.startswith("! History unreadable") for line in logs), 1, logs)
+
+    def test_a_damaged_learning_set_does_not_stop_dictation(self):
+        """N21: a damaged learning.jsonl raised the same way in LearningStore()."""
+        delivered, logs = self._dictate_once_with_damaged("learning/learning.jsonl", '{"sample_id": "cut of')
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("hello world", delivered[0].lower())
+        self.assertEqual(sum(line.startswith("! Learning set unreadable") for line in logs), 1, logs)
+
+    def _dictate_once_with_damaged(self, relative: str, content: str) -> tuple[list, list]:
+        """run() with ``relative`` under the data folder holding ``content``,
+        one dictation, then shutdown; the file must be left byte-for-byte."""
         import numpy as np
         from history import HistoryStore
         from learning import LearningStore
@@ -802,8 +818,9 @@ class RunPipelineTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="sotto-win-unreadable-") as temporary:
             data = Path(temporary)
-            index = data / "history.jsonl"
-            index.write_text('{"id": "abc123", "text": "kept"}\n{"id": "def456", "text": "cut of', encoding="utf-8")
+            index = data / relative
+            index.parent.mkdir(parents=True, exist_ok=True)
+            index.write_text(content, encoding="utf-8")
             before = index.read_bytes()
 
             def drive():
@@ -827,7 +844,7 @@ class RunPipelineTest(unittest.TestCase):
                     mock.patch.object(sotto_win.win_inject, "deliver",
                                       lambda text, **kwargs: delivered.append(text) or kwargs["mode"]), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
                     mock.patch.object(dictionary, "DICTIONARY_PATH", data / "dictionary.txt"), \
@@ -838,10 +855,8 @@ class RunPipelineTest(unittest.TestCase):
                 driver.start()
                 self.assertFalse(sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu"))
                 driver.join(5)
-            self.assertEqual(index.read_bytes(), before, "History is left exactly as it was")
-        self.assertEqual(len(delivered), 1)
-        self.assertIn("hello world", delivered[0].lower())
-        self.assertEqual(sum(line.startswith("! History unreadable") for line in logs), 1, logs)
+            self.assertEqual(index.read_bytes(), before, "the file is left exactly as it was")
+        return delivered, logs
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
@@ -930,7 +945,7 @@ class ControllerTest(unittest.TestCase):
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win, "save_language_mode",
@@ -1051,7 +1066,7 @@ class LifecycleTest(unittest.TestCase):
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
@@ -1148,7 +1163,7 @@ class LifecycleTest(unittest.TestCase):
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
@@ -1288,7 +1303,7 @@ def _patched_run(stack, data, fakes, *, logs, boundaries, controllers, settings=
             mock.patch.object(sotto_win.win_capture, "WinCapture", FakeCapture),
             mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook),
             mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)),
-            mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)),
+            mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)),
             mock.patch.object(sotto_win, "Controller", RecordingController),
             mock.patch.object(sotto_win, "load_language_mode", return_value="auto"),
             mock.patch.object(sotto_win.user_settings, "load",

@@ -19,9 +19,11 @@ from tests.test_nemotron import FakeRuntime
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Nemotron pipeline drives the AppKit runtime; macOS-only')
 class PipelineTests(unittest.TestCase):
-    def _run_one_dictation(self, directory: Path, make_store):
+    def _run_one_dictation(self, directory: Path, make_store, make_learning=None):
         """sotto.run with one streamed dictation, then Quit; History comes from
-        ``make_store(**kwargs)``. Returns (status UI mock, pasted, captures, runtime)."""
+        ``make_store(**kwargs)``, the learning store from ``make_learning(**kwargs)``
+        (default: one opened on ``directory``). Returns (status UI mock, pasted,
+        captures, runtime)."""
         callbacks, captures, pasted = {}, [], []
         delivered = threading.Event()
         runtime = FakeRuntime()
@@ -80,13 +82,17 @@ class PipelineTests(unittest.TestCase):
             callbacks["quit"]()
 
         with ExitStack() as stack:
-            learning_store = learning.LearningStore(directory)
+            if make_learning is None:
+                learning_store = learning.LearningStore(directory)
+
+                def make_learning(**_kwargs):
+                    return learning_store
             replacements = {
                 "sotto.CaptureService": Capture,
                 "sotto.inject": inject,
                 "nemotron_backend.NemotronRuntime": lambda: runtime,
                 "history.HistoryStore": make_store,
-                "learning.LearningStore": lambda: learning_store,
+                "learning.LearningStore": make_learning,
                 "ui.init_app": lambda: status,
                 "ui.run_loop": run_loop,
                 "ApplicationServices.AXIsProcessTrustedWithOptions": lambda _: True,
@@ -138,3 +144,22 @@ class PipelineTests(unittest.TestCase):
             alerts = [call.args for call in status.show_error.call_args_list]
             self.assertEqual([title for title, _ in alerts], [sotto.HISTORY_UNREADABLE_TITLE])
             self.assertIn(str(index), alerts[0][1])
+
+    def test_a_damaged_learning_set_still_launches_pastes_and_alerts_once(self):
+        """N21: a damaged learning.jsonl used to make LearningStore() raise
+        before the menu bar existed, so the LaunchAgent relaunched into the
+        same crash forever."""
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            damaged = Path(directory) / "learning" / "learning.jsonl"
+            damaged.parent.mkdir()
+            damaged.write_text('{"sample_id": "cut of', encoding="utf-8")
+            before = damaged.read_bytes()
+            real_store, real_learning = history.HistoryStore, learning.LearningStore
+            status, pasted, _captures, _runtime = self._run_one_dictation(
+                Path(directory), lambda **kwargs: real_store(Path(directory), **kwargs),
+                lambda **kwargs: real_learning(Path(directory), **kwargs))
+            self.assertEqual(pasted, ["Complete final transcript."])
+            self.assertEqual(damaged.read_bytes(), before)
+            alerts = [call.args for call in status.show_error.call_args_list]
+            self.assertEqual([title for title, _ in alerts], [sotto.LEARNING_UNREADABLE_TITLE])
+            self.assertIn(str(damaged), alerts[0][1])

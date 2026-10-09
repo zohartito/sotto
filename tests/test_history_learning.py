@@ -748,5 +748,45 @@ class HistoryLearningTests(unittest.TestCase):
                 self.live("never saved")
         self.assertEqual([entry["id"] for entry in self.history.entries()], [kept["id"]])
 
+    def test_a_damaged_learning_index_does_not_stop_the_app(self):
+        """N21: a damaged learning.jsonl or pending-gold.jsonl used to make
+        LearningStore() raise before the menu bar existed, at every login.
+        The app now opens it read-only (dictation works, nothing is saved or
+        swept, the user is told once); every other caller stays strict."""
+        import sotto
+        from history import HistoryUnreadable
+        for name in ("learning.jsonl", "pending-gold.jsonl"):
+            with self.subTest(name):
+                root = self.root / name
+                coordinator = LearningCoordinator(HistoryStore(root), LearningStore(root))
+                row = coordinator.append_live("kept words", np.array([-1.0, 0, 1.0], np.float32), .5, "model")
+                coordinator.correct(row["id"], "human words")
+                self.assertIsNotNone(coordinator.enroll(row["id"]))
+                damaged = root / "learning" / name
+                kept = damaged.read_text(encoding="utf-8") if damaged.exists() else ""
+                damaged.write_text(kept + '{"sample_id": "cut of\n', encoding="utf-8")
+                before = {path: path.read_bytes() for path in (root / "learning").rglob("*") if path.is_file()}
+                with self.assertRaisesRegex(RuntimeError, "malformed"):
+                    LearningStore(root)
+                learning = LearningStore(root, tolerate_unreadable=True)
+                self.assertIsNotNone(learning.unreadable)
+                with self.assertRaises(RuntimeError):
+                    learning.mark_pending_gold(row["id"], "code")
+                store = HistoryStore(root, tolerate_unreadable=True)
+                app = sotto.history_coordinator(store, learning)
+                self.assertIsInstance(app, sotto.UnsavedHistory)
+                delivered = app.append_live("please call me back", prepare_canonical(np.zeros(1600, np.float32)),
+                                            .1, "model", ts=5.0, provenance="live", adaptive=False)
+                self.assertEqual((delivered["text"], delivered["saved"]), ("please call me back", False))
+                with self.assertRaises(HistoryUnreadable):
+                    app.clear()
+                after = {path: path.read_bytes() for path in (root / "learning").rglob("*") if path.is_file()}
+                self.assertEqual(after, before, "the learning set is left exactly as it was")
+                title, message = sotto.unreadable_store_alert(store, learning)
+                self.assertEqual(title, sotto.LEARNING_UNREADABLE_TITLE)
+                self.assertIn(str(damaged), message)
+                self.assertIn("not saved to History", message)
+                self.assertEqual([entry["id"] for entry in HistoryStore(root).entries()], [row["id"]])
+
 if __name__ == "__main__":
     unittest.main()
