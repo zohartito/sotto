@@ -51,7 +51,15 @@ SILENCE_RESTART_AFTER_S = 600.0  # min process age before a dead-mic restart
 HOLD_THRESHOLD_S = 0.35
 DOUBLE_TAP_WINDOW_S = 0.40
 HANDS_FREE_MAX_S = 600.0        # watchdog: force-finish a forgotten open mic
-RESTORE_DELAY_S = 0.6
+# Clipboard restore after the synthetic ⌘V. Reading the pasteboard does not
+# change its changeCount and there is no public "the app has read it" signal,
+# so the restore is a bounded wait: long enough for an app that is briefly busy
+# at paste time (Electron hitches, a tab mid-layout) to still read Sotto's text
+# — the old 0.6 s handed such apps the user's OLD clipboard — and short enough
+# that a user ⌘V a few seconds later gets their own clipboard back. The restore
+# still runs only if changeCount is unchanged (a user ⌘C in the window wins),
+# and overlapping pastes carry the original forward (see inject()).
+RESTORE_DELAY_S = 3.0
 DELIVERY_POLL_S = 0.15           # re-check a held key this often before pasting
 DELIVERY_WAIT_MAX_S = 30.0       # key held, no recording: give up, the text stays in History
 SOTTO_EVENT_TAG = 0x534F5454     # "SOTT" in kCGEventSourceUserData on every key event Sotto posts

@@ -249,6 +249,30 @@ class ClipboardCarryForwardTests(unittest.TestCase):
         self.assertEqual(world.pasteboard.text(), "USER COPY")
 
 
+# -- F42: the restore gives a slow app time to read the pasteboard ---------------
+
+class RestoreWindowTests(unittest.TestCase):
+    def test_restore_waits_for_a_slow_app_then_puts_the_original_back(self):
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        world.timers.advance_to(1.5)  # the app is still busy handling ⌘V (the audit's repro)
+        self.assertEqual(world.pasteboard.text(), "dictation ", "restored before the app could read it")
+        world.timers.advance_to(sotto.RESTORE_DELAY_S + 0.01)
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+
+    def test_restore_delay_is_a_few_seconds_and_bounded(self):
+        self.assertGreaterEqual(sotto.RESTORE_DELAY_S, 2.0)
+        self.assertLessEqual(sotto.RESTORE_DELAY_S, 5.0)
+
+    def test_restore_still_checks_change_count_at_restore_time(self):
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        world.timers.advance_to(sotto.RESTORE_DELAY_S - 0.05)
+        world.pasteboard.user_copies("USER COPY")  # a ⌘C just before the restore fires
+        world.timers.advance_to(sotto.RESTORE_DELAY_S + 1.0)
+        self.assertEqual(world.pasteboard.text(), "USER COPY")
+
+
 # -- F10: Sotto's own key events are tagged ------------------------------------
 
 class OwnEventTagTests(unittest.TestCase):
