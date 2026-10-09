@@ -228,6 +228,27 @@ class WinCaptureTest(unittest.TestCase):
         capture.end()
         self._wait_closed(streams[1])
 
+    def test_a_failed_open_is_reported_once_to_the_app(self) -> None:
+        # [N2] A failed open only logged: the app went on "recording" a
+        # capture that could not exist.
+        failures: list = []
+        logs: list[str] = []
+
+        def factory(**kwargs):
+            raise OSError("Error opening InputStream: Device unavailable")
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=logs.append)
+        capture.on_start_failed = lambda: failures.append(capture.is_active())
+        self.assertTrue(capture.begin())
+        for _ in range(500):  # up to 5 s
+            if failures:
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+        self.assertEqual(failures, [False], "reported once, after the capture ended")
+        self.assertFalse(capture.is_waking())
+        self.assertTrue(any("mic open failed" in line for line in logs), logs)
+
     def test_abort_discards_frames(self) -> None:
         self.capture.begin()
         self._wait_stream_open()

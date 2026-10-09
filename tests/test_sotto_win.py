@@ -2015,6 +2015,39 @@ class RoundTwoRunTest(unittest.TestCase):
             "Transcription failed, and the recording could not be saved to History either; "
             "please dictate again."])
 
+    def test_a_microphone_that_cannot_open_ends_the_gesture_and_says_so_once(self):
+        # [N2] A failed open only logged: the gesture stayed "recording",
+        # "mic live" was logged, and the release lost the dictation silently.
+        import win_capture
+        real_capture, made, opens = win_capture.WinCapture, [], []
+
+        def failing_stream(**kwargs):
+            opens.append(kwargs)
+            raise OSError("Error opening InputStream: Device unavailable [PaErrorCode -9985]")
+
+        def make_capture():
+            made.append(real_capture(stream_factory=failing_stream, log=lambda message: None))
+            return made[-1]
+
+        def drive(results, app):
+            hook = app["hooks"][0]
+            hook.engine.pressed()
+            _wait_for(lambda: opens and not made[0].is_active(), "the failed open")
+            time.sleep(0.5)  # announce_live polls every 0.05 s
+            results["recording_after_failure"] = hook.engine.snapshot()[0]
+            hook.engine.released()
+            _wait_for(lambda: not app["controllers"][0].busy(), "the release")
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-mic-") as temporary:
+            results, app = self.run_app(self.fakes([], []), drive, Path(temporary), extra=(
+                mock.patch.object(sotto_win.win_capture, "WinCapture", make_capture),))
+        self.assertFalse(results["recording_after_failure"], "the gesture still records")
+        self.assertEqual([note for note in app["notes"] if "Could not start the microphone" in note],
+                         app["notes"])
+        self.assertEqual(len(app["notes"]), 1, app["notes"])
+        self.assertNotIn("● recording (mic live)", app["logs"])
+        self.assertIn("✗ could not start the microphone — dictation cancelled", app["logs"])
+
 
 if __name__ == "__main__":
     unittest.main()

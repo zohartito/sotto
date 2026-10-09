@@ -72,6 +72,9 @@ QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
 UNREAD_PASTE = "a paste the app has not read yet"  # in_flight()'s words for it
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
+MIC_FAILED_TEXT = ("Could not start the microphone. Check that no other app holds it and that "
+                   "desktop apps may use it (Settings → Privacy & security → Microphone), "
+                   "then press the key again.")
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
 
@@ -1233,7 +1236,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             deadline = time.monotonic() + 10
             while capture.is_waking() and time.monotonic() < deadline:
                 time.sleep(0.05)
-            if engine.snapshot()[0]:
+            if engine.snapshot()[0] and capture.is_active():  # a failed open is not live
                 log("● recording (mic live)")
 
         threading.Thread(target=announce_live, daemon=True).start()
@@ -1266,7 +1269,18 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("○ tap ignored")
         ui_state()
 
+    def on_mic_failed() -> None:
+        """The newest capture's stream never opened (device busy or gone, or
+        the previous stream still closing): end the gesture, so nothing
+        pretends to record, and say so once — the Mac's on_mic_failed.
+        Runs on the capture's opening thread, never on the keyboard hook."""
+        if engine.force_finish():
+            log("✗ could not start the microphone — dictation cancelled")
+        if ui is not None:
+            ui.notify(MIC_FAILED_TEXT)
+
     engine = sotto.GestureEngine(on_start, on_finish, on_discard)
+    capture.on_start_failed = on_mic_failed
     hook = win_hotkey.TriggerHook(engine, trigger=trigger)
     hook.start()
     hook_lock = threading.Lock()  # the resync poller's revive vs the teardown's stop

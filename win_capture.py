@@ -64,6 +64,10 @@ class WinCapture:
         self._closing: list[threading.Thread] = []
         self._close_wait_s = CLOSE_WAIT_S
         self._lock = threading.Lock()
+        # Called (on the opening thread, never the keyboard hook) when the
+        # newest capture's stream could not open: the app ends the gesture
+        # and says so once, as the Mac's CaptureService.on_start_failed does.
+        self.on_start_failed = None
 
     def begin(self) -> bool:
         """Open the stream off-thread; returns True (always a cold start)."""
@@ -110,11 +114,17 @@ class WinCapture:
         return not any(thread.is_alive() for thread in closing)
 
     def _fail_start(self, generation: int, reason: str) -> None:
+        """Side effects: ends this capture; calls on_start_failed unless a
+        newer capture has begun since (a press that was released before
+        its open failed is still lost, so it is still reported)."""
         with self._lock:
             if self._current(generation):
                 self._active = False
                 self._waking = False
+            newest = self._generation == generation
         self._log(f"! mic open failed: {reason[:120]}")
+        if newest and self.on_start_failed is not None:
+            self.on_start_failed()
 
     def _open_stream(self, generation: int) -> None:
         # Runs on the thread begin() started, never on the keyboard hook.

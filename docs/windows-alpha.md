@@ -430,8 +430,9 @@ History copies are separate.
 - **`✗ microphone`:** pick a default input in **Settings → System → Sound**
   and check the microphone privacy switch for desktop apps. Sotto records from
   the Windows default input through PortAudio's default host API (MME), which
-  converts to 16 kHz. `! mic open failed` in the log usually means another app
-  holds the device exclusively.
+  converts to 16 kHz. `! mic open failed` in the log (and a "Could not start
+  the microphone" notification; the press is cancelled) usually means another
+  app holds the device exclusively.
 - **`! cuda (float16) unavailable … falling back to CPU`:** expected on a
   CPU-only install. For the GPU, run the installer with `-Cuda` (or install
   `requirements-alpha-windows-cuda.txt`) and update the NVIDIA driver;
