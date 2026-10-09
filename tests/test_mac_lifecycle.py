@@ -6,6 +6,7 @@ these tests compile the real closures against fakes (no AppKit run loop, no
 mic, no model, no clipboard, no exec) and check what they do.
 """
 import ast
+import os
 import queue
 import signal
 import sys
@@ -14,6 +15,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 if sys.platform != "darwin":
     raise unittest.SkipTest("the Mac app lifecycle — macOS-only")
@@ -372,7 +374,7 @@ class WarmupIsNotDictationTests(unittest.TestCase):
 
 class TeardownTests(unittest.TestCase):
     def wire(self, *, foreground=False, exec_error=None, worker_job=None, worker_alive=False,
-             queued=(), abandoned=(), failed_raises=False):
+             queued=(), abandoned=(), failed_raises=False, on_join=None, finishing=None):
         self.events, self.exits, self.kept, self.failed = [], [], [], []
         shutdown = sotto.ShutdownBoundary()
         shutdown.request()
@@ -396,7 +398,8 @@ class TeardownTests(unittest.TestCase):
 
         class Thread:
             def join(self, timeout=None):
-                pass
+                if on_join is not None:
+                    on_join(worker)
 
             def is_alive(self):
                 return worker_alive
@@ -412,12 +415,13 @@ class TeardownTests(unittest.TestCase):
             "shutdown": shutdown, "capture": capture, "jobs": jobs, "restart": Restart(),
             "nemotron": None, "transcription_thread": Thread(), "worker": worker,
             "restart_drain": {"deadline": None, "kept": False},
-            "APP_DRAIN_TIMEOUT": 0.0, "RESTART_DRAIN_DEADLINE_S": 0.0, "RESTART_RELEASE_WAIT_S": 0.0,
+            "APP_DRAIN_TIMEOUT": 1.0, "RESTART_DRAIN_DEADLINE_S": 0.0, "RESTART_RELEASE_WAIT_S": 0.0,
             "AppHelper": types.SimpleNamespace(callLater=lambda *a: None), "time": time,
             "log": lambda line: None, "os": types.SimpleNamespace(_exit=self.exits.append),
             "Quartz": quartz, "tap": None, "status_ui": None, "ui_call": lambda *a: None,
             "flush_clipboard_restore": lambda *a, **k: self.events.append("restore"),
-            "signal": signal,
+            "signal": signal, "finishing": finishing or sotto.PendingDeliveries(),
+            "wait_until_idle": sotto.wait_until_idle,
         }
         for name in ("SIGTERM_RESTORE_WAIT_S", "RESTORE_DELAY_S", "RESTART_FAILED_EXIT"):
             namespace[name] = getattr(sotto, name, None)
@@ -463,6 +467,29 @@ class TeardownTests(unittest.TestCase):
         stop()
         self.assertEqual(self.kept, [live])
 
+    def test_n9_a_capture_taken_by_the_worker_as_the_teardown_looked_is_kept(self):
+        # Codex: shutdown lands between jobs.get() and current_job; the worker
+        # files it as abandoned only after the teardown first looked.
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap7", None, None)
+        stop, _ = self.wire(on_join=lambda worker: worker.abandoned.append(live))
+        stop()
+        self.assertEqual(self.kept, [live])
+
+    def test_n9_the_teardown_waits_for_a_finish_that_holds_the_audio(self):
+        # Codex: on_finish has the audio but has not reached the enqueue yet.
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap8", None, None)
+        finishing = sotto.PendingDeliveries()
+        finishing.add()
+
+        def finish_late():
+            time.sleep(0.1)
+            self.kept.append(live)   # the refused enqueue hands it to keep
+            finishing.finish()
+        stop, _ = self.wire(finishing=finishing)
+        threading.Thread(target=finish_late, daemon=True).start()
+        stop()
+        self.assertEqual(self.kept, [live], "the teardown ended before the finish kept its audio")
+
     def test_n27_a_failed_exec_exits_so_launchd_starts_sotto_again(self):
         for error in (OSError(7, "Argument list too long"), IndexError("tuple index out of range")):
             with self.subTest(error=type(error).__name__):
@@ -476,6 +503,24 @@ class TeardownTests(unittest.TestCase):
         stop, _ = self.wire(foreground=True, exec_error=OSError(8, "Exec format error"), failed_raises=True)
         stop()
         self.assertEqual(self.exits, [sotto.RESTART_FAILED_EXIT])
+
+
+class RelaunchTests(unittest.TestCase):
+    """N44/N27: Sotto.app's relaunch helper that cannot start reaches the
+    teardown as an exception (which exits RESTART_FAILED_EXIT), never as a
+    silent success that would end in exit 0."""
+
+    def test_a_relaunch_helper_that_cannot_start_raises(self):
+        with patch.object(sotto, "launchd_owns_this_process", return_value=False), \
+             patch.object(sotto, "launched_as_sealed_job", return_value=False):
+            restart = sotto.RestartController(sotto.ShutdownBoundary())
+        env = {"SOTTO_LAUNCHER": "app", "SOTTO_APP_EXECUTABLE": "/Applications/Sotto.app/Contents/MacOS/Sotto"}
+        with patch.dict(os.environ, env), patch("os.execv") as execute, \
+             patch("subprocess.Popen", side_effect=OSError(35, "Resource temporarily unavailable")):
+            self.assertTrue(restart.request())
+            with self.assertRaises(OSError):
+                restart.exec_foreground()
+        execute.assert_not_called()  # never an in-place exec for the app
 
 
 class FinishAtShutdownTests(unittest.TestCase):
@@ -495,7 +540,7 @@ class FinishAtShutdownTests(unittest.TestCase):
             "shutdown": shutdown, "capture": capture, "jobs": jobs, "status_ui": None,
             "ui_call": lambda *a: ui.append(a), "log": lambda line: None, "time": time,
             "uuid": sotto.uuid, "current_speech_config": lambda: "config",
-            "pending_deliveries": sotto.PendingDeliveries(),
+            "pending_deliveries": sotto.PendingDeliveries(), "finishing": sotto.PendingDeliveries(),
             "worker": types.SimpleNamespace(keep_untranscribed=kept.append),
         }
         closures(["on_finish", "finish_capture"], namespace)["on_finish"]()

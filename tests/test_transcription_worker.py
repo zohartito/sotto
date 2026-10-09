@@ -866,6 +866,33 @@ class UntranscribedAtShutdownTests(TemporaryUserFiles, unittest.TestCase):
                          ["[not transcribed: Sotto stopped]"])
         self.assertEqual(h.injected, [])
 
+    def test_a_failed_append_does_not_stop_the_teardown_from_keeping_it(self):
+        calls = []
+        holder: dict = {}
+
+        def fails_once(text, prepared, seconds, model, **kw):
+            calls.append(text)
+            if len(calls) == 1:
+                holder["harness"].shutdown.request()
+                raise OSError(28, "No space left on device")
+            return {"id": "row2", "text": text, "provenance": kw.get("provenance")}
+        h = holder["harness"] = Harness(says("Please call me back at four"), append=fails_once)
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        self.assertEqual(h.worker.abandoned, [job])
+        h.worker.keep_untranscribed(job)
+        self.assertEqual(calls, ["Please call me back at four", "[not transcribed: Sotto stopped]"])
+
+    def test_a_suppressed_adaptive_append_discards_its_staged_audio(self):
+        h = Harness(says("unused"))
+        history = object()
+        h.worker.adaptive_runtime = types.SimpleNamespace(history=history)
+        h.worker._live_id = "cap9"
+        h.worker.keep_untranscribed(h.live_job(speech(1.0))[:5] + ("cap9",) + h.live_job(speech(1.0))[6:])
+        with patch("transcription.discard_staged_adaptive_live_audio") as discard:
+            self.assertIsNone(h.worker._append_live("text", None, 1.0, "m"))
+        discard.assert_called_once_with(history, "cap9")
+
     def test_the_running_job_is_visible_to_the_teardown(self):
         seen = {}
         holder: dict = {}

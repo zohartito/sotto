@@ -504,10 +504,19 @@ class TranscriptionWorker:
     def _append_live(self, *args, **kwargs):
         """coordinator.append_live for the live capture in hand, unless the
         teardown already kept it (a model that returned too late): then None,
-        so nothing is registered or delivered."""
+        so nothing is registered or delivered, and an adaptive staging WAV is
+        removed. An append that raises saved nothing, so the capture is
+        unsettled again and the teardown may still keep it."""
         if not self._settle(self._live_id):
+            if self.adaptive_runtime is not None:
+                discard_staged_adaptive_live_audio(self.adaptive_runtime.history, self._live_id)
             return None
-        return self.coordinator.append_live(*args, **kwargs)
+        try:
+            return self.coordinator.append_live(*args, **kwargs)
+        except Exception:
+            with self._settle_lock:
+                self._settled.discard(self._live_id)
+            raise
 
     def _history_append_failed(self, exc: Exception, deliver=None) -> None:
         """History could not take the live row (F16a): disk full, a locked or

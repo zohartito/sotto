@@ -3076,6 +3076,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
     pending_deliveries = PendingDeliveries()
+    finishing = PendingDeliveries()  # captures ended but not yet queued (see on_finish)
     ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
                                                  pending_deliveries)
     if status_ui is not None and store.unreadable is not None:
@@ -3179,11 +3180,14 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     def on_finish() -> None:
         # In flight from before the capture ends until its job is queued, so
-        # Quit's drain never sees an idle gap between the two.
+        # Quit's drain never sees an idle gap between the two; ``finishing``
+        # lets the teardown wait for that audio too (N9).
         pending_deliveries.add()
+        finishing.add()
         try:
             finish_capture()
         finally:
+            finishing.finish()
             pending_deliveries.finish()
 
     def finish_capture() -> None:
@@ -3484,11 +3488,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         each capture once, so one it saved is never kept again, and a model
         that returns after this keep saves nothing.
 
-        Side effects: History rows; may join the worker briefly; logs."""
+        A finish still holding its audio short of the queue gets
+        APP_DRAIN_TIMEOUT to reach it (a refused enqueue keeps it), and the
+        worker the same to file a capture it took just as shutdown came.
+
+        Side effects: History rows; may wait and join the worker briefly; logs."""
+        wait_until_idle(lambda: finishing.count() > 0, poll_s=0.02, deadline_s=APP_DRAIN_TIMEOUT)
         shutdown.discard_queued(jobs, keep=worker.keep_untranscribed)
         running = worker.current_job
+        transcription_thread.join(APP_DRAIN_TIMEOUT)
         if running is not None and running[0] == "live":
-            transcription_thread.join(APP_DRAIN_TIMEOUT)
             worker.keep_untranscribed(running)
         for job in list(worker.abandoned):
             worker.keep_untranscribed(job)
