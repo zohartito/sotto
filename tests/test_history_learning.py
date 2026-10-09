@@ -739,5 +739,14 @@ class HistoryLearningTests(unittest.TestCase):
         HistoryStore(store.base_dir)
         self.assertTrue(evidence.exists())
 
+    def test_a_failed_history_save_leaves_no_phantom_row(self):
+        """N29: append_live used to add the row in memory before saving, so a
+        failed save left a row in entries() that was never on disk."""
+        kept = self.live("kept")
+        with patch("history._atomic_jsonl", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.live("never saved")
+        self.assertEqual([entry["id"] for entry in self.history.entries()], [kept["id"]])
+
 if __name__ == "__main__":
     unittest.main()

@@ -348,7 +348,12 @@ class HistoryStore:
                 entry["audio"]["inference"].get("format") == "pcm_s16le_mono_16000"):
             entry["silver_enqueue"] = {"history_revision": 0, "state": "pending"}
         self._entries.append(entry)
-        self._save_locked()
+        try:
+            self._save_locked()
+        except Exception:
+            # Never on disk, so never in entries() either (N29).
+            self._entries.pop()
+            raise
         self._prune_locked()
         return dict(entry)
 
