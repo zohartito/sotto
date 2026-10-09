@@ -71,6 +71,7 @@ class StreamingCapture:
         self.input_error = None
         self.fallback = False
         self.closed = False
+        self.prepared = None  # the exact canonical audio, kept even if finish() raises
 
     def feed(self, samples, rate):
         if self.cancelled.is_set() or self.closed or self.input_error is not None:
@@ -138,7 +139,7 @@ class StreamingCapture:
             pcm = b"".join(self.pcm)
             samples, identity = decode_canonical(pcm)
             samples.setflags(write=False)
-            prepared = PreparedAudio(pcm, samples, identity)
+            prepared = self.prepared = PreparedAudio(pcm, samples, identity)
             if self.cancelled.is_set():
                 raise RuntimeError("Streaming capture was cancelled")
             if not len(samples) or not samples.any():

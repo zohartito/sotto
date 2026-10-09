@@ -32,6 +32,7 @@ class TypingTests(unittest.TestCase):
         with patch.object(sotto.Quartz, "CGEventCreateKeyboardEvent", side_effect=lambda *a: MagicMock()), \
              patch.object(sotto.Quartz, "CGEventKeyboardSetUnicodeString",
                           side_effect=lambda event, units, chunk: posted.append((units, chunk))), \
+             patch.object(sotto.Quartz, "CGEventSetIntegerValueField"), \
              patch.object(sotto.Quartz, "CGEventPost"), patch.object(sotto.time, "sleep"), \
              patch.object(sotto, "NSPasteboard") as pasteboard, \
              patch.object(sotto, "secure_input_active", return_value=False):
