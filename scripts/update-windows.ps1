@@ -9,9 +9,9 @@
   install-mac.sh --update, it fetches the update and installs the new
   version's pinned packages (the CPU or CUDA set recorded at install) while
   this copy's source stays as it was; pip has no rollback, so a failed install
-  puts the previously installed packages back. Only after the packages are in
-  does it fast-forward the source and re-run install-windows.ps1 -SkipSetup
-  for the shortcut and the install record.
+  puts the previously installed packages back and removes any it added. Only
+  after the packages are in does it fast-forward the source and re-run
+  install-windows.ps1 -SkipSetup for the shortcut and the install record.
 
   Sotto is started again either way: the new version, or the unchanged
   previous one, whose tray then reports the failure. The outcome goes to
@@ -84,11 +84,32 @@ function Finish([bool]$Ok, [string]$Text) {
   exit 1
 }
 
-# pip cannot undo a half-finished install: put back the set recorded before it.
+# Installed distribution names, normalized (PEP 503); $null when pip fails.
+function Package-Names {
+  $listed = & $VenvPython -m pip list --disable-pip-version-check --format=json 2>$null
+  if ($LASTEXITCODE -ne 0) { return $null }
+  try { $names = @(("$listed" | ConvertFrom-Json) | ForEach-Object { ($_.name -replace '[-_.]+', '-').ToLowerInvariant() }) }
+  catch { return $null }
+  return ,$names
+}
+
+# pip cannot undo a half-finished install: put back the set recorded before it
+# (pip install -r only adds), remove what the update added, then check it.
 function Restore-Packages([string]$Previous) {
   Say '== restoring the previous packages'
-  if (@(Get-Content -LiteralPath $Previous).Count -eq 0) { return $true }
-  Logged { & $VenvPython -m pip install --disable-pip-version-check -r $Previous }
+  if (@(Get-Content -LiteralPath $Previous).Count -gt 0) {
+    Logged { & $VenvPython -m pip install --disable-pip-version-check -r $Previous }
+    if ($LASTEXITCODE -ne 0) { return $false }
+  }
+  $now = Package-Names
+  if ($null -eq $now) { return $false }
+  $added = @($now | Where-Object { $PreviousNames -notcontains $_ -and @('pip', 'setuptools', 'wheel') -notcontains $_ })
+  if ($added.Count -gt 0) {
+    Say "== removing what the update added: $($added -join ' ')"
+    Logged { & $VenvPython -m pip uninstall --disable-pip-version-check --yes @added }
+    if ($LASTEXITCODE -ne 0) { return $false }
+  }
+  Logged { & $VenvPython -m pip check --disable-pip-version-check }
   return ($LASTEXITCODE -eq 0)
 }
 
@@ -144,6 +165,8 @@ $previous = Join-Path $Next 'previous-packages.txt'
 $frozen = @(& $VenvPython -m pip freeze --disable-pip-version-check 2>$null)
 if ($LASTEXITCODE -ne 0) { Finish $false 'Could not list the installed packages (pip freeze failed); nothing was changed.' }
 [IO.File]::WriteAllLines($previous, [string[]]$frozen)
+$PreviousNames = Package-Names
+if ($null -eq $PreviousNames) { Finish $false 'Could not list the installed packages (pip list failed); nothing was changed.' }
 
 Say "== packages ($Requirements)"
 Logged { & $VenvPython -m pip install --disable-pip-version-check -r (Join-Path $Next $Requirements) }

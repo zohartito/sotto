@@ -384,6 +384,34 @@ class UpdateScriptTest(unittest.TestCase):
         self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), before)
         self.assertIn("previous packages are back", self.status())
 
+    def test_packages_a_failed_update_added_are_removed_again(self) -> None:
+        # [PR15 review] pip install -r only adds: a package the update brought
+        # in (with its dependency) stayed installed after the rollback, while
+        # the status said the previous packages were back.
+        wheels = Path(self._tmp.name) / "wheels"
+        wheels.mkdir()
+        for name, version, requires in (("sotto_test_core", "1.0", ()), ("sotto_test_core", "2.0", ()),
+                                        ("sotto_test_app", "1.0", ("sotto-test-core<2",)),
+                                        ("sotto_test_new", "1.0", ("sotto-test-extra",)),
+                                        ("sotto_test_extra", "1.0", ())):
+            _wheel(wheels, name, version, requires)
+        python = self.venv / "Scripts" / "python.exe"
+        subprocess.run([str(python), "-m", "pip", "install", "--quiet", "--no-index", "--find-links",
+                        str(wheels), "sotto-test-app==1.0"], check=True, capture_output=True, timeout=300)
+        before = self.git(self.copy, "rev-parse", "HEAD")
+        self.publish("requirements-alpha-windows.txt",
+                     self.REQUIREMENTS["requirements-alpha-windows.txt"]
+                     + "sotto-test-new==1.0\nsotto-test-core==2.0\n")
+        result = self.update(PIP_FIND_LINKS=str(wheels))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        log = self.log_bytes().decode("utf-8", "replace")
+        self.assertRegex(log, r"Successfully installed .*sotto-test-new-1\.0", "pip did add it first")
+        installed = subprocess.run([str(python), "-m", "pip", "freeze"], capture_output=True, text=True,
+                                   timeout=120).stdout.split()
+        self.assertEqual(sorted(installed), ["sotto-test-app==1.0", "sotto-test-core==1.0"], log)
+        self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), before)
+        self.assertIn("previous packages are back", self.status())
+
     def test_an_update_installs_packages_then_switches_and_keeps_the_recorded_set(self) -> None:
         # [F2w][F34] Packages first, then the source; the CPU set recorded at
         # install stays CPU even on a PC with an NVIDIA GPU.
