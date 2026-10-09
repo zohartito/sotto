@@ -1,5 +1,6 @@
 """One-line installers: download (or update) a git copy, then hand off to the platform installer."""
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -63,8 +64,14 @@ class ScriptShapeTests(unittest.TestCase):
 
     def test_windows_script_never_exits_the_users_shell(self):
         text = (ROOT / "scripts" / "get.ps1").read_text(encoding="utf-8")
-        self.assertNotRegex(text, r"(?im)^\s*exit\b", "iex runs in the user's session; exit would close it")
-        self.assertTrue(text.rstrip().endswith("Install-Sotto"))
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        for line in code:
+            if re.search(r"(?i)\bexit\b", line):
+                # [N41] Only a run as a file exits, with the failure's code.
+                self.assertIn("${function:Install-Sotto}.File", line,
+                              "iex runs in the user's session; exit would close it")
+        self.assertEqual([line for line in code if line.startswith("Install-Sotto")], ["Install-Sotto"],
+                         "one call, after every definition")
 
 
 @unittest.skipUnless(sys.platform == "darwin" and (ROOT / ".git").exists() and shutil.which("git"),
@@ -208,7 +215,6 @@ class MacInstallerTests(unittest.TestCase):
                      "Windows git checkout")
 class WindowsInstallerTests(unittest.TestCase):
     def test_the_same_repository_matches_in_https_and_both_ssh_forms(self):
-        import re
         script = (ROOT / "scripts" / "get.ps1").read_text(encoding="utf-8")
         function = re.search(r"(?ms)^function Test-SameRepo.*?^}", script).group(0)
         checks = ("@((Test-SameRepo 'git@github.com:zohartito/sotto.git' 'https://github.com/zohartito/sotto.git'),"
@@ -321,6 +327,64 @@ class WindowsInstallerTests(unittest.TestCase):
             again = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
             self.assertIn("would run", again.stdout, again.stderr)
             self.assertEqual(git(dest, "rev-parse", "HEAD"), newer)
+
+    def test_an_installed_copy_whose_update_packages_fail_keeps_its_source(self):
+        # [N5] get.ps1 fast-forwarded an installed copy before any package was
+        # installed, and nothing put the old source back when they failed.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            dest = folder / "sotto"
+            remote = bare_copy_of_this_checkout(folder)
+            script, _menu = windows_get_script(folder)
+            # update-windows.ps1 logs to %LOCALAPPDATA%\sotto-alpha: a temporary one here.
+            env = dict(os.environ, SOTTO_REPO=str(remote), SOTTO_SOURCE=str(dest), SOTTO_GET_DRY_RUN="1",
+                       LOCALAPPDATA=str(folder / "localappdata"), PIP_NO_INDEX="1",
+                       PIP_DISABLE_PIP_VERSION_CHECK="1")
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+            first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("would run", first.stdout, first.stderr)
+            subprocess.run([sys.executable, "-m", "venv", str(dest / "venv-alpha")], check=True,
+                           capture_output=True, timeout=600)
+
+            def git(cwd: Path, *args: str) -> str:
+                return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                       *args], cwd=cwd, check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            upstream = folder / "upstream"
+            git(folder, "clone", "--quiet", str(remote), str(upstream))
+            requirements = upstream / "requirements-alpha-windows.txt"
+            requirements.write_text(requirements.read_text(encoding="utf-8") + "sotto-test-missing-package==1.0\n",
+                                    encoding="utf-8")
+            git(upstream, "commit", "--quiet", "-am", "a package that cannot be installed")
+            git(upstream, "push", "--quiet", "origin", "HEAD:main")
+            before = git(dest, "rev-parse", "HEAD")
+            failed = subprocess.run(command, env=env, capture_output=True, text=True, timeout=600)
+            self.assertEqual(git(dest, "rev-parse", "HEAD"), before, failed.stdout + failed.stderr)
+            self.assertIn("previous packages are back", failed.stdout, failed.stderr)
+            self.assertNotIn("would run", failed.stdout)
+            self.assertEqual(failed.returncode, 1, "[N41] a failure exits nonzero when run as a file")
+
+    def test_a_failure_sets_the_exit_code_without_closing_a_pasted_shell(self):
+        # [N41] Every failure was a bare return: exit code 0 as a file, and
+        # $LASTEXITCODE left as whatever ran last when pasted through iex.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            foreign = folder / "notes"
+            foreign.mkdir()
+            script, _menu = windows_get_script(folder)
+            env = dict(os.environ, SOTTO_REPO=str(folder / "remote.git"), SOTTO_SOURCE=str(foreign),
+                       SOTTO_GET_DRY_RUN="1")
+            as_file = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                                     env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("is not a copy of Sotto", as_file.stdout, as_file.stderr)
+            self.assertEqual(as_file.returncode, 1)
+            pasted = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                     f"cmd /c exit 0; Get-Content -Raw -LiteralPath '{script}' | iex; "
+                                     "\"still here $LASTEXITCODE\""],
+                                    env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("is not a copy of Sotto", pasted.stdout, pasted.stderr)
+            self.assertIn("still here 1", pasted.stdout, pasted.stderr)
 
 
 if __name__ == "__main__":

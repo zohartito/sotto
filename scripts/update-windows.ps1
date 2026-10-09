@@ -17,22 +17,30 @@
   previous one, whose tray then reports the failure. The outcome goes to
   update-status.txt in the data folder, which the tray reports once at its
   next start; the full output is in update.log.
+
+  get.ps1 runs the update's own copy of this script on an existing copy:
+  -SourceDir names that copy, -NoRestart leaves starting Sotto to get.ps1
+  and -ShortcutDir is its Start Menu folder.
 #>
 param(
   [string]$DataDir = '',
   [string]$VenvDir = '',
-  [int]$WaitSeconds = 120
+  [int]$WaitSeconds = 120,
+  [string]$SourceDir = '',
+  [switch]$NoRestart,
+  [string]$ShortcutDir = ''
 )
 
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Continue'
 
-$Root = Split-Path -Parent $PSScriptRoot
+$Root = if ($SourceDir) { [IO.Path]::GetFullPath($SourceDir) } else { Split-Path -Parent $PSScriptRoot }
+if (-not $ShortcutDir) { $ShortcutDir = [Environment]::GetFolderPath('Programs') }
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'sotto-alpha' }
 if (-not $VenvDir) { $VenvDir = Join-Path $Root 'venv-alpha' }
 $Log = Join-Path $DataDir 'update.log'
 $Status = Join-Path $DataDir 'update-status.txt'
-$Shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Sotto.lnk'
+$Shortcut = Join-Path $ShortcutDir 'Sotto.lnk'
 $Launcher = Join-Path $Root 'win_launch.py'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $Manifest = Join-Path $VenvDir 'sotto-install.json'
@@ -79,7 +87,12 @@ function Finish([bool]$Ok, [string]$Text) {
     Say "X $Text"
     Set-Content -LiteralPath $Status -Value "failed $Text See update.log in the data folder." -Encoding UTF8
   }
-  Start-Sotto
+  if ($NoRestart) {
+    # Run from get.ps1 in a console: say it there too.
+    if ($Ok) { Write-Host "OK updated to $Text" } else { Write-Host "X $Text (details: $Log)" -ForegroundColor Red }
+  } else {
+    Start-Sotto
+  }
   if ($Ok) { exit 0 }
   exit 1
 }
@@ -194,6 +207,6 @@ if ($LASTEXITCODE -ne 0) {
 
 # Shortcut and install record, keeping the recorded dependency set.
 Logged { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'scripts\install-windows.ps1') `
-    -SkipSetup $FlavorSwitch -DataDir $DataDir -VenvDir $VenvDir }
+    -SkipSetup $FlavorSwitch -DataDir $DataDir -VenvDir $VenvDir -ShortcutDir $ShortcutDir }
 if ($LASTEXITCODE -ne 0) { Finish $false "Sotto was updated to $version, but its setup did not finish." }
 Finish $true $version

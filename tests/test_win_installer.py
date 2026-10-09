@@ -429,6 +429,27 @@ class UpdateScriptTest(unittest.TestCase):
         self.assertLess(log.index(b"== packages"), log.index(b"== source"), "packages before the source")
         self.assertTrue((self.data / "launched.txt").exists())
 
+    def test_get_ps1_runs_the_updates_copy_on_this_one_without_starting_it(self) -> None:
+        # [N5] get.ps1 runs the update's own update-windows.ps1 from a temporary
+        # folder (-SourceDir), and starts Sotto itself after its full install.
+        upstream = self.publish("CHANGES.txt", "new version\n")
+        elsewhere = Path(self._tmp.name) / "extracted" / "scripts"
+        elsewhere.mkdir(parents=True)
+        shutil.copy(self.copy / "scripts" / "update-windows.ps1", elsewhere)
+        env = dict(os.environ, PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1")
+        result = subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                 "-File", str(elsewhere / "update-windows.ps1"), "-SourceDir", str(self.copy),
+                                 "-NoRestart", "-WaitSeconds", "0", "-ShortcutDir", str(self.menu),
+                                 "-DataDir", str(self.data), "-VenvDir", str(self.venv)],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                env=env, timeout=600)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr + self.log_bytes().decode("utf-8", "replace"))
+        self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), upstream)
+        self.assertIn("OK updated to", result.stdout)
+        time.sleep(2.0)
+        self.assertFalse((self.data / "launched.txt").exists(), "get.ps1 starts Sotto, not the updater")
+
 
 if __name__ == "__main__":
     unittest.main()

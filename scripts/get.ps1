@@ -3,7 +3,8 @@
 #   irm https://raw.githubusercontent.com/zohartito/sotto/main/scripts/get.ps1 | iex
 #
 # Downloads Sotto with git into %USERPROFILE%\sotto (or $env:SOTTO_SOURCE), or
-# updates that copy, then runs its scripts\install-windows.ps1 and starts Sotto.
+# updates that copy (the new packages first, the source only after them), then
+# runs its scripts\install-windows.ps1 and starts Sotto.
 # No admin rights. Missing tools are named with the command that installs them.
 
 # Same repository? Ignores https vs either ssh form (git@github.com:... and
@@ -16,6 +17,14 @@ function Test-SameRepo([string]$First, [string]$Second) {
   return $normalized[0] -eq $normalized[1]
 }
 
+# The one-liner runs this script inside the user's shell (iex), where exit
+# would close that shell: a failure is said, remembered here, and becomes an
+# exit code only when the script runs as a file.
+function Fail-Install([string]$Text) {
+  Write-Host "X $Text" -ForegroundColor Red
+  $script:SottoInstallFailed = $true
+}
+
 function Install-Sotto {
   $ErrorActionPreference = 'Stop'
   $repo = if ($env:SOTTO_REPO) { $env:SOTTO_REPO } else { 'https://github.com/zohartito/sotto.git' }
@@ -23,14 +32,14 @@ function Install-Sotto {
   $shortcutDir = [Environment]::GetFolderPath('Programs')
 
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Host 'X Sotto needs Git: winget install --id Git.Git -e  (then open a new PowerShell and run this line again)' -ForegroundColor Red
+    Fail-Install 'Sotto needs Git: winget install --id Git.Git -e  (then open a new PowerShell and run this line again)'
     return
   }
   if (Test-Path -LiteralPath (Join-Path $dest '.git')) {
     $origin = ''
     try { $origin = git -C $dest remote get-url origin 2>$null } catch { $origin = '' }
     if (-not (Test-SameRepo $origin $repo)) {
-      Write-Host "X $dest is a git copy of $origin, not Sotto. Choose another folder with `$env:SOTTO_SOURCE." -ForegroundColor Red
+      Fail-Install "$dest is a git copy of $origin, not Sotto. Choose another folder with `$env:SOTTO_SOURCE."
       return
     }
     # Pulling and reinstalling under a running Sotto would swap its source and
@@ -42,12 +51,12 @@ function Install-Sotto {
         $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
       })
     if ($running.Count -gt 0) {
-      Write-Host "X Sotto is running from $dest (process $($running[0].Id)). Quit it from its tray menu (or update it there with Check for updates), then run this line again." -ForegroundColor Red
+      Fail-Install "Sotto is running from $dest (process $($running[0].Id)). Quit it from its tray menu (or update it there with Check for updates), then run this line again."
       return
     }
     Write-Host "== Updating Sotto in $dest"
     git -C $dest fetch --quiet
-    if ($LASTEXITCODE -ne 0) { Write-Host "X Could not download the update into $dest." -ForegroundColor Red; return }
+    if ($LASTEXITCODE -ne 0) { Fail-Install "Could not download the update into $dest."; return }
     # Ask the update's own installer whether it will run here (its Start Menu
     # check) before the source moves: a refusal after the pull would leave new
     # source on old packages.
@@ -56,34 +65,54 @@ function Install-Sotto {
     New-Item -ItemType Directory -Force -Path $check | Out-Null
     try {
       $archive = Join-Path $check 'installer.tar'
-      git -C $dest archive --format=tar -o $archive '@{u}' scripts/install-windows.ps1
+      git -C $dest archive --format=tar -o $archive '@{u}' scripts/install-windows.ps1 scripts/update-windows.ps1
       if ($LASTEXITCODE -eq 0) { & (Join-Path $env:SystemRoot 'System32\tar.exe') -xf $archive -C $check }
       $installer = Join-Path $check 'scripts\install-windows.ps1'
-      if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-        Write-Host "X Could not read the update's installer; $dest was not changed." -ForegroundColor Red; return
+      $updater = Join-Path $check 'scripts\update-windows.ps1'
+      if (-not (Test-Path -LiteralPath $installer -PathType Leaf) -or -not (Test-Path -LiteralPath $updater -PathType Leaf)) {
+        Fail-Install "Could not read the update's installer; $dest was not changed."; return
       }
       & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -CheckOnly -SourceDir $dest -ShortcutDir $shortcutDir
-      if ($LASTEXITCODE -ne 0) { Write-Host "X $dest was not updated; see the message above." -ForegroundColor Red; return }
+      if ($LASTEXITCODE -ne 0) { Fail-Install "$dest was not updated; see the message above."; return }
+      $behind = "$(git -C $dest rev-parse HEAD)".Trim() -ne "$(git -C $dest rev-parse '@{u}')".Trim()
+      if ($behind -and (Test-Path -LiteralPath (Join-Path $dest 'venv-alpha\Scripts\python.exe') -PathType Leaf)) {
+        # An installed copy: the update's own updater installs the new
+        # packages first, moves the source only after them, and puts the
+        # previous packages back if anything fails.
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $updater -SourceDir $dest -NoRestart `
+          -WaitSeconds 0 -ShortcutDir $shortcutDir
+        if ($LASTEXITCODE -ne 0) { Fail-Install "$dest was not updated; see the message above."; return }
+      }
     } finally {
       Remove-Item -LiteralPath $check -Recurse -Force -ErrorAction SilentlyContinue
     }
+    # Already moved by the updater, or nothing installed yet: no packages to keep in step.
     git -C $dest merge --ff-only --quiet '@{u}'
-    if ($LASTEXITCODE -ne 0) { Write-Host "X Could not update $dest (local changes?)." -ForegroundColor Red; return }
+    if ($LASTEXITCODE -ne 0) { Fail-Install "Could not update $dest (local changes?)."; return }
   } elseif (Test-Path -LiteralPath $dest) {
-    Write-Host "X $dest exists and is not a copy of Sotto. Choose another folder with `$env:SOTTO_SOURCE." -ForegroundColor Red
+    Fail-Install "$dest exists and is not a copy of Sotto. Choose another folder with `$env:SOTTO_SOURCE."
     return
   } else {
     Write-Host "== Downloading Sotto into $dest"
     git clone --quiet $repo $dest
-    if ($LASTEXITCODE -ne 0) { Write-Host 'X Could not download Sotto.' -ForegroundColor Red; return }
+    if ($LASTEXITCODE -ne 0) { Fail-Install 'Could not download Sotto.'; return }
   }
 
   if ($env:SOTTO_GET_DRY_RUN) { "dry run: would run $dest\scripts\install-windows.ps1"; return }
   # The installer checks Windows, Python 3.13 and the GPU, and says what is missing.
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dest 'scripts\install-windows.ps1') -ShortcutDir $shortcutDir
-  if ($LASTEXITCODE -ne 0) { Write-Host 'X The installer stopped; see the messages above.' -ForegroundColor Red; return }
+  if ($LASTEXITCODE -ne 0) { Fail-Install 'The installer stopped; see the messages above.'; return }
   $shortcut = Join-Path $shortcutDir 'Sotto.lnk'
   if (Test-Path -LiteralPath $shortcut) { Start-Process -FilePath $shortcut }
 }
 
+$script:SottoInstallFailed = $false
 Install-Sotto
+if ($script:SottoInstallFailed) {
+  $global:LASTEXITCODE = 1
+  # Only when run as a file (powershell -File get.ps1): a function defined from
+  # text pasted through iex has no file, and there exit would close the shell.
+  if (${function:Install-Sotto}.File) { exit 1 }
+} else {
+  $global:LASTEXITCODE = 0
+}
