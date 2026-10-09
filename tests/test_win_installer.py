@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -276,6 +277,14 @@ class UpdateScriptTest(unittest.TestCase):
             text = text.replace("[Environment]::GetFolderPath('Programs')", f"'{self.menu}'")
             if "GetFolderPath" in text or f"'{self.menu}'" not in text:
                 self.fail(f"refusing to run {name}: its Start Menu folder could not be redirected")
+            if name == "install-windows.ps1":
+                # pip is offline here (PIP_NO_INDEX), so the exact-pip bootstrap
+                # (pinned in tests/test_dependency_pins.py) asks only for "pip",
+                # which the venv's own pip satisfies; the step still runs.
+                pinned = re.search(r"pip install --disable-pip-version-check pip==[\d.]+", text)
+                if pinned is None:
+                    self.fail("refusing to run install-windows.ps1: its pip bootstrap line moved")
+                text = text.replace(pinned.group(0), "pip install --disable-pip-version-check pip")
             (self.copy / "scripts" / name).write_text(text, encoding="utf-8")
         for name, text in self.REQUIREMENTS.items():
             (self.copy / name).write_text(text, encoding="utf-8")

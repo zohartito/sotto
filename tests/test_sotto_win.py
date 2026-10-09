@@ -877,7 +877,7 @@ class LifecycleTest(unittest.TestCase):
                     mock.patch.object(sotto_win.win_inject, "deliver",
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
-                    mock.patch.object(sotto_win, "HistoryStore", lambda: HistoryStore(data)), \
+                    mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
@@ -1017,7 +1017,7 @@ def _patched_run(stack, data, fakes, *, logs, boundaries, controllers, settings=
             mock.patch.object(sotto_win.win_asr, "LocalCT2Whisper", FakeWhisper),
             mock.patch.object(sotto_win.win_capture, "WinCapture", FakeCapture),
             mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook),
-            mock.patch.object(sotto_win, "HistoryStore", lambda: HistoryStore(data)),
+            mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)),
             mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)),
             mock.patch.object(sotto_win, "Controller", RecordingController),
             mock.patch.object(sotto_win, "load_language_mode", return_value="auto"),
