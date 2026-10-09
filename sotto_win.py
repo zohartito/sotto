@@ -1047,8 +1047,9 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         consecutive polls gets its release synthesized. Hands-free is exempt —
         its key is legitimately up while recording."""
         misses = 0
-        while not shutdown.requested():
-            time.sleep(1.0)
+        # Waits on the shutdown event, so a hook stopped by Quit or Restart is
+        # never started again behind the teardown.
+        while not shutdown.event.wait(1.0):
             capture.tick()
             if not hook.alive():
                 log("! keyboard listener died — restarting it")

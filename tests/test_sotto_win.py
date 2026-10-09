@@ -879,6 +879,46 @@ class FailureAndTeardownTest(unittest.TestCase):
         self.assertTrue(np.allclose(whisper_calls[1][0], whisper_calls[2][0], atol=1e-4),
                         "Retry transcribes the audio the failed attempt had")
 
+    def test_the_keyboard_hook_is_never_started_again_after_shutdown(self):
+        # [F35] The resync poller slept through the shutdown request and then
+        # revived the stopped hook behind the teardown.
+        import contextlib
+
+        hooks, boundaries, controllers, logs = [], [], [], []
+        FakeWhisper, FakeCapture, FakeHook = _app_fakes(16_000, [], [], hooks, [])
+
+        class CountingHook(FakeHook):
+            def __init__(self, engine, *, trigger):
+                super().__init__(engine, trigger=trigger)
+                self.starts = 0
+
+            def start(self):
+                self.starts += 1
+
+            def alive(self):
+                return not self.stopped
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-stop-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                _wait_for(lambda: controllers and hooks, "listening")
+                time.sleep(1.5)  # the poller is mid-sleep, as it nearly always is
+                controllers[0].quit()
+
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, (FakeWhisper, FakeCapture, CountingHook), logs=logs,
+                             boundaries=boundaries, controllers=controllers)
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+                driver.join(10)
+                time.sleep(1.5)  # longer than one poll after the hook stopped
+
+        self.assertTrue(hooks[0].stopped)
+        self.assertEqual(hooks[0].starts, 1, logs)
+        self.assertNotIn("! keyboard listener died — restarting it", logs)
+
     def test_a_queued_insertion_never_outlives_its_own_wait(self):
         # [F46] Each queued text got a fresh modifier wait after the ones ahead
         # of it used theirs up, so dictation N could land N waits late.
