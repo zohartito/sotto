@@ -1361,7 +1361,12 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                 continue
             try:
                 if copy_only and text is SCRATCH:
-                    pass  # finished from the tray: there is no insertion to undo
+                    # Finished from the tray: the menu has the focus, so no
+                    # Ctrl+Z is sent; say so rather than drop it silently.
+                    log("  scratch that: finished from the tray — nothing undone")
+                    if ui is not None:
+                        ui.notify("Nothing was undone: \"scratch that\" finished from the tray "
+                                  "cannot reach your app. Press Ctrl+Z there instead.")
                 else:
                     copy_instead(text) if copy_only else insert_one(text, prefs, ready_at)
             except Exception as exc:

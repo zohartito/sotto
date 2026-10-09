@@ -2048,6 +2048,54 @@ class RoundTwoRunTest(unittest.TestCase):
         self.assertNotIn("● recording (mic live)", app["logs"])
         self.assertIn("✗ could not start the microphone — dictation cancelled", app["logs"])
 
+    def test_scratch_that_finished_from_the_tray_says_nothing_was_undone(self):
+        # [N20] "scratch that" in a dictation finished from the tray was
+        # dropped without a word: no Ctrl+Z (right), but no note either.
+        fakes = self.fakes([_voiced()], ["scratch that"])
+        undos: list = []
+
+        def drive(results, app):
+            controller = app["controllers"][0]
+            controller.start_now()
+            time.sleep(0.45)
+            controller.finish_now()
+            _wait_for(lambda: not controller.busy(), "the dictation to settle")
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-tray-scratch-") as temporary:
+            results, app = self.run_app(fakes, drive, Path(temporary), settings=self.ENGLISH, extra=(
+                mock.patch.object(sotto_win.win_inject, "send_inputs", undos.append),))
+        self.assertEqual((undos, app["copied"], app["delivered"]), ([], [], []))
+        self.assertEqual(len(app["notes"]), 1, app["notes"])
+        self.assertIn("Nothing was undone", app["notes"][0])
+        self.assertIn("  scratch that: finished from the tray — nothing undone", app["logs"])
+
+    def test_a_retry_that_finds_history_unreadable_is_reported_in_the_tray(self):
+        # [N20, first half: not real] History that turns unreadable after
+        # startup still lists its rows; a Retry then fails with a tray note,
+        # not only a log line.  (Unreadable at startup, History lists nothing,
+        # so there is no Retry to choose.)
+        from history import HistoryStore, HistoryUnreadable
+        fakes = self.fakes([_voiced()], ["hello world", "never reached"])
+
+        def drive(results, app):
+            controller = app["controllers"][0]
+            self.dictate(app)
+            entry_id = controller.entries()[0]["id"]
+            (data / "history.jsonl").write_text('{"id": "abc123", "text": "cut of', encoding="utf-8")
+            results["listed"] = [entry["id"] for entry in controller.entries()]
+            controller.retry(entry_id)
+            _wait_for(lambda: not controller.busy(), "the retry")
+            results["entry_id"] = entry_id
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-retry-unreadable-") as temporary:
+            data = Path(temporary)
+            results, app = self.run_app(fakes, drive, data)
+            with self.assertRaises(HistoryUnreadable):
+                HistoryStore(data)  # the file really is unreadable
+        self.assertEqual(results["listed"], [results["entry_id"]])
+        self.assertEqual(len(app["notes"]), 1, app["notes"])
+        self.assertEqual(app["copied"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
