@@ -101,6 +101,22 @@ class LifetimeTotalsTests(unittest.TestCase):
         progress.record(self.path, text="first words", seconds=2.0)  # no file yet: start from zero
         self.assertEqual(progress.load_totals(self.path), {"dictations": 1, "words": 2, "seconds": 2.0})
 
+    def test_a_malformed_totals_file_is_never_replaced(self):
+        """A truncated stats.json is not "no stats yet" either: record() writes
+        nothing, and the app's record_totals logs it instead of raising."""
+        from unittest import mock
+        import sotto
+        truncated = '{"dictations": 812, "words": 243'
+        self.path.write_text(truncated, encoding="utf-8")
+        with self.assertRaises(ValueError):
+            progress.record(self.path, text="two words", seconds=1.0)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), truncated)
+        with mock.patch.object(sotto, "totals_path", return_value=self.path), \
+             mock.patch.object(sotto, "log") as logged:
+            sotto.record_totals("two words", 1.0)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), truncated)
+        self.assertIn("progress totals not saved", logged.call_args[0][0])
+
     def test_time_saved_against_typing_and_the_menu_line(self):
         totals = {"dictations": 300, "words": 12_400, "seconds": 3_600.0}
         self.assertAlmostEqual(progress.saved_minutes(totals), 12_400 / 40 - 60)

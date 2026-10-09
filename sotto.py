@@ -462,7 +462,7 @@ def record_totals(text: str, seconds: float) -> None:
     import progress
     try:
         progress.record(totals_path(), text=text, seconds=seconds)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # unreadable or malformed: keep the file, skip this one
         log(f"! progress totals not saved ({type(exc).__name__})")
 
 

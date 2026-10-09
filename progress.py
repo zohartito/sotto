@@ -85,12 +85,16 @@ def _write(path: Path, totals: dict) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _parse_totals(text: str) -> dict:
+def _parse_totals(text: str, *, strict: bool = False) -> dict:
+    """The totals in ``text``; malformed text reads as zero for display, or
+    raises ValueError when ``strict`` (before an update would overwrite it)."""
     try:
         data = json.loads(text)
         return {"dictations": int(data.get("dictations", 0)), "words": int(data.get("words", 0)),
                 "seconds": float(data.get("seconds", 0.0))}
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError) as exc:
+        if strict:
+            raise ValueError(f"stats file is malformed: {type(exc).__name__}") from exc
         return _zero()
 
 
@@ -120,11 +124,11 @@ def record(path: Path, *, text: str, seconds: float) -> None:
     """Add one inserted dictation: its word count and how long it took to say.
 
     Side effects: rewrites ``path``. Only a missing file starts from zero: any
-    other read error (a passing lock or permission glitch) raises OSError and
-    writes nothing, so it can never replace the lifetime totals with this one
-    dictation (F38)."""
+    other read error (a passing lock or permission glitch) raises OSError, and
+    a malformed file raises ValueError, writing nothing, so neither can replace
+    the lifetime totals with this one dictation (F38)."""
     try:
-        totals = _parse_totals(Path(path).read_text(encoding="utf-8"))
+        totals = _parse_totals(Path(path).read_text(encoding="utf-8"), strict=True)
     except FileNotFoundError:
         totals = _zero()
     totals["dictations"] += 1
