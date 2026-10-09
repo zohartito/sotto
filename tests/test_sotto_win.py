@@ -384,6 +384,22 @@ class QuitAndUpdateTest(unittest.TestCase):
             self.assertEqual(controller.on_finish.call_count, 1 if orphan else 0)
             self.assertFalse(controller.finish_from_menu.is_set())
 
+    def test_quit_still_stops_when_finishing_the_recording_fails(self):
+        # Ending an orphan capture raised on the quit thread: shutdown was
+        # never requested, the gate stayed closed as "quitting" and every
+        # later Quit returned at once — only killing the process stopped Sotto.
+        controller, _jobs = self.controller(busy=False)
+        self.virtual_clock(controller)
+        controller.capture.is_active.return_value = True  # an orphan capture
+        controller.on_finish.side_effect = RuntimeError("the capture could not be ended")
+        logs: list = []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.quit()
+            self.assertTrue(controller.shutdown.event.wait(5), "Quit always stops Sotto")
+        failed = [line for line in logs if "could not be ended" in line]
+        self.assertEqual(len(failed), 1, logs)
+        self.assertFalse(controller.finish_from_menu.is_set())
+
     def test_a_restart_is_refused_while_quitting(self):
         controller, jobs = self.controller(busy=True)
         clock, _polls = self.drain_polls(controller, {jobs: 1.0})

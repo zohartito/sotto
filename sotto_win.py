@@ -699,15 +699,26 @@ class Controller:
             self._close_gate("quitting")
 
         def finish_then_stop() -> None:
-            ended = self._end_recording()
-            if ended:
-                log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} "
-                    "before quitting (the text is copied)")
-            if not drain_until_idle(lambda: self.busy() and not self.shutdown.requested(),
-                                    deadline_s=QUIT_DRAIN_S, clock=self.clock, sleep=self.sleep):
-                log(f"! quitting anyway after {QUIT_DRAIN_S:.0f}s; "
-                    f"abandoned: {', '.join(self.in_flight())}")
-            self.shutdown.request()
+            # Whatever fails here, Quit stops Sotto: the gate is already
+            # closed as "quitting", so a later Quit would return at once.
+            try:
+                try:
+                    ended = self._end_recording()
+                except Exception as exc:
+                    ended = None
+                    log(f"! could not finish the recording before quitting: {str(exc)[:160]}")
+                if ended:
+                    log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} "
+                        "before quitting (the text is copied)")
+                if not drain_until_idle(lambda: self.busy() and not self.shutdown.requested(),
+                                        deadline_s=QUIT_DRAIN_S, clock=self.clock,
+                                        sleep=self.sleep):
+                    log(f"! quitting anyway after {QUIT_DRAIN_S:.0f}s; "
+                        f"abandoned: {', '.join(self.in_flight())}")
+            except Exception as exc:
+                log(f"! quitting without waiting: {str(exc)[:160]}")
+            finally:
+                self.shutdown.request()
 
         threading.Thread(target=finish_then_stop, daemon=True, name="sotto-quit").start()
 
