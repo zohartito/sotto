@@ -11,9 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 RELEASES_URL = "https://github.com/zohartito/sotto/releases"
 MAX_LISTED_CHANGES = 5
+# The Windows tray runs under pythonw: without this flag each git call would
+# flash a console window.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
 
 @dataclass(frozen=True)
@@ -27,7 +31,8 @@ class UpdateCheck:
 
 
 def _git(root: Path, *args: str, timeout: float = 30, run=subprocess.run):
-    return run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=timeout)
+    return run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=timeout,
+               **_NO_WINDOW)
 
 
 def _last_line(text: str) -> str:
