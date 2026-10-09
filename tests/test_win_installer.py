@@ -254,7 +254,8 @@ class UpdateScriptTest(unittest.TestCase):
 
     REQUIREMENTS = {
         "requirements-alpha-windows.txt": "-c constraints-alpha-windows.txt\n",
-        "requirements-alpha-windows-cuda.txt": "-r requirements-alpha-windows.txt\n-c constraints-alpha-windows-cuda.txt\n",
+        "requirements-alpha-windows-cuda.txt":
+            "-r requirements-alpha-windows.txt\n-c constraints-alpha-windows-cuda.txt\n",
         "constraints-alpha-windows.txt": "# none\n",
         "constraints-alpha-windows-cuda.txt": "# none\n",
     }
@@ -379,7 +380,8 @@ class UpdateScriptTest(unittest.TestCase):
         # install stays CPU even on a PC with an NVIDIA GPU.
         upstream = self.publish("CHANGES.txt", "new version\n")
         result = self.update()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + self.log_bytes().decode("utf-8", "replace"))
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr + self.log_bytes().decode("utf-8", "replace"))
         self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), upstream)
         status = self.status()
         self.assertTrue(status.startswith("ok ") and upstream.startswith(status[3:]), status)

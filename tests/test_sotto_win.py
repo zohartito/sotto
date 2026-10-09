@@ -1236,7 +1236,7 @@ class FailureAndTeardownTest(unittest.TestCase):
                         hook.engine.pressed()
                         time.sleep(0.45)
                         hook.engine.released()
-                        _wait_for(lambda: len(HistoryStore(data).entries(10)) > index, "the History row")
+                        _wait_for(lambda index=index: len(HistoryStore(data).entries(10)) > index, "the History row")
                         ready.append(time.monotonic())
                     # Past the second text's own wait (with a margin), but well
                     # before a second full wait after the first one expired.
