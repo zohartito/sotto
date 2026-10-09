@@ -26,8 +26,9 @@ their own licenses.
 - A microphone, permission to use it, and Accessibility permission for the
   terminal/Python running Sotto.
 - Allow several GB of memory and at least 8 GB of free disk for the environment,
-  model and download caches. Latency and accuracy vary; this alpha makes no
-  benchmark or comparative accuracy claims.
+  model and download caches. Latency and accuracy vary: the speeds quoted below
+  were measured on one M4 Max with synthetic speech, and there are no accuracy
+  comparisons.
 
 If needed, install native Python 3.12 with Homebrew:
 
@@ -179,8 +180,10 @@ its own to undo your last dictation with the app's own ⌘Z. It only undoes
 Sotto's own insert: within a minute of the paste, while the same app is still
 in front, and only if you have not typed since; otherwise nothing happens and
 the log says why. Filler words (um, uh) are removed with the comma around them.
-Both apply to English dictation only and can be switched off under
-**Settings… → Cleanup**; History keeps what the model heard.
+Both apply only to dictation the engine reports as English (Whisper and
+Nemotron; Parakeet does not report a language, so its text stays as spoken)
+and can be switched off under **Settings… → Cleanup**; History keeps what the
+model heard.
 
 ## Dictionary: Sotto learns your spellings
 

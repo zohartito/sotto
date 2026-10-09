@@ -12,6 +12,16 @@ import numpy as np
 
 from audio_codec import PreparedAudio, decode_canonical, prepare_canonical
 
+HEADROOM = 0.5           # loud end of the signal (99.9th percentile) lands here
+MAX_GAIN = 10000.0
+OPENING_SAMPLES = 8960   # ~0.56 s at 16 kHz sets the first boost
+
+
+def _boost_for(samples) -> float:
+    """The gain that puts these samples' loud end at HEADROOM."""
+    loud_end = float(np.percentile(np.abs(samples), 99.9))
+    return min(MAX_GAIN, HEADROOM / max(loud_end, 1e-8))
+
 
 class StreamingResampler:
     """Scipy polyphase resampling with retained FIR context and no edge seams."""
@@ -86,13 +96,16 @@ class StreamingCapture:
             # Wait for actual nonzero PCM, with no energy or VAD threshold.
             if not self.pending.any():
                 return
-            if len(self.pending) < 8960 and not final:
+            if len(self.pending) < OPENING_SAMPLES and not final:
                 return
-            scale = float(np.percentile(np.abs(self.pending), 99.9))
-            self.gain = min(10000.0, 0.5 / max(scale, 1e-8))
+            self.gain = _boost_for(self.pending)
             samples, self.pending = self.pending, np.zeros(0, np.float32)
         if not len(samples):
             return
+        # The boost only ever goes down. A block louder than the opening (speech
+        # after a quiet lead-in) lowers it before it is applied, so a level set
+        # from room noise never clips the speech that follows.
+        self.gain = min(self.gain, _boost_for(samples))
         canonical = prepare_canonical(np.clip(samples * self.gain, -1.0, 1.0))
         self.pcm.append(canonical.pcm)
         if self.error is None:
