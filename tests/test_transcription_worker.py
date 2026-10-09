@@ -133,6 +133,7 @@ class Harness:
     def __init__(self, behaviour=None, *, snapshot=None, nemotron=False, append=None):
         self.logs: list[str] = []
         self.ui_calls: list[tuple] = []
+        self.delivered: list[tuple] = []
         self.injected: list[str] = []
         self.undone = 0
         self.copied: list[str] = []
@@ -169,8 +170,8 @@ class Harness:
             coordinator=self.coordinator, refresh_history=refresh_history,
             adaptive_runtime=None, adaptive=False, use_nemotron=nemotron,
             status_ui=self.status_ui,
-            # ui_call would hop to the AppKit main thread; run it inline.
-            ui_call=self._ui_call,
+            # ui_call / deliver_call would hop to the AppKit main thread; run them inline.
+            ui_call=self._ui_call, deliver_call=self._deliver_call,
             inject_when_clear=inject_when_clear, undo_when_clear=undo_when_clear,
             record_totals=record_totals,
             model_activity={"last_finished": time.monotonic(), "rewarming": False},
@@ -181,6 +182,10 @@ class Harness:
 
     def _ui_call(self, method, *args):
         self.ui_calls.append((getattr(method, "__name__", str(method)), args))
+        method(*args)
+
+    def _deliver_call(self, method, *args):
+        self.delivered.append((getattr(method, "__name__", str(method)), args))
         method(*args)
 
     def live_job(self, raw, rate=16000, stream=None):
@@ -228,6 +233,7 @@ class Harness:
             "undone": self.undone,
             "copied": list(self.copied),
             "ui": [name for name, _ in self.ui_calls],
+            "delivered": [name for name, _ in self.delivered],
             "errors": list(self.status_ui.errors),
             "totals": list(self.totals),
             "refreshed": self.refreshed,
@@ -266,6 +272,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                                 'speech_fraction': 1.0}}],
                            'asr_calls': 1,
                            'copied': [],
+                           'delivered': ['inject_when_clear'],
                            'errors': [],
                            'injected': ['Please call me back at four'],
                            'log': ['→ Ns after release (speech model Ns) · 27 chars'],
@@ -274,7 +281,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                            'refreshed': 1,
                            'retries': [],
                            'totals': [('Please call me back at four', 2.0)],
-                           'ui': ['inject_when_clear', 'hide_if_transcribing'],
+                           'ui': ['hide_if_transcribing'],
                            'undone': 0},
  'b1_loop_salvaged': {'appends': [{'adaptive': False,
                                    'entry_id': None,
@@ -302,17 +309,17 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                            'speech_fraction': 1.0}}],
                       'asr_calls': 1,
                       'copied': [],
+                      'delivered': ['inject_when_clear'],
                       'errors': [],
                       'injected': ['That is part of the plan we agreed on last week.'],
-                      'log': ['  cut a 40x repetition loop (440 chars) — keeping the clean '
-                              'prefix',
+                      'log': ['  cut a 40x repetition loop (440 chars) — keeping the clean prefix',
                               '→ Ns after release (speech model Ns) · 48 chars'],
                       'lookups': [],
                       'nemotron_calls': 0,
                       'refreshed': 1,
                       'retries': [],
                       'totals': [('That is part of the plan we agreed on last week.', 12.0)],
-                      'ui': ['inject_when_clear', 'hide_if_transcribing'],
+                      'ui': ['hide_if_transcribing'],
                       'undone': 0},
  'b2_pure_loop_held': {'appends': [{'adaptive': False,
                                     'entry_id': None,
@@ -332,12 +339,22 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                     'raw_kept': True,
                                     'raw_sample_rate': 16000.0,
                                     'seconds': 2.0,
-                                    'text': LOOP.strip(),
+                                    'text': 'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference '
+                                            'difference difference difference difference',
                                     'vad': {'available': True,
                                             'span_count': 0,
                                             'speech_fraction': 1.0}}],
                        'asr_calls': 1,
                        'copied': [],
+                       'delivered': [],
                        'errors': [],
                        'injected': [],
                        'log': ['! not pasted (220 chars/sec) — kept in history',
@@ -373,6 +390,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                              'speech_fraction': 1.0}}],
                         'asr_calls': 1,
                         'copied': [],
+                        'delivered': [],
                         'errors': [],
                         'injected': [],
                         'log': ['! not pasted (empty transcript) — kept in history',
@@ -405,10 +423,10 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                        'speech_fraction': 0.0}}],
                   'asr_calls': 0,
                   'copied': [],
+                  'delivered': [],
                   'errors': [],
                   'injected': [],
-                  'log': ['! not pasted (dead microphone (all-zero capture))',
-                          '→ Ns · 17 chars'],
+                  'log': ['! not pasted (dead microphone (all-zero capture))', '→ Ns · 17 chars'],
                   'lookups': [],
                   'nemotron_calls': 0,
                   'refreshed': 1,
@@ -419,6 +437,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
  'e_sub_02s_dropped': {'appends': [],
                        'asr_calls': 0,
                        'copied': [],
+                       'delivered': [],
                        'errors': [],
                        'injected': [],
                        'log': ['○ sub-Ns capture dropped (key-tap artifact)'],
@@ -454,6 +473,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                          'speech_fraction': 1.0}}],
                     'asr_calls': 1,
                     'copied': [],
+                    'delivered': ['undo_when_clear'],
                     'errors': [],
                     'injected': [],
                     'log': ['→ Ns after release (speech model Ns) · 0 chars'],
@@ -462,11 +482,12 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                     'refreshed': 1,
                     'retries': [],
                     'totals': [],
-                    'ui': ['undo_when_clear', 'hide_if_transcribing'],
+                    'ui': ['hide_if_transcribing'],
                     'undone': 1},
  'g1_retry_copied': {'appends': [],
                      'asr_calls': 1,
                      'copied': ['Please call me back at four'],
+                     'delivered': [],
                      'errors': [],
                      'injected': [],
                      'log': ['↻ retried · 27 chars'],
@@ -479,8 +500,8 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                   'latency_keys': ['asr_seconds', 'queue_wait_seconds'],
                                   'model': 'mlx-community/whisper-large-v3-turbo',
                                   'preprocessing': {'retry_canonical': True,
-                                                    'voice': {'asr_text': 'Um, please call me '
-                                                                          'back at four'}},
+                                                    'voice': {'asr_text': 'Um, please call me back '
+                                                                          'at four'}},
                                   'profile': 'auto',
                                   'prompt': {'disabled': 'no glossary terms'},
                                   'provenance': 'retry',
@@ -495,6 +516,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
  'g2_retry_held': {'appends': [],
                    'asr_calls': 1,
                    'copied': [],
+                   'delivered': [],
                    'errors': [],
                    'injected': [],
                    'log': ['↻ retried — not copied (220 chars/sec); kept in History'],
@@ -506,13 +528,19 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                 'language': 'en',
                                 'latency_keys': ['asr_seconds', 'queue_wait_seconds'],
                                 'model': 'mlx-community/whisper-large-v3-turbo',
-                                'preprocessing': {'outcome': 'suspect',
-                                                  'retry_canonical': True},
+                                'preprocessing': {'outcome': 'suspect', 'retry_canonical': True},
                                 'profile': 'auto',
                                 'prompt': {'disabled': 'no glossary terms'},
                                 'provenance': 'retry',
                                 'raw_kept': False,
-                                'text': LOOP.strip(),
+                                'text': 'difference difference difference difference difference '
+                                        'difference difference difference difference difference '
+                                        'difference difference difference difference difference '
+                                        'difference difference difference difference difference '
+                                        'difference difference difference difference difference '
+                                        'difference difference difference difference difference '
+                                        'difference difference difference difference difference '
+                                        'difference difference difference difference difference',
                                 'vad': {'available': None,
                                         'span_count': None,
                                         'speech_fraction': None}}],
@@ -522,6 +550,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
  'h_retry_deleted': {'appends': [],
                      'asr_calls': 0,
                      'copied': [],
+                     'delivered': [],
                      'errors': [],
                      'injected': [],
                      'log': ['↻ retry skipped — entry deleted'],
@@ -535,6 +564,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
  'i_shutdown_mid_job': {'appends': [],
                         'asr_calls': 1,
                         'copied': [],
+                        'delivered': [],
                         'errors': [],
                         'injected': [],
                         'log': [],
@@ -571,6 +601,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                             'speech_fraction': 1.0}}],
                        'asr_calls': 0,
                        'copied': [],
+                       'delivered': ['inject_when_clear'],
                        'errors': [],
                        'injected': ['Please call me back at four'],
                        'log': ['→ Ns after release (speech model Ns) · 27 chars'],
@@ -579,7 +610,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                        'refreshed': 1,
                        'retries': [],
                        'totals': [('Please call me back at four', 2.0)],
-                       'ui': ['inject_when_clear', 'hide_if_transcribing'],
+                       'ui': ['hide_if_transcribing'],
                        'undone': 0}}
 
 

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """sotto — hold a key, speak, release; the words land at your cursor. All local.
 
-Gestures (on whichever trigger key you pick):
+Gestures (on whichever trigger key you pick; right Option by default):
     hold        push-to-talk — release to transcribe
     double-tap  hands-free — records until the next single tap
     lone tap    ignored (no accidental blips)
 
-    python sotto.py                          # run on fn, whisper-large-v3-turbo
-    python sotto.py --trigger right-option   # e.g. while fn is taken by parrot
-    python sotto.py --model mlx-community/whisper-large-v3-turbo
+    python sotto.py run                      # menu bar app with the pill
+    python sotto.py run --trigger fn         # another trigger key
     python sotto.py doctor                   # permission + device checks
 
-Runs from a terminal that already has Accessibility (no extra TCC dance).
-Transcription is mlx-whisper on Metal/unified memory — nothing leaves the Mac
-for inference (model files download once from Hugging Face).
+The installed Sotto.app asks for the Microphone and Accessibility itself; a
+terminal run needs both granted to the terminal. Speech engines (Whisper via
+mlx-whisper, Parakeet, Nemotron) run on this Mac; model files download once,
+at pinned revisions, and audio never leaves the Mac.
 """
 
 from __future__ import annotations
@@ -495,6 +495,61 @@ def live_preview(text: str) -> str:
         return dictionary.apply(text, dictionary.load(dictionary.DICTIONARY_PATH))[0]
     except Exception:  # display only: a broken dictionary leaves the words as heard
         return text
+
+
+def main_thread_dispatch(has_ui: bool, call_after):
+    """Return (ui_call, deliver_call), both scheduling work on the main thread.
+
+    ui_call updates the menu bar and pill, so it does nothing under
+    --no-overlay. deliver_call (pasting, voice undo) always runs: hiding the
+    UI must never stop text from reaching the cursor.
+    """
+    def deliver_call(method, *call_args) -> None:
+        call_after(method, *call_args)
+
+    def ui_call(method, *call_args) -> None:
+        if has_ui:
+            call_after(method, *call_args)
+
+    return ui_call, deliver_call
+
+
+def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep) -> None:
+    """Block the calling worker thread until busy() is False.
+
+    Side effects: sleeps. Used before an update restart, because a restart
+    discards any recording or transcription still in progress.
+    """
+    while busy():
+        sleep(poll_s)
+
+
+class CaptureGate:
+    """Whether a key press may start a new recording.
+
+    close() is called before an update restart: it waits for a start already
+    under way (so that recording is visible as active), then refuses new ones,
+    so "wait until idle, then restart" cannot discard a recording that began
+    in between. reopen() undoes it if the restart does not happen.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._open = True
+
+    @contextmanager
+    def starting(self):
+        """Hold while deciding and starting a recording; yields whether it may start."""
+        with self._lock:
+            yield self._open
+
+    def close(self) -> None:
+        with self._lock:
+            self._open = False
+
+    def reopen(self) -> None:
+        with self._lock:
+            self._open = True
 
 
 def choose_language(probabilities: dict, allowed) -> str:
@@ -2298,9 +2353,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         status_ui.set_language_mode(language_state["mode"],
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
-    def ui_call(method, *call_args) -> None:
-        if status_ui is not None:
-            AppHelper.callAfter(method, *call_args)
+    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter)
 
     def refresh_history() -> None:
         if status_ui is not None:
@@ -2327,6 +2380,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     capture = CaptureService()
     capture.restart_callback = restart.request
     capture.idle_release_s = idle_release
+    capture_gate = CaptureGate()
     if status_ui is not None:
         status_ui.level_source = lambda: capture.latest_rms
         status_ui.live_text_source = (
@@ -2348,13 +2402,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     # Gesture callbacks mark the capture boundary. The audio engine starts and
     # stops off-thread; the ASR model stays resident independently.
     def on_start() -> None:
-        if shutdown.requested():
-            return
-        stream = None
-        if use_nemotron:
-            from streaming_audio import StreamingCapture
-            stream = StreamingCapture(nemotron)
-        cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
+        with capture_gate.starting() as allowed:
+            if shutdown.requested():
+                return
+            if not allowed:
+                log("● an update is restarting Sotto; dictation resumes in a moment")
+                return
+            stream = None
+            if use_nemotron:
+                from streaming_audio import StreamingCapture
+                stream = StreamingCapture(nemotron)
+            cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
         now = time.monotonic()
         if model_rewarm_due(model_activity["last_finished"], now,
                             rewarming=bool(model_activity["rewarming"]),
@@ -2504,7 +2562,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         nemotron=nemotron, current_speech_config=current_speech_config,
         coordinator=coordinator, refresh_history=refresh_history,
         adaptive_runtime=adaptive_runtime, adaptive=adaptive, use_nemotron=use_nemotron,
-        status_ui=status_ui, ui_call=ui_call, inject_when_clear=inject_when_clear,
+        status_ui=status_ui, ui_call=ui_call, deliver_call=deliver_call,
+        inject_when_clear=inject_when_clear,
         undo_when_clear=undo_when_clear, copy_text=_copy_text, record_totals=record_totals,
         model_activity=model_activity, glossary_terms=glossary_terms)
     transcription_thread = threading.Thread(target=worker.run, daemon=True)
@@ -2933,15 +2992,19 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             if engine.force_start():
                 log("● dictation started via menu (hands-free)")
 
-        def action_restart() -> None:
-            """Restart this foreground process or its own sealed supervisor."""
+        def action_restart(after_failure=None) -> None:
+            """Restart this foreground process or its own sealed supervisor.
+            after_failure runs if the restart does not happen."""
+            def failed(message: str) -> None:
+                if after_failure is not None:
+                    after_failure()
+                ui_call(status_ui.show_error, "Could not restart Sotto", message[:160])
             try:
-                if not restart.request(on_failure=lambda message: ui_call(
-                        status_ui.show_error, "Could not restart Sotto", message[:160])):
+                if not restart.request(on_failure=failed):
                     raise RuntimeError("Sotto is already shutting down")
                 log("● restart requested from the menu")
             except Exception as exc:
-                ui_call(status_ui.show_error, "Could not restart Sotto", str(exc)[:160])
+                failed(str(exc))
 
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
@@ -3091,17 +3154,28 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             def work() -> None:
                 import updates
                 from sotto_paths import DATA_DIR
-                ok, tail = updates.apply_mac(Path(__file__).resolve().parent, sys.executable,
-                                             DATA_DIR / "logs" / "update.log")
+                finished, tail, source_changed = updates.apply_mac(
+                    Path(__file__).resolve().parent, sys.executable, DATA_DIR / "logs" / "update.log")
                 update_state["running"] = False
-                if ok:
-                    log("✓ update installed — restarting")
-                    action_restart()
+                if finished:
+                    log("✓ update installed — restarting once dictation is done")
+                    # A restart discards any recording or transcription in progress,
+                    # and the user may have dictated while the update ran. Refuse new
+                    # recordings first, then drain, so none can start in between.
+                    capture_gate.close()
+                    wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0)
+                    action_restart(after_failure=capture_gate.reopen)
+                elif source_changed:
+                    log("! update installed but its setup did not finish (see logs/update.log)")
+                    ui_call(status_ui.show_error, "Update not finished",
+                            f"{tail}\n\nThe new version is in place but its setup did not finish. "
+                            "Run scripts/install-mac.sh --update in Terminal to finish it, then "
+                            "choose Restart Sotto. Details are in logs/update.log in the data folder.")
                 else:
                     log("! update failed (see logs/update.log)")
                     ui_call(status_ui.show_error, "Update failed",
-                            f"{tail}\n\nSotto keeps running the current version. "
-                            "Details are in logs/update.log in the data folder.")
+                            f"{tail}\n\nThe source was not switched, so Sotto keeps running the "
+                            "current version. Details are in logs/update.log in the data folder.")
             threading.Thread(target=work, daemon=True).start()
 
         def action_check_updates() -> None:

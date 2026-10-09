@@ -39,8 +39,8 @@ class TranscriptionWorker:
 
     def __init__(self, *, shutdown, jobs: queue.Queue, log, model: str, mlx_whisper, nemotron,
                  current_speech_config, coordinator, refresh_history, adaptive_runtime,
-                 adaptive: bool, use_nemotron: bool, status_ui, ui_call, inject_when_clear,
-                 undo_when_clear, copy_text, record_totals, model_activity: dict,
+                 adaptive: bool, use_nemotron: bool, status_ui, ui_call, deliver_call,
+                 inject_when_clear, undo_when_clear, copy_text, record_totals, model_activity: dict,
                  glossary_terms: tuple[str, ...]) -> None:
         self.shutdown = shutdown
         self.jobs = jobs
@@ -56,6 +56,9 @@ class TranscriptionWorker:
         self.use_nemotron = use_nemotron
         self.status_ui = status_ui
         self.ui_call = ui_call
+        # Delivery (paste, voice undo) is always scheduled; ui_call is a no-op
+        # under --no-overlay and must never carry text (F9).
+        self.deliver_call = deliver_call
         self.inject_when_clear = inject_when_clear
         self.undo_when_clear = undo_when_clear
         self.copy_text = copy_text
@@ -136,7 +139,7 @@ class TranscriptionWorker:
 
         Side effects: appends a ``live`` or ``live_suspect`` History row,
         schedules the cursor insertion (or the "scratch that" undo) via
-        ``ui_call``, records progress totals, refreshes the History menu, logs.
+        ``deliver_call``, records progress totals, refreshes the History menu, logs.
         Nothing is appended, delivered or persisted once shutdown is requested."""
         _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, stream = job
         started = time.monotonic()
@@ -363,8 +366,8 @@ class TranscriptionWorker:
             else:
                 if self.shutdown.requested():
                     return
-                deliver = ((lambda: self.ui_call(self.undo_when_clear, 0)) if voice_action == "scratch"
-                           else (lambda: self.ui_call(self.inject_when_clear, text, 0)) if text else None)
+                deliver = ((lambda: self.deliver_call(self.undo_when_clear, 0)) if voice_action == "scratch"
+                           else (lambda: self.deliver_call(self.inject_when_clear, text, 0)) if text else None)
                 try:
                     appended_row = finalize_primary_live_delivery(
                         append=lambda: self.coordinator.append_live(

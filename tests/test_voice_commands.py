@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import settings
 import voice_commands
 from voice_commands import clean, is_english
 
@@ -38,10 +39,19 @@ class CleanTests(unittest.TestCase):
 
     def test_english_only(self):
         self.assertTrue(is_english("en"))
+        self.assertTrue(is_english("EN"))
         self.assertFalse(is_english("pt"))                 # "um" is a Portuguese word
-        self.assertTrue(is_english(None, ["en"]))          # unknown language, English-only user
-        self.assertTrue(is_english(None, []))
-        self.assertFalse(is_english(None, ["en", "pt"]))   # unknown and could be Portuguese
+        # Parakeet reports no language and speaks 25 of them, so an unknown
+        # language is never treated as English, whatever the Settings list says.
+        self.assertFalse(is_english(None))
+        self.assertFalse(is_english(""))
+
+    def test_portuguese_parakeet_text_keeps_every_word(self):
+        import sotto
+        text = "Eu comprei um carro e um livro."
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(settings, "SETTINGS_PATH", Path(folder) / "settings.json"):
+            self.assertEqual(sotto.apply_voice_cleanup(text, {}, None), (text, None))
 
 
 class PipelineTests(unittest.TestCase):

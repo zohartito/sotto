@@ -121,6 +121,25 @@ class NemotronTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(prepared.pcm).hexdigest(), prepared.identity.sha256)
         self.assertTrue(runtime.streams[0].closed)
 
+    def test_speech_after_a_quiet_lead_in_is_not_clipped(self):
+        # The boost used to be set once from the first ~0.56 s. Room noise there
+        # made it huge, and the speech after it was clipped for the decoder and
+        # in History alike.
+        rng = np.random.default_rng(0)
+        rate = 48000
+        noise = rng.normal(0, 0.002, int(0.8 * rate)).astype(np.float32)
+        seconds = np.arange(3 * rate) / rate
+        speech = (0.25 * np.sin(2 * np.pi * 140 * seconds)).astype(np.float32)
+        audio = np.concatenate([noise, speech])
+        runtime = FakeRuntime()
+        capture = StreamingCapture(runtime)
+        for start in range(0, len(audio), 4096):
+            capture.feed(audio[start:start + 4096], rate)
+        _, prepared = capture.finish()
+        spoken = prepared.asr_samples[len(noise) // 3:]
+        self.assertLess(np.mean(np.abs(spoken) >= 0.999), 0.01)
+        np.testing.assert_array_equal(np.concatenate(runtime.streams[0].blocks), prepared.asr_samples)
+
     def test_zero_capture_never_creates_decoder_but_quiet_audio_does(self):
         runtime = FakeRuntime()
         capture = StreamingCapture(runtime)

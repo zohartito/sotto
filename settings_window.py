@@ -134,7 +134,7 @@ class SettingsController(AppKit.NSObject):
         self._row_label(view, y, "Whisper speed")
         self._popup(view, y, list(SPEED_LABELS.items()), "speedChanged:", key="speed"); y += 32
         self._row_label(view, y, "Automatic language")
-        view.addSubview_(_label("Chooses among these; clearly other speech is written as spoken.",
+        view.addSubview_(_label("With two or more, clearly other speech is written as spoken.",
                                 AppKit.NSMakeRect(CONTROL_X, y + 2, CONTROL_W, 16), small=True)); y += 24
         languages = sorted(state["language_names"].items(), key=lambda item: item[1])
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(CONTROL_X, y, CONTROL_W, 150))
