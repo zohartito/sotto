@@ -770,7 +770,9 @@ class LearningCoordinator:
             self._reload_current_locked()
             entry = self.history._find_locked(entry_id)
             if entry is None or (expected_revision is not None and entry.get("revision") != expected_revision): return None
-            self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]),operation="delete")
+            # "correct", not "delete": recovery of an interrupted correction
+            # must keep the (uncorrected) row, never remove it.
+            self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]),operation="correct")
             # A later correction invalidates its prior explicit consent first.
             for record in list(self.learning.active_for_history(entry_id)):
                 self.learning.revoke(record["sample_id"])
