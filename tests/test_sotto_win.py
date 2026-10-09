@@ -164,6 +164,21 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(Path(command[0]), pythonw if pythonw.is_file() else Path(sys.executable))
         self.assertEqual(command[1:], ["C:/sotto/win_launch.py", "--data-dir", "D:/x"])
 
+    def test_restart_finds_a_script_started_by_a_relative_path(self):
+        # [F36] `python sotto-copy\sotto_win.py --tray` from another folder: the
+        # restart runs in the repository folder, so a relative path must not reach it.
+        with tempfile.TemporaryDirectory(prefix="sotto-win-cwd-") as folder, \
+                mock.patch.object(sys, "argv", ["sotto-copy\\sotto_win.py", "--tray"]):
+            previous = os.getcwd()
+            os.chdir(folder)
+            try:
+                command = sotto_win.restart_command()
+            finally:
+                os.chdir(previous)
+        self.assertTrue(Path(command[1]).is_absolute(), command)
+        self.assertEqual(Path(command[1]).resolve(), (Path(folder) / "sotto-copy" / "sotto_win.py").resolve())
+        self.assertEqual(command[2:], ["--tray"])
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class RestartTest(unittest.TestCase):

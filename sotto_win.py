@@ -214,9 +214,14 @@ def release_instance(handle: int | None) -> None:
 
 
 def restart_command() -> list[str]:
-    """The same launch again, without a console window."""
+    """The same launch again, without a console window.  A relative script
+    path is made absolute: the restart runs in the repository folder, not in
+    the folder Sotto was started from."""
     import win_startup
-    return [str(win_startup.gui_python()), *sys.argv]
+    script = sys.argv[0]
+    if script and not Path(script).is_absolute():
+        script = str(Path(script).absolute())
+    return [str(win_startup.gui_python()), script, *sys.argv[1:]]
 
 
 def spawn_restart() -> None:
