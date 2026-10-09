@@ -179,8 +179,10 @@ words · about 4.2 hours saved vs typing at 40 wpm" (counts only, kept in
 
 Say **"new line"** or **"new paragraph"** as its own phrase for a line break or a
 blank line ("a new line of products" stays as words). Say **"scratch that"** on
-its own to undo your last dictation with the app's own ⌘Z, within a minute of
-Sotto inserting it. Filler words (um, uh) are removed with the comma around them.
+its own to undo your last dictation with the app's own ⌘Z. It only undoes
+Sotto's own insert: within a minute of the paste, while the same app is still
+in front, and only if you have not typed since; otherwise nothing happens and
+the log says why. Filler words (um, uh) are removed with the comma around them.
 Both apply only to dictation the engine reports as English (Whisper and
 Nemotron; Parakeet does not report a language, so its text stays as spoken)
 and can be switched off under **Settings… → Cleanup**; History keeps what the
