@@ -388,6 +388,15 @@ class QuitDrainTests(unittest.TestCase):
             self.assertLess(source.index("if shutdown.requested():"),
                             source.index("finally:"), name)
 
+    def test_update_and_engine_restarts_also_wait_for_the_paste(self):
+        # The update restart and the engine switch restart the process too, so
+        # they must count a scheduled paste as busy, like Quit: every in-flight
+        # check in run() goes through dictation_in_flight.
+        for name in ("action_apply_update", "action_set_engine"):
+            source = _closure_source(name)
+            self.assertNotIn("jobs.unfinished_tasks", source, name)
+            self.assertIn("dictation_in_flight(capture, jobs, pending_deliveries)", source, name)
+
 
 class FinishCaptureNowTests(unittest.TestCase):
     """Finish now and Quit both end a capture the gesture engine lost track of."""

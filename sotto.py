@@ -3408,7 +3408,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         def action_set_engine(mode: str) -> None:
             if adaptive or not engine_switching or mode == active_engine:
                 return
-            if capture.is_active() or jobs.unfinished_tasks:
+            if dictation_in_flight(capture, jobs, pending_deliveries):
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Switch engines after the current recording and transcription finish.")
                 return
@@ -3419,7 +3419,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     installation()  # verify before persisting a restart choice
                 if mode == "parakeet" and not parakeet_cached():
                     raise RuntimeError("Download Parakeet first: Settings → Download Parakeet.")
-                if capture.is_active() or jobs.unfinished_tasks:
+                if dictation_in_flight(capture, jobs, pending_deliveries):
                     raise RuntimeError("Finish the current dictation before switching engines.")
                 persist_engine_and_restart(
                     mode, restart.request,
@@ -3761,7 +3761,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Update this checkout with the installer, then restart into it."""
             if update_state["running"]:
                 return
-            if capture.is_active() or jobs.unfinished_tasks:
+            if dictation_in_flight(capture, jobs, pending_deliveries):
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Update after the current recording and transcription finish.")
                 return
@@ -3780,7 +3780,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     # and the user may have dictated while the update ran. Refuse new
                     # recordings first, then drain, so none can start in between.
                     capture_gate.close()
-                    wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0)
+                    wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries))
                     action_restart(after_failure=capture_gate.reopen)
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
