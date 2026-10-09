@@ -355,12 +355,16 @@ class TranscriptionWorker:
                         adaptive_runtime=self.adaptive_runtime,appended_publication=publication_meta,
                         shutdown=self.shutdown,inject=None)
                     self._publication_committed = appended_row is not None
-                except Exception:
-                    if self.adaptive_runtime is not None: discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
-                    raise
+                except Exception as exc:
+                    if self.adaptive_runtime is not None:
+                        discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
+                        raise
+                    self._history_append_failed(exc)  # F16(a): held text; nothing to deliver
             else:
                 if self.shutdown.requested():
                     return
+                deliver = ((lambda: self.ui_call(self.undo_when_clear, 0)) if voice_action == "scratch"
+                           else (lambda: self.ui_call(self.inject_when_clear, text, 0)) if text else None)
                 try:
                     appended_row = finalize_primary_live_delivery(
                         append=lambda: self.coordinator.append_live(
@@ -369,13 +373,15 @@ class TranscriptionWorker:
                             provenance="live", adaptive=entry_adaptive,
                             entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
                         adaptive_runtime=self.adaptive_runtime,appended_publication=publication_meta,
-                        shutdown=self.shutdown,
-                        inject=(lambda: self.ui_call(self.undo_when_clear, 0)) if voice_action == "scratch"
-                        else (lambda: self.ui_call(self.inject_when_clear, text, 0)) if text else None)
+                        shutdown=self.shutdown, inject=deliver)
                     self._publication_committed = appended_row is not None
-                except Exception:
-                    if self.adaptive_runtime is not None: discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
-                    raise
+                except Exception as exc:
+                    if self.adaptive_runtime is not None:
+                        # The adaptive lane's row is part of its receipts:
+                        # append-before-deliver stays absolute there.
+                        discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
+                        raise
+                    self._history_append_failed(exc, deliver)  # F16(a)
             self._publication_adopted = (appended_row is not None and not self.shutdown.requested())
             if appended_row is not None and text and not reason and voice_action is None:
                 self.record_totals(text, len(raw) / max(native_rate, 1.0))
@@ -425,6 +431,25 @@ class TranscriptionWorker:
             return
         self.refresh_history()
         self._show_error("Transcription failed", f"The audio is in History; use Retry.\n\n{error}")
+
+    def _history_append_failed(self, exc: Exception, deliver=None) -> None:
+        """History could not take the live row (F16a): disk full, a locked or
+        damaged store. Non-adaptive dictation still reaches the user, who is
+        told once that this dictation was not saved.
+
+        Side effects: runs ``deliver`` (the cursor insertion or the "scratch
+        that" undo, exactly what a saved row would have scheduled); shows one
+        alert; logs the error. Nothing once shutdown is requested."""
+        error = f"{type(exc).__name__}: {str(exc)[:160]}"
+        self.log(f"! History append failed ({error})"
+                 + (" — delivering the text anyway" if deliver is not None else ""))
+        if self.shutdown.requested():
+            return
+        if deliver is not None:
+            deliver()
+        outcome = ("The text was still delivered, but it is not in History."
+                   if deliver is not None else "The held-back text could not be kept in History.")
+        self._show_error("History could not be saved", f"{outcome}\n\n{error}")
 
     def _show_error(self, title: str, message: str) -> None:
         """One alert on AppKit's main thread, when there is a menu bar to show it.

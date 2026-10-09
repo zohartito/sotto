@@ -710,6 +710,33 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         h.run_jobs(h.live_job(speech(2.0)))
         self.assertEqual((h.coordinator.appended, h.status_ui.errors, h.injected), ([], [], []))
 
+    def test_f16_history_write_failure_still_delivers_the_text_and_tells_the_user(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        h = Harness(says("Please call me back at four"), append=disk_full)
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(h.injected, ["Please call me back at four"])
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["History could not be saved"])
+        self.assertTrue(any("OSError" in line for line in h.logs), h.logs)
+
+    def test_f16_held_text_stays_off_the_cursor_when_history_fails(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        h = Harness(says(LOOP), append=disk_full)
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual((h.injected, h.copied), ([], []))
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["History could not be saved"])
+
+    def test_f16_after_shutdown_nothing_is_delivered_or_shown(self):
+        holder: dict = {}
+
+        def disk_full_after_shutdown(*args, **kwargs):
+            holder["harness"].shutdown.request()
+            raise OSError(28, "No space left on device")
+        h = holder["harness"] = Harness(says("Please call me back at four"), append=disk_full_after_shutdown)
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual((h.injected, h.status_ui.errors), ([], []))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
