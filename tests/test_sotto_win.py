@@ -194,7 +194,6 @@ class RestartTest(unittest.TestCase):
         return sotto_win.Controller(shutdown=sotto.ShutdownBoundary(), capture=capture,
                                     jobs=jobs, deliveries=deliveries, finishing=lambda: False,
                                     engine=engine, on_finish=mock.Mock(),
-                                    finish_from_menu=threading.Event(),
                                     capture_gate=sotto.CaptureGate(),
                                     lifecycle={"closed": None}), jobs
 
@@ -367,22 +366,27 @@ class QuitAndUpdateTest(unittest.TestCase):
             controller, _jobs = self.controller(busy=False)
             self.virtual_clock(controller)
             copied_finish = []
-            controller.engine.force_finish.side_effect = lambda: (
-                copied_finish.append(controller.finish_from_menu.is_set()), not orphan)[1]
-            controller.capture.is_active.return_value = orphan  # the engine lost track of it
 
-            def end_orphan():
-                copied_finish.append(controller.finish_from_menu.is_set())
+            def force_finish(finish=None, orphan=orphan):
+                if orphan:
+                    return False  # the engine lost track of the capture
+                finish()          # the engine runs the finish it was handed
+                return True
+
+            def end_capture(copy_only=False, controller=controller, copied_finish=copied_finish):
+                copied_finish.append(copy_only)
                 controller.capture.is_active.return_value = False
 
-            controller.on_finish.side_effect = end_orphan
+            controller.engine.force_finish.side_effect = force_finish
+            controller.capture.is_active.return_value = orphan
+            controller.on_finish.side_effect = end_capture
             with mock.patch.object(sotto_win, "log"):
                 controller.quit()
                 self.assertTrue(controller.shutdown.event.wait(5))
-            # Ended like the tray's Finish: the menu took the focus, so it is copied.
-            self.assertEqual(copied_finish, [True, True] if orphan else [True], f"orphan={orphan}")
-            self.assertEqual(controller.on_finish.call_count, 1 if orphan else 0)
-            self.assertFalse(controller.finish_from_menu.is_set())
+            # Ended like the tray's Finish: the menu took the focus, so it is
+            # copied, and the copy travels with the finish the engine runs.
+            self.assertEqual(copied_finish, [True], f"orphan={orphan}")
+            self.assertEqual(controller.on_finish.call_count, 1, f"orphan={orphan}")
 
     def test_quit_still_stops_when_finishing_the_recording_fails(self):
         # Ending an orphan capture raised on the quit thread: shutdown was
@@ -398,7 +402,7 @@ class QuitAndUpdateTest(unittest.TestCase):
             self.assertTrue(controller.shutdown.event.wait(5), "Quit always stops Sotto")
         failed = [line for line in logs if "could not be ended" in line]
         self.assertEqual(len(failed), 1, logs)
-        self.assertFalse(controller.finish_from_menu.is_set())
+        controller.on_finish.assert_called_once_with(copy_only=True)
 
     def test_a_restart_is_refused_while_quitting(self):
         controller, jobs = self.controller(busy=True)
@@ -470,7 +474,7 @@ class QuitAndUpdateTest(unittest.TestCase):
             self.virtual_clock(controller)
             work = {"left": refused == "busy"}
 
-            def quit_chosen_meanwhile():
+            def quit_chosen_meanwhile(controller=controller, work=work):
                 controller.quit()  # from the tray, between Update's close and reopen
                 return work["left"]
 

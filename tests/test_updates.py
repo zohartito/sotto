@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from unittest import mock
 
@@ -180,7 +179,7 @@ class WindowsUpdateTests(unittest.TestCase):
         engine.force_finish.return_value = False  # nothing is recording
 
         def lifecycle_parts():
-            return dict(engine=engine, on_finish=mock.Mock(), finish_from_menu=threading.Event(),
+            return dict(engine=engine, on_finish=mock.Mock(),
                         capture_gate=sotto.CaptureGate(), lifecycle={"closed": None})
 
         busy_jobs = queue.Queue()
