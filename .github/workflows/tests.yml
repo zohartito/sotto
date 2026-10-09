@@ -1,7 +1,7 @@
 name: Tests
 
-# Runs the unit suite on a real Mac for every pull request and every push to
-# main. Python comes from Homebrew on the runner, not actions/setup-python,
+# Runs the unit suite and ruff on a real Mac for every pull request and every
+# push to main. Python comes from Homebrew on the runner, not actions/setup-python,
 # which stays unused until its provenance is reviewed
 # (.github/workflows-disabled/README.md). tests/gesture_check.py is wall-clock
 # timed and stays a local check.
@@ -45,3 +45,25 @@ jobs:
         env:
           SOTTO_DATA_DIR: ${{ runner.temp }}/sotto-data
         run: venv-alpha/bin/python -m unittest discover -s tests
+
+  lint:
+    name: Lint (ruff)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same Homebrew Python and venv name as the unit tests; only ruff is
+      # installed, at an exact version. pyproject.toml holds the rules.
+      - name: Python 3.12 from Homebrew
+        run: |
+          brew list python@3.12 >/dev/null 2>&1 || brew install python@3.12
+          echo "PYTHON=$(brew --prefix python@3.12)/bin/python3.12" >> "$GITHUB_ENV"
+
+      - name: ruff check
+        run: |
+          "$PYTHON" -m venv venv-alpha
+          venv-alpha/bin/python -m pip install --quiet ruff==0.16.10
+          venv-alpha/bin/python -m ruff check
