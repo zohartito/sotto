@@ -332,6 +332,79 @@ class HistoryLearningTests(unittest.TestCase):
         recovered = LearningStore(self.root)
         self.assertEqual(recovered._records[enrolled.sample_id]["status"], "revoked")
 
+    def test_plain_history_actions_never_create_the_silver_lane(self):
+        # Plain alpha: sotto.run always builds this guard, never a SilverStore.
+        AdaptiveLearning(self.root)
+        silver = self.root / "adaptive-learning" / "silver"
+        row, other = self.live(), self.live("other")
+        retried = self.coordinator.commit_retry(row["id"], "retry text", row["revision"])
+        self.coordinator.correct(row["id"], "truth", expected_revision=retried["revision"])
+        self.assertIsNotNone(self.coordinator.enroll(row["id"]))
+        self.coordinator.correct_as_is(other["id"])
+        self.coordinator.no_speech(other["id"])
+        self.assertEqual(self.coordinator.revoke_history(row["id"]), 1)
+        self.assertTrue(self.coordinator.delete(row["id"]))
+        self.coordinator.clear()
+        self.assertEqual(self.history.entries(99), [])
+        # HistoryStore's own empty evidence spool is the only silver-path entry.
+        self.assertEqual(sorted(os.listdir(silver)), ["evidence"])
+        self.assertEqual(os.listdir(silver / "evidence"), [])
+
+    def test_existing_damaged_silver_lane_still_fails_delete_closed(self):
+        import sqlite3
+        row = self.live()
+        silver = self.root / "adaptive-learning" / "silver"
+        (silver / "silver.sqlite3").write_bytes(b"not a database")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.coordinator.delete(row["id"])
+        self.assertIsNotNone(HistoryStore(self.root).get(row["id"]))
+
+    def test_silver_lane_is_absent_only_when_its_root_is_provably_missing(self):
+        import learning
+        base = self.root / "probe"
+        self.assertFalse(learning.silver_lane_exists(base))
+        HistoryStore(base)  # creates only adaptive-learning/silver/evidence
+        self.assertFalse(learning.silver_lane_exists(base))
+        parent = base / "adaptive-learning"
+        silver = parent / "silver"
+        for name in ("silver.sqlite3", "silver.sqlite3-wal", "deployment.jsonl", "unknown",
+                     "evidence/spooled.wav"):
+            (silver / name).write_bytes(b"")
+            self.assertTrue(learning.silver_lane_exists(base), name)
+            (silver / name).unlink()
+        (silver / "evidence" / "comparators").mkdir(mode=0o700)
+        self.assertTrue(learning.silver_lane_exists(base))
+        (silver / "evidence" / "comparators").rmdir()
+        self.assertFalse(learning.silver_lane_exists(base))
+        os.chmod(parent, 0)
+        try:
+            self.assertTrue(learning.silver_lane_exists(base))
+        finally:
+            os.chmod(parent, 0o700)
+        silver.rename(parent / "elsewhere")
+        silver.symlink_to(parent / "elsewhere", target_is_directory=True)
+        self.assertTrue(learning.silver_lane_exists(base))
+        silver.unlink()
+        shutil.rmtree(parent)
+        parent.write_bytes(b"")
+        self.assertTrue(learning.silver_lane_exists(base))
+
+    def test_clear_refuses_when_the_silver_lane_appears_mid_clear(self):
+        from silver_store import SilverStore
+        row = self.live()
+        original = AdaptiveLearning.clear_personal_state
+
+        def racing(guard):
+            original(guard)
+            SilverStore(self.root)
+
+        with patch.object(AdaptiveLearning, "clear_personal_state", racing):
+            with self.assertRaises(RuntimeError):
+                self.coordinator.clear()
+        self.assertIsNotNone(HistoryStore(self.root).get(row["id"]))
+        self.coordinator.clear()
+        self.assertEqual(HistoryStore(self.root).entries(99), [])
+
     def test_delete_clear_failure_ordering(self):
         row = self.live(); self.coordinator.correct(row["id"], "truth")
         enrolled = self.coordinator.enroll(row["id"])

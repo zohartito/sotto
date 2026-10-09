@@ -1549,6 +1549,49 @@ class SilverLaneTests(unittest.TestCase):
         self.assertEqual(current["text"],"new retry")
         self.assertTrue(audio.exists())
 
+    def test_interrupted_correction_stages_correct_intent_and_recovery_keeps_uncorrected_row(self):
+        row=self.live(); store=SilverStore(self.root); audio=self.history.audio_path(row["id"])
+        with mock.patch.object(HistoryStore,"_save_locked",side_effect=OSError(5,"I/O error")):
+            with self.assertRaises(OSError):
+                self.coordinator.correct(row["id"],"corrected",expected_revision=row["revision"])
+        pending=store.scrub_pending()
+        self.assertEqual([(item["history_id"],item["history_revision"],item["operation"]) for item in pending["intents"]],
+                         [(row["id"],row["revision"],"correct")])
+        worker=AdaptiveWorker(self.root,history=HistoryStore(self.root),silver=store,teachers=_Teachers())
+        worker.recover_markers()
+        self.assertIsNone(store.scrub_pending())
+        survivor=HistoryStore(self.root).get(row["id"])
+        self.assertIsNotNone(survivor)
+        self.assertEqual((survivor["revision"],survivor["text"],survivor.get("correction")),(row["revision"],"candidate",None))
+        self.assertTrue(audio.exists())
+
+    def test_completed_correction_recovery_keeps_corrected_row(self):
+        row=self.live(); store=SilverStore(self.root)
+        corrected=self.coordinator.correct(row["id"],"gold",expected_revision=row["revision"])
+        intent=next(item for item in store.scrub_pending()["intents"] if item["history_id"] == row["id"])
+        self.assertEqual((intent["history_revision"],intent["operation"]),(row["revision"],"correct"))
+        self.coordinator.finish_pending_revoke_intent(intent)
+        current=self.history.get(row["id"])
+        self.assertEqual((current["revision"],current["text"]),(corrected["revision"],"gold"))
+
+    def test_delete_still_revokes_existing_silver_evidence_for_the_row(self):
+        row=self.live(); store=SilverStore(self.root)
+        job_args=dict(history_id=row["id"],history_revision=row["revision"],audio_sha256=row["audio"]["inference"]["sha256"],
+                      teacher_family_hash=family_hash(),consensus_policy_hash=policy_hash(),receipt_hash="frozen-receipt")
+        key=store.enqueue(**job_args); self.assertIsNotNone(key)
+        job=store.claim("owner"); self.assertIsNotNone(job)
+        self.assertTrue(store.finish(job,outcome="accepted",reference="candidate",vote_digest="vote"))
+        AdaptiveLearning(self.root).revoke(row["id"],reason="history_deleted")  # sotto.nonadaptive_delete order
+        self.assertTrue(self.coordinator.delete(row["id"]))
+        self.assertIsNone(self.history.get(row["id"]))
+        with store._connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM jobs WHERE job_key=?",(key,)).fetchone(),("discarded",))
+            self.assertEqual(db.execute("SELECT state,reference FROM labels WHERE job_key=?",(key,)).fetchone(),("revoked",None))
+            self.assertIsNotNone(db.execute("SELECT 1 FROM history_tombstones WHERE history_id=? AND history_revision=?",
+                                            (row["id"],row["revision"])).fetchone())
+        self.assertIsNone(store.enqueue(**job_args))
+        self.assertEqual([(item["history_id"],item["operation"]) for item in store.scrub_pending()["intents"]],[(row["id"],"delete")])
+
     def test_worker_recovers_schema2_delete_intent_before_selective_scrub_ack(self):
         from adaptive_learning import AdaptiveLearning
         from learning import LearningStore
