@@ -3002,11 +3002,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
 
     def _copy_text(text: str) -> None:
-        if shutdown.requested():
-            return
-        pasteboard = NSPasteboard.generalPasteboard()
-        pasteboard.clearContents()
-        pasteboard.setString_forType_(text, NSPasteboardTypeString)
+        """Retry's clipboard copy. The worker schedules it with deliver_call,
+        so it finishes its PendingDeliveries entry like a paste (N19)."""
+        try:
+            if shutdown.requested():
+                return
+            pasteboard = NSPasteboard.generalPasteboard()
+            pasteboard.clearContents()
+            pasteboard.setString_forType_(text, NSPasteboardTypeString)
+        finally:
+            pending_deliveries.finish()
 
     # Gesture callbacks mark the capture boundary. The audio engine starts and
     # stops off-thread; the ASR model stays resident independently.
@@ -3418,7 +3423,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 try:
                     entry = store.get(entry_id)
                     if entry:
-                        ui_call(_copy_text, entry["text"])
+                        deliver_call(_copy_text, entry["text"])  # _copy_text finishes its count
                 except Exception as exc:
                     ui_call(status_ui.show_error, "Could not copy transcript", str(exc)[:160])
             threading.Thread(target=work, daemon=True).start()

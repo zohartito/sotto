@@ -533,7 +533,7 @@ class TranscriptionWorker:
         """Transcribe a History row's saved canonical audio again.
 
         Side effects: commits the new text to the row (``commit_retry``),
-        copies deliverable text to the clipboard via ``ui_call``, refreshes
+        copies deliverable text to the clipboard via ``deliver_call``, refreshes
         the History menu, logs. Nothing is committed or copied once shutdown
         is requested."""
         _, entry_id, queued_at, capture_id, job_config = job
@@ -639,6 +639,8 @@ class TranscriptionWorker:
         if held and committed is not None:
             self.log(f"↻ retried — not copied ({held}); kept in History")
         elif text and committed is not None and not self.shutdown.requested():
-            self.ui_call(self.copy_text, text)
+            # A delivery like a paste (N19): counted in PendingDeliveries until
+            # the main thread runs it, so Quit waits for the copy.
+            self.deliver_call(self.copy_text, text)
             self.log(f"↻ retried · {len(text)} chars")
         self.refresh_history()

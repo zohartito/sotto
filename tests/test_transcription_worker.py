@@ -487,7 +487,8 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
  'g1_retry_copied': {'appends': [],
                      'asr_calls': 1,
                      'copied': ['Please call me back at four'],
-                     'delivered': [],
+                     # N19: the Retry copy is a counted delivery, not a UI call.
+                     'delivered': ['_copy_text'],
                      'errors': [],
                      'injected': [],
                      'log': ['↻ retried · 27 chars'],
@@ -511,7 +512,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                           'span_count': None,
                                           'speech_fraction': None}}],
                      'totals': [],
-                     'ui': ['_copy_text', 'hide_if_transcribing'],
+                     'ui': ['hide_if_transcribing'],
                      'undone': 0},
  'g2_retry_held': {'appends': [],
                    'asr_calls': 1,
@@ -855,6 +856,17 @@ class RoundTwoWorkerTests(TemporaryUserFiles, unittest.TestCase):
         self.assertEqual(h.status_ui.errors, [])
         self.assertFalse(any("transcription failed" in line for line in h.logs), h.logs)
         self.assertTrue(any("progress file locked" in line for line in h.logs), h.logs)
+
+    def test_n19_the_retry_copy_is_counted_until_the_main_thread_runs_it(self):
+        h = Harness(says("Please call me back at four"), snapshot=snapshot(speech(2.0)))
+        deliveries, main_loop = sotto.PendingDeliveries(), []
+        ui_call, deliver_call = sotto.main_thread_dispatch(
+            True, lambda method, *args: main_loop.append((method, args)), deliveries)
+        h.worker.ui_call, h.worker.deliver_call = ui_call, deliver_call
+        h.run_jobs(h.retry_job())
+        self.assertEqual(h.copied, [])                        # scheduled, not yet run
+        self.assertEqual(deliveries.count(), 1)               # so Quit still waits for it
+        self.assertIn(h.worker.copy_text, [method for method, _ in main_loop])
 
     def test_n10_read_only_history_never_says_the_failed_audio_is_in_history(self):
         def boom(samples, **kwargs):

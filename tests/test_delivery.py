@@ -769,6 +769,31 @@ class OwnAlertInFrontTests(unittest.TestCase):
         self.assertFalse(self.probe(active=True, text_focused=True))    # the correction editor
 
 
+class RetryCopyCountedTests(unittest.TestCase):
+    def test_n19_the_retry_copy_finishes_its_pending_delivery(self):
+        deliveries = sotto.PendingDeliveries()
+        pasteboard = FakePasteboard("ORIGINAL user clipboard")
+        namespace = {"shutdown": types.SimpleNamespace(requested=lambda: False),
+                     "NSPasteboard": pasteboard, "NSPasteboardTypeString": PLAIN_TEXT,
+                     "pending_deliveries": deliveries}
+        copy_text = run_closures(["_copy_text"], namespace)["_copy_text"]
+        deliveries.add()                                       # what deliver_call did
+        copy_text("retried text")
+        self.assertEqual((pasteboard.text(), deliveries.count()), ("retried text", 0))
+        namespace["shutdown"] = types.SimpleNamespace(requested=lambda: True)
+        deliveries.add()
+        copy_text("late")                                      # skipped after shutdown, still finished
+        self.assertEqual((pasteboard.text(), deliveries.count()), ("retried text", 0))
+
+    def test_n19_every_copy_is_scheduled_as_a_counted_delivery(self):
+        tree = ast.parse(open(sotto.__file__, encoding="utf-8").read())
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+        schedulers = [node.func.id for node in ast.walk(run) if isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Name)
+                      and any(isinstance(arg, ast.Name) and arg.id == "_copy_text" for arg in node.args)]
+        self.assertEqual(schedulers, ["deliver_call"])         # History's Copy item; Retry's is in the worker
+
+
 class TransientPasteTests(unittest.TestCase):
     def test_n33_the_paste_is_marked_transient_for_clipboard_managers(self):
         world = patch_insertion(self)
