@@ -593,8 +593,9 @@ class SpeechRuntimeTests(unittest.TestCase):
             self.assertIn("threading.Thread(target=work, daemon=True).start()", source)
             self.assertLess(worker, source.index("store.get"))
         self.assertIn("ui_call(_copy_text, entry[\"text\"])", copy_source)
-        self.assertIn("shutil.copy(store.audio_path(entry_id)", save_source)
-        self.assertIn('desktop_audio_path(Path.home() / "Desktop", entry["ts"])', save_source)
+        self.assertIn('save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",',
+                      save_source)
+        self.assertNotIn("shutil.copy", save_source)
 
     def test_concurrent_export_same_destination_has_one_clean_winner(self):
         _, _ = self._enrolled()

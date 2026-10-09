@@ -1,8 +1,10 @@
 """Onboarding seams; no microphone, model download or app injection."""
+import inspect
 import json
 import os
 from pathlib import Path
 import plistlib
+import queue
 import subprocess
 import sys
 import tempfile
@@ -336,6 +338,86 @@ class UpdateRestartTests(unittest.TestCase):
         self.assertEqual(sotto.QUIT_DRAIN_S, 10.0)
 
 
+def _closure_source(name: str) -> str:
+    """The source of one nested def inside sotto.run, up to the next statement at its indent."""
+    import re
+    runtime = inspect.getsource(sotto.run)
+    start = runtime.index(f"def {name}(")
+    indent = runtime[:start].rsplit("\n", 1)[1]
+    following = re.compile(rf"\n{indent}\S").search(runtime, start)
+    return runtime[start:following.start() if following else None]
+
+
+class QuitDrainTests(unittest.TestCase):
+    """Quit waits for the finished dictation to be pasted, not just transcribed."""
+
+    def test_a_paste_scheduled_after_the_queue_drains_still_counts_as_busy(self):
+        jobs, deliveries, main_loop, pasted = queue.Queue(), sotto.PendingDeliveries(), [], []
+        _, deliver_call = sotto.main_thread_dispatch(
+            has_ui=True, call_after=lambda method, *args: main_loop.append((method, args)),
+            deliveries=deliveries)
+        capture = Mock()
+        capture.is_active.return_value = False
+
+        def paste(text):
+            pasted.append(text)
+            deliveries.finish()
+
+        jobs.put("capture")
+        jobs.get()
+        deliver_call(paste, "hello")  # the worker schedules the paste on the main loop …
+        jobs.task_done()              # … and only then marks the job done
+        self.assertEqual(jobs.unfinished_tasks, 0)
+        self.assertTrue(sotto.dictation_in_flight(capture, jobs, deliveries))
+        method, args = main_loop.pop(0)
+        method(*args)
+        self.assertEqual(pasted, ["hello"])
+        self.assertFalse(sotto.dictation_in_flight(capture, jobs, deliveries))
+
+    def test_quit_waits_for_deliveries_before_requesting_shutdown(self):
+        quit_source = _closure_source("action_quit")
+        drain = quit_source.index("dictation_in_flight(capture, jobs, pending_deliveries)")
+        self.assertLess(drain, quit_source.index("shutdown.request()"))
+        self.assertIn("deadline_s=QUIT_DRAIN_S", quit_source)
+
+    def test_every_delivery_reports_done_and_still_refuses_after_shutdown(self):
+        for name in ("inject_when_clear", "undo_when_clear"):
+            source = _closure_source(name)
+            self.assertIn("finally:\n", source, name)
+            self.assertIn("pending_deliveries.finish()", source.split("finally:", 1)[1], name)
+            self.assertLess(source.index("if shutdown.requested():"),
+                            source.index("finally:"), name)
+
+
+class FinishCaptureNowTests(unittest.TestCase):
+    """Finish now and Quit both end a capture the gesture engine lost track of."""
+
+    def _call(self, *, forced: bool, active: bool):
+        engine, capture, on_finish = Mock(), Mock(), Mock()
+        engine.force_finish.return_value = forced
+        capture.is_active.return_value = active
+        return sotto.end_capture_now(engine, capture, on_finish), on_finish
+
+    def test_gesture_recording_is_finished_by_the_engine(self):
+        ended, on_finish = self._call(forced=True, active=True)
+        self.assertEqual(ended, "gesture")
+        on_finish.assert_not_called()
+
+    def test_orphan_capture_is_transcribed_not_dropped(self):
+        ended, on_finish = self._call(forced=False, active=True)
+        self.assertEqual(ended, "orphan")
+        on_finish.assert_called_once_with()
+
+    def test_nothing_recording_changes_nothing(self):
+        ended, on_finish = self._call(forced=False, active=False)
+        self.assertIsNone(ended)
+        on_finish.assert_not_called()
+
+    def test_quit_and_finish_now_share_it(self):
+        for name in ("action_quit", "action_finish_now"):
+            self.assertIn("end_capture_now(engine, capture, on_finish)", _closure_source(name), name)
+
+
 class EngineInstallerTests(unittest.TestCase):
     """An engine download that fails to start or hangs reports it; it never raises."""
 
@@ -422,6 +504,43 @@ class SaveAudioNameTests(unittest.TestCase):
             second.write_bytes(b"two")
             self.assertEqual(sotto.desktop_audio_path(desktop, moment + 20).name, "sotto-20261009-015327.wav")
             self.assertEqual(sotto.desktop_audio_path(desktop, moment).name, "sotto-20261009-015307-3.wav")
+
+    def test_a_name_is_reserved_the_moment_it_is_picked(self):
+        # Two saves that both pick a name before either copies must not share it.
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            first = sotto.desktop_audio_path(desktop, 1_760_000_000.0)
+            second = sotto.desktop_audio_path(desktop, 1_760_000_000.0)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.exists() and second.exists())
+
+    def test_concurrent_saves_of_one_entry_make_two_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, desktop = root / "entry.wav", root / "Desktop"
+            source.write_bytes(b"RIFF-audio")
+            desktop.mkdir()
+            both_ready, saved = threading.Barrier(2), []
+
+            def save():
+                both_ready.wait(5)
+                saved.append(sotto.save_audio_copy(source, desktop, 1_760_000_000.0))
+
+            workers = [threading.Thread(target=save) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+            self.assertEqual(len(set(saved)), 2)
+            self.assertEqual(sorted(path.read_bytes() for path in desktop.iterdir()),
+                             [b"RIFF-audio", b"RIFF-audio"])
+
+    def test_missing_audio_leaves_nothing_on_the_desktop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            with self.assertRaises(FileNotFoundError):
+                sotto.save_audio_copy(desktop / "gone.wav", desktop, 1_760_000_000.0)
+            self.assertEqual(list(desktop.iterdir()), [])
 
 
 class LiveWordsTests(unittest.TestCase):

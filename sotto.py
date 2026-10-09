@@ -544,14 +544,42 @@ def live_preview(text: str) -> str:
         return text
 
 
-def main_thread_dispatch(has_ui: bool, call_after):
+class PendingDeliveries:
+    """Pastes and undos handed to the main thread but not yet delivered.
+
+    The transcription queue counts a job done once its paste is scheduled,
+    before the main loop runs it, so Quit also waits for this to reach zero.
+    add() runs on the worker, finish() on the main thread; hence the lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def add(self) -> None:
+        with self._lock:
+            self._count += 1
+
+    def finish(self) -> None:
+        with self._lock:
+            self._count = max(0, self._count - 1)
+
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+
+def main_thread_dispatch(has_ui: bool, call_after, deliveries: PendingDeliveries | None = None):
     """Return (ui_call, deliver_call), both scheduling work on the main thread.
 
     ui_call updates the menu bar and pill, so it does nothing under
     --no-overlay. deliver_call (pasting, voice undo) always runs: hiding the
-    UI must never stop text from reaching the cursor.
+    UI must never stop text from reaching the cursor. Each delivery is counted
+    in deliveries until the scheduled method calls deliveries.finish().
     """
     def deliver_call(method, *call_args) -> None:
+        if deliveries is not None:
+            deliveries.add()
         call_after(method, *call_args)
 
     def ui_call(method, *call_args) -> None:
@@ -577,6 +605,28 @@ def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep,
     return True
 
 
+def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries) -> bool:
+    """Whether a dictation is still recording, transcribing, or waiting to be
+    pasted — the three stages Quit lets finish before shutting down."""
+    return capture.is_active() or jobs.unfinished_tasks > 0 or deliveries.count() > 0
+
+
+def end_capture_now(engine, capture, on_finish) -> str | None:
+    """End the recording in progress so it is transcribed, not dropped.
+
+    Returns "gesture" when the gesture engine ended it, "orphan" when the
+    capture outlived the engine's state (a gesture callback raised after the
+    mic started) and was ended directly, or None when nothing was recording.
+    Side effects: may stop the capture and queue it for transcription.
+    """
+    if engine.force_finish():
+        return "gesture"
+    if capture.is_active():
+        on_finish()
+        return "orphan"
+    return None
+
+
 INSTALL_TIMEOUT_S = 3600.0  # an engine download on a slow link, but never forever
 
 
@@ -594,13 +644,33 @@ def run_installer(argv: list[str], *, run=subprocess.run) -> tuple[bool, str]:
 
 def desktop_audio_path(folder: Path, timestamp: float) -> Path:
     """Where "Save audio to Desktop" writes a recording: named by the second
-    it was captured, with -2, -3, … so an earlier save is never overwritten."""
+    it was captured, with -2, -3, … so an earlier save is never overwritten.
+
+    Side effects: creates the file empty with exclusive create, so two saves
+    running at once can never pick the same name.
+    """
     import datetime
     stem = f"sotto-{datetime.datetime.fromtimestamp(timestamp):%Y%m%d-%H%M%S}"
     candidate, number = folder / f"{stem}.wav", 2
-    while candidate.exists():
-        candidate, number = folder / f"{stem}-{number}.wav", number + 1
-    return candidate
+    while True:
+        try:
+            with open(candidate, "xb"):
+                return candidate
+        except FileExistsError:
+            candidate, number = folder / f"{stem}-{number}.wav", number + 1
+
+
+def save_audio_copy(source: Path, folder: Path, timestamp: float) -> Path:
+    """Copy a recording into folder under a fresh desktop_audio_path name.
+
+    Side effects: writes one new file. The source is opened first, so a
+    missing recording raises FileNotFoundError without leaving a file behind.
+    """
+    with open(source, "rb") as audio:
+        target = desktop_audio_path(folder, timestamp)
+        with open(target, "wb") as saved:
+            shutil.copyfileobj(audio, saved)
+    return target
 
 
 class CaptureGate:
@@ -2515,7 +2585,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         status_ui.set_language_mode(language_state["mode"],
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
-    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter)
+    pending_deliveries = PendingDeliveries()
+    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
+                                                 pending_deliveries)
 
     def refresh_history() -> None:
         if status_ui is not None:
@@ -3048,10 +3120,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     def inject_when_clear(text: str, attempts: int) -> None:
         """Never paste while the trigger key is physically held — a synthetic
         cmd-V during a hold makes macOS emit phantom flag edges on the trigger
-        keycode, which chops the live dictation and can mis-arm hands-free."""
-        if shutdown.requested():
-            return
-        if trigger_physically_down() and attempts < 40:
+        keycode, which chops the live dictation and can mis-arm hands-free.
+        Every outcome but a retry finishes its pending_deliveries entry."""
+        if not shutdown.requested() and trigger_physically_down() and attempts < 40:
             if attempts == 0:
                 log("  paste deferred — trigger key still held")
             timer = threading.Timer(
@@ -3060,35 +3131,44 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             timer.daemon = True
             timer.start()
             return
-        import settings
-        preferences = settings.load(settings.SETTINGS_PATH)
-        inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
-        last_delivery["at"] = time.monotonic()
+        try:
+            if shutdown.requested():
+                return
+            import settings
+            preferences = settings.load(settings.SETTINGS_PATH)
+            inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
+            last_delivery["at"] = time.monotonic()
+        finally:
+            pending_deliveries.finish()
 
     last_delivery = {"at": 0.0}
 
     def undo_when_clear(attempts: int) -> None:
         """'scratch that': undo the last dictation with the app's own ⌘Z,
-        only when Sotto pasted something within the last minute."""
+        only when Sotto pasted something within the last minute. Every outcome
+        but a retry finishes its pending_deliveries entry."""
         import voice_commands
-        if shutdown.requested():
-            return
-        if trigger_physically_down() and attempts < 40:
+        if not shutdown.requested() and trigger_physically_down() and attempts < 40:
             timer = threading.Timer(0.15, lambda: AppHelper.callAfter(undo_when_clear, attempts + 1))
             timer.daemon = True
             timer.start()
             return
-        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
-            log("  scratch that: nothing recent to undo")
-            return
-        if secure_input_active():
-            return
-        for key_down in (True, False):
-            event = Quartz.CGEventCreateKeyboardEvent(None, 6, key_down)  # 6 = Z
-            Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
-            Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
-        last_delivery["at"] = 0.0
-        log("↶ scratch that — undid the last dictation")
+        try:
+            if shutdown.requested():
+                return
+            if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
+                log("  scratch that: nothing recent to undo")
+                return
+            if secure_input_active():
+                return
+            for key_down in (True, False):
+                event = Quartz.CGEventCreateKeyboardEvent(None, 6, key_down)  # 6 = Z
+                Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+                Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+            last_delivery["at"] = 0.0
+            log("↶ scratch that — undid the last dictation")
+        finally:
+            pending_deliveries.finish()
 
     tap_watch = {"warned_at": 0.0}
 
@@ -3354,8 +3434,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     entry = store.get(entry_id)
                     if not entry:
                         return
-                    target = desktop_audio_path(Path.home() / "Desktop", entry["ts"])
-                    shutil.copy(store.audio_path(entry_id), target)
+                    target = save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",
+                                             entry["ts"])
                     log(f"✓ saved audio to Desktop as {target.name}")
                 except FileNotFoundError:
                     log("! audio missing for that entry")
@@ -3499,10 +3579,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Menu escape hatch — always works, no gesture required."""
             if shutdown.requested():
                 return
-            if engine.force_finish():
+            ended = end_capture_now(engine, capture, on_finish)
+            if ended == "gesture":
                 log("● finished via menu")
-            elif capture.is_active():
-                on_finish()  # gesture engine desynced; end the capture anyway
+            elif ended == "orphan":
                 log("● orphan capture finished via menu")
 
         def action_start_now() -> None:
@@ -3527,16 +3607,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
         def action_quit() -> None:
             """Quit once the dictation in progress is done, waiting at most
-            QUIT_DRAIN_S. Side effects: refuses new recordings, ends a
-            hands-free recording as if tapped, then requests shutdown."""
+            QUIT_DRAIN_S. Side effects: refuses new recordings, ends the
+            recording in progress (even one the gesture engine lost), waits
+            until it is pasted, then requests shutdown."""
             if shutdown.requested():
                 return
             capture_gate.close()
-            if engine.force_finish():
+            if end_capture_now(engine, capture, on_finish):
                 log("● finishing the recording before quitting")
 
             def work() -> None:
-                if not wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0,
+                if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
                                        deadline_s=QUIT_DRAIN_S):
                     log(f"! dictation still running after {QUIT_DRAIN_S:.0f}s — quitting anyway")
                 shutdown.request()
