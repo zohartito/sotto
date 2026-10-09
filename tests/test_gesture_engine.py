@@ -181,6 +181,52 @@ class OrderedActionTests(EngineHarness):
         tap_thread.join(5)
         self.assertEqual(order, ["start", "finish"])        # ... acted on in order
 
+    def test_a_menu_finish_queued_behind_a_callback_carries_its_own_action(self):
+        """force_finish returns before its finish runs when another thread is
+        draining, so caller state set around the call (Windows: copy, don't
+        insert) is gone by then. The decision has to travel with the action."""
+        order = []
+        start_entered = threading.Event()
+        resume_start = threading.Event()
+        self.addCleanup(resume_start.set)
+
+        def on_start():
+            start_entered.set()
+            resume_start.wait(5)             # e.g. the mic is slow to open
+            order.append("start")
+
+        engine = sotto.GestureEngine(on_start, lambda: order.append("finish"),
+                                     lambda: order.append("discard"))
+        tap_thread = threading.Thread(target=engine.pressed, daemon=True)
+        tap_thread.start()
+        self.assertTrue(start_entered.wait(5))
+        self.assertTrue(engine.force_finish(finish=lambda: order.append("menu finish")))
+        self.assertEqual(order, [], "the queued finish ran while start was in flight")
+        resume_start.set()
+        tap_thread.join(5)
+        self.assertEqual(order, ["start", "menu finish"])
+        self.assertEqual(engine.snapshot(), (False, False))
+
+    def test_force_finish_from_inside_a_callback_queues_instead_of_waiting(self):
+        """on_mic_failed calls force_finish from inside on_start, on the
+        draining thread: it must return at once (waiting for its own finish
+        there would deadlock) and the finish runs right after the start."""
+        order = []
+        results = []
+
+        def on_start():
+            results.append(engine.force_finish())
+            order.append("start")
+
+        engine = sotto.GestureEngine(on_start, lambda: order.append("finish"),
+                                     lambda: order.append("discard"))
+        tap_thread = threading.Thread(target=engine.pressed, daemon=True)
+        tap_thread.start()
+        tap_thread.join(5)
+        self.assertFalse(tap_thread.is_alive(), "force_finish waited on its own drainer")
+        self.assertEqual(results, [True])
+        self.assertEqual(order, ["start", "finish"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -654,6 +654,96 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn("○ restarting — this press is ignored", logs)
         self.assertTrue(restarted)
 
+    def test_tray_finish_queued_behind_a_callback_in_flight_is_still_copied(self):
+        """Gesture actions run in decision order on whichever thread is
+        draining (F6). A tray finish decided while the key thread is still
+        inside on_start runs later, on that thread — it must still copy."""
+        import numpy as np
+        from history import HistoryStore
+        from learning import LearningStore
+        import vad
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs, copied, delivered = [], [], [], [], [], []
+        whisper_calls: list = []
+        FakeWhisper, FakeCapture, FakeHook = _app_fakes(
+            rate, [voiced], ["finished from the tray"], hooks, whisper_calls)
+        begin_entered, resume_begin = threading.Event(), threading.Event()
+        self.addCleanup(resume_begin.set)
+        results: dict = {}
+
+        class SlowStartCapture(FakeCapture):
+            def begin(self):
+                cold = super().begin()
+                begin_entered.set()
+                resume_begin.wait(10)  # the mic is slow to open: on_start is in flight
+                return cold
+
+        class RecordingBoundary(sotto.ShutdownBoundary):
+            def __init__(self):
+                super().__init__()
+                boundaries.append(self)
+
+        class RecordingController(sotto_win.Controller):
+            def __init__(self, **parts):
+                super().__init__(**parts)
+                controllers.append(self)
+
+        def wait_for(condition, what):
+            deadline = time.monotonic() + 30
+            while not condition():
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"timed out waiting for {what}")
+                time.sleep(0.02)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-tray-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                try:
+                    wait_for(lambda: controllers and hooks, "listening")
+                    controller, hook = controllers[0], hooks[0]
+                    hook.physically_down = True
+                    key_thread = threading.Thread(target=hook.engine.pressed, daemon=True)
+                    key_thread.start()  # the key thread becomes the drainer ...
+                    if not begin_entered.wait(10):
+                        raise AssertionError("on_start never reached the capture")
+                    controller.finish_now()  # ... so the tray's finish queues behind it
+                    resume_begin.set()
+                    key_thread.join(10)
+                    hook.physically_down = False
+                    wait_for(lambda: copied or delivered, "the tray-finished dictation")
+                except BaseException as exc:
+                    results["error"] = exc
+                finally:
+                    boundaries[0].request()
+
+            with mock.patch.object(sotto_win.win_asr, "resolve_model_dir", return_value=data), \
+                    mock.patch.object(sotto_win.win_asr, "LocalCT2Whisper", FakeWhisper), \
+                    mock.patch.object(sotto_win.win_capture, "WinCapture", SlowStartCapture), \
+                    mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook), \
+                    mock.patch.object(sotto_win.win_inject, "deliver",
+                                      lambda text, **kwargs: delivered.append(text)), \
+                    mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
+                    mock.patch.object(sotto_win, "HistoryStore", lambda: HistoryStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "Controller", RecordingController), \
+                    mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
+                    mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
+                    mock.patch.object(dictionary, "DICTIONARY_PATH", data / "dictionary.txt"), \
+                    mock.patch.object(sotto_win, "log", logs.append), \
+                    mock.patch.object(sotto, "ShutdownBoundary", RecordingBoundary), \
+                    mock.patch.object(vad, "MODEL_PATH", data / "no-vad.onnx"):
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                self.assertFalse(sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu"))
+                driver.join(10)
+
+        self.assertNotIn("error", results, results)
+        self.assertEqual(delivered, [], "a tray-finished dictation was inserted into the focused app")
+        self.assertEqual(copied, ["finished from the tray"])
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class IsolatedCliTest(unittest.TestCase):

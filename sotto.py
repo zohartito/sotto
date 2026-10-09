@@ -1916,8 +1916,13 @@ class GestureEngine:
         self._drain()
         return True
 
-    def force_finish(self) -> bool:
-        """Menu escape hatch: end any in-flight recording as a normal finish."""
+    def force_finish(self, finish=None) -> bool:
+        """Menu escape hatch: end any in-flight recording as a normal finish.
+
+        `finish` replaces on_finish for this one decision. It may run after
+        this returns (another thread is draining), so anything the caller
+        wants that finish to know must travel inside it — never in state the
+        caller sets around this call."""
         fires = []
         with self._lock:
             self._epoch += 1
@@ -1926,7 +1931,7 @@ class GestureEngine:
             if self._recording:
                 self._recording = False
                 self._hands_free = False
-                fires.append(self._on_finish)
+                fires.append(finish or self._on_finish)
             self._queue(fires)
         self._drain()
         return was_recording
