@@ -252,6 +252,78 @@ class HandsFreeHintTests(unittest.TestCase):
         self.assertEqual(status._orb.position().x, ui.ISLAND_W / 2)
 
 
+class MainThreadDispatchTests(unittest.TestCase):
+    """--no-overlay hides the menu bar and pill, never the text delivery."""
+
+    def test_delivery_runs_without_a_ui_and_ui_updates_do_not(self):
+        scheduled = []
+        ui_call, deliver_call = sotto.main_thread_dispatch(
+            has_ui=False, call_after=lambda method, *args: scheduled.append((method, args)))
+        ui_call("refresh_history")
+        deliver_call("inject_when_clear", "hello", 0)
+        self.assertEqual(scheduled, [("inject_when_clear", ("hello", 0))])
+
+    def test_with_a_ui_both_are_scheduled_in_order(self):
+        scheduled = []
+        ui_call, deliver_call = sotto.main_thread_dispatch(
+            has_ui=True, call_after=lambda method, *args: scheduled.append(method))
+        ui_call("show_error")
+        deliver_call("undo_when_clear")
+        self.assertEqual(scheduled, ["show_error", "undo_when_clear"])
+
+
+class CaptureGateTests(unittest.TestCase):
+    """Before an update restart, new recordings are refused, then in-flight work drains."""
+
+    def test_closed_gate_refuses_new_starts_and_reopens(self):
+        gate = sotto.CaptureGate()
+        with gate.starting() as allowed:
+            self.assertTrue(allowed)
+        gate.close()
+        with gate.starting() as allowed:
+            self.assertFalse(allowed)
+        gate.reopen()
+        with gate.starting() as allowed:
+            self.assertTrue(allowed)
+
+    def test_close_waits_for_a_start_already_under_way(self):
+        gate = sotto.CaptureGate()
+        inside, release, order = threading.Event(), threading.Event(), []
+
+        def start():
+            with gate.starting() as allowed:
+                order.append(("start", allowed))
+                inside.set()
+                release.wait(5)
+
+        starter = threading.Thread(target=start)
+        starter.start()
+        inside.wait(5)
+        closer = threading.Thread(target=lambda: (gate.close(), order.append("closed")))
+        closer.start()
+        time.sleep(0.05)
+        self.assertEqual(order, [("start", True)])  # close() is still waiting
+        release.set()
+        starter.join(5)
+        closer.join(5)
+        self.assertEqual(order, [("start", True), "closed"])
+
+
+class UpdateRestartTests(unittest.TestCase):
+    """An update restarts Sotto only once nothing is recording or transcribing."""
+
+    def test_waits_while_busy_and_returns_once_idle(self):
+        busy = iter([True, True, False])
+        sleeps = []
+        sotto.wait_until_idle(lambda: next(busy), poll_s=0.5, sleep=sleeps.append)
+        self.assertEqual(sleeps, [0.5, 0.5])
+
+    def test_returns_at_once_when_already_idle(self):
+        sleeps = []
+        sotto.wait_until_idle(lambda: False, sleep=sleeps.append)
+        self.assertEqual(sleeps, [])
+
+
 class LiveWordsTests(unittest.TestCase):
     """Streaming engines show words while you talk; only finished text is pasted."""
 

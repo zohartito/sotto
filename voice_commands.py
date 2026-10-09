@@ -19,12 +19,11 @@ SCRATCH = re.compile(r"(?i)^\W*scratch that\W*$")
 SCRATCH_WINDOW_S = 60.0  # "scratch that" only undoes a dictation this recent
 
 
-def is_english(language: str | None, languages=None) -> bool:
-    """English when detected or forced; an unknown language counts only when
-    English is the user's sole language."""
-    if language:
-        return language.lower() == "en"
-    return tuple(languages or ("en",)) == ("en",)
+def is_english(language: str | None) -> bool:
+    """English only when the engine says so (Whisper's detected or forced
+    language, Nemotron's "en"). Parakeet reports none and speaks 25
+    languages, so its text is left exactly as spoken."""
+    return bool(language) and language.lower() == "en"
 
 
 def _drop_fillers(text: str) -> str:
