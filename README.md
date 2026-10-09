@@ -84,7 +84,7 @@ To run Sotto from a terminal instead of the app:
 git clone https://github.com/zohartito/sotto.git
 cd sotto
 python3.12 -m venv venv-alpha
-venv-alpha/bin/python -m pip install --upgrade pip
+venv-alpha/bin/python -m pip install pip==26.2.1
 venv-alpha/bin/python -m pip install -r requirements-alpha.txt
 venv-alpha/bin/python -m pip check
 

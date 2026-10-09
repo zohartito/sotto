@@ -6,7 +6,7 @@ cd /d "%~dp0.."
 if not exist venv\Scripts\python.exe (
     echo Creating venv and installing requirements...
     python -m venv venv || exit /b 1
-    venv\Scripts\python -m pip install --upgrade pip || exit /b 1
+    venv\Scripts\python -m pip install pip==26.2.1 || exit /b 1
     where nvidia-smi >nul 2>nul && (
         venv\Scripts\python -m pip install -r requirements-alpha-windows-cuda.txt || exit /b 1
     ) || (

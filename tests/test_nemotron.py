@@ -235,7 +235,8 @@ class NemotronTests(unittest.TestCase):
             spec = root / "spec.json"
             spec.write_text(json.dumps({"version": "1", "model_file": "model.gguf",
                                        "model_sha256": hashlib.sha256(b"model").hexdigest(),
-                                       "libraries": {"libtest.dylib": hashlib.sha256(library.read_bytes()).hexdigest()}}))
+                                       "libraries": {"libtest.dylib":
+                                                     hashlib.sha256(library.read_bytes()).hexdigest()}}))
             with patch.object(nemotron_backend, "SPEC_PATH", spec), \
                     patch.object(nemotron_backend, "INSTALL_ROOT", root):
                 nemotron_backend.installation()

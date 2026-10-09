@@ -45,7 +45,8 @@ class ApplyTests(unittest.TestCase):
     def test_matching_and_duplicates_use_the_same_case_rule(self):
         rules = dictionary.parse("Straße => street\nSTRASSE => avenue\n")
         self.assertEqual(len(rules), 2)                     # distinct under the same comparison
-        self.assertEqual(dictionary.apply("die STRAßE und STRASSE", rules)[0], "die Street und Avenue")  # a capital stays a capital
+        # a capital stays a capital
+        self.assertEqual(dictionary.apply("die STRAßE und STRASSE", rules)[0], "die Street und Avenue")
 
     def test_non_latin_words_and_no_rules(self):
         self.assertEqual(dictionary.apply("я сказал привет всем", self.rules)[0], "я сказал Privet всем")

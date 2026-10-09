@@ -885,7 +885,6 @@ def _select_input_device() -> tuple[int | None, str]:
     when one is connected — its mic is at your mouth — otherwise the built-in
     MacBook mic. Never the iPhone Continuity mic or a Bluetooth speaker's mic:
     those sit across the room and produced this project's deaf recordings."""
-    import ctypes
 
     def fourcc(code: str) -> int:
         return int.from_bytes(code.encode("ascii"), "big")
@@ -2810,7 +2809,6 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                         "Switch engines after the current recording and transcription finish.")
                 return
             try:
-                from speech_config import save_engine_mode
                 if mode == "nemotron":
                     from nemotron_backend import installation
                     installation()  # verify before persisting a restart choice
