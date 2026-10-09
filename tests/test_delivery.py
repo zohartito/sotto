@@ -672,6 +672,50 @@ class EventTapCallbackTests(unittest.TestCase):
         self.assertEqual(tap.user_keydowns["count"], 3)
 
 
+class OwnAlertInFrontTests(unittest.TestCase):
+    """N24: Sotto's alerts activate Sotto, and callAfter keeps running during
+    their modal loop (repro/N24_repro.py), so a paste must wait instead of
+    posting ⌘V into the alert."""
+
+    def test_n24_nothing_is_pasted_while_sottos_own_window_is_in_front(self):
+        world = DeliveryQueueHarness()
+        world.own_front = True
+        world.queue._own_window_front = lambda: world.own_front
+        world.queue.paste("result-1 ")
+        world.queue.undo()
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S * 3)  # an alert left open for minutes
+        self.assertEqual((world.delivered, world.undos, world.notes), ([], [], []))
+        world.own_front = False                                # the user dismissed it / switched apps
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S * 3 + 1.0)
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-1 "])
+
+    def test_n24_the_queue_reads_the_real_probe_in_run(self):
+        tree = ast.parse(open(sotto.__file__, encoding="utf-8").read())
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+        call = next(node for node in ast.walk(run) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name) and node.func.id == "DeliveryQueue")
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+        self.assertEqual(keywords.get("own_window_front"), "own_window_without_text_field")
+
+    def probe(self, *, active, text_focused):
+        class FakeText:
+            pass
+
+        class Responder:
+            def isKindOfClass_(self, cls):
+                return text_focused and cls is FakeText
+        window = types.SimpleNamespace(firstResponder=Responder)
+        app = types.SimpleNamespace(isActive=lambda: active, keyWindow=lambda: window)
+        fake = types.SimpleNamespace(NSApp=app, NSText=FakeText)
+        with patch.dict(sys.modules, {"AppKit": fake}):
+            return sotto.own_window_without_text_field()
+
+    def test_n24_probe(self):
+        self.assertFalse(self.probe(active=False, text_focused=False))  # another app is in front
+        self.assertTrue(self.probe(active=True, text_focused=False))    # an OK-only alert
+        self.assertFalse(self.probe(active=True, text_focused=True))    # the correction editor
+
+
 class TransientPasteTests(unittest.TestCase):
     def test_n33_the_paste_is_marked_transient_for_clipboard_managers(self):
         world = patch_insertion(self)

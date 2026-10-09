@@ -2180,6 +2180,25 @@ def frontmost_pid() -> int | None:
         return None
 
 
+def own_window_without_text_field() -> bool:
+    """Is Sotto itself the active app with no text field to take a paste?
+
+    Sotto's alerts activate it (ui._alert), and callAfter still runs during
+    their modal loop, so a Cmd-V would land on an OK-only alert and vanish
+    (N24). The correction editor's text view still takes dictation. Main
+    thread only; an unavailable probe reports False rather than blocking."""
+    try:
+        import AppKit
+        app = AppKit.NSApp
+        if app is None or not app.isActive():
+            return False
+        window = app.keyWindow()
+        responder = window.firstResponder() if window is not None else None
+        return responder is None or not responder.isKindOfClass_(AppKit.NSText)
+    except Exception:
+        return False
+
+
 def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") -> bool:
     """Insert at the cursor. "paste": full-pasteboard snapshot, synthetic
     cmd-V, then a changeCount-guarded restore so a user copy in the window
@@ -2261,7 +2280,9 @@ class DeliveryQueue:
     chop the live dictation. The head of the queue waits as long as a
     recording is active (the release delivers it); with no recording, a key
     held longer than DELIVERY_WAIT_MAX_S drops the pending text — it is already
-    in History — with one note.
+    in History — with one note. While Sotto's own alert is in front
+    (own_window_front), the head waits without a bound: a Cmd-V there would
+    land nowhere, and the user's next app switch or click on OK delivers it.
 
     Every method runs on the main thread (deliver_call / AppHelper.callAfter);
     the poll timer only bounces back there, so there is no lock.
@@ -2274,7 +2295,8 @@ class DeliveryQueue:
 
     def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
                  secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
-                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None) -> None:
+                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None,
+                 own_window_front=lambda: False) -> None:
         self._insert = insert            # (text) -> bool: did the text reach the app?
         self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
         self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
@@ -2289,6 +2311,7 @@ class DeliveryQueue:
         self._clock = clock
         self._timer = timer
         self._on_done = on_done          # () -> None: one item left the queue
+        self._own_window_front = own_window_front  # () -> bool: Sotto's alert would get the Cmd-V
         self._items: list[tuple] = []
         self._poll_armed = False
         self._waiting = False
@@ -2310,6 +2333,9 @@ class DeliveryQueue:
                 return
             if self._keys_held():
                 self._wait_or_drop()
+                return
+            if self._own_window_front():
+                self._wait_for_own_window()
                 return
             self._blocked_since = None
             self._waiting = False
@@ -2352,6 +2378,17 @@ class DeliveryQueue:
         if not self._waiting:
             self._waiting = True
             self._log("  paste deferred — a key is still held")
+        self._arm_poll()
+
+    def _wait_for_own_window(self) -> None:
+        """Hold the queue while Sotto's own window is in front (N24); no drop."""
+        self._blocked_since = None
+        if not self._waiting:
+            self._waiting = True
+            self._log("  paste deferred — Sotto's own window is in front")
+        self._arm_poll()
+
+    def _arm_poll(self) -> None:
         if not self._poll_armed:
             self._poll_armed = True
             timer = self._timer(DELIVERY_POLL_S, self._call_after, (self._resume,))
@@ -3118,7 +3155,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
         keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
         call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested,
-        on_done=pending_deliveries.finish)
+        on_done=pending_deliveries.finish, own_window_front=own_window_without_text_field)
 
     # deliver_call counts each of these in pending_deliveries when it schedules
     # it; the queue's on_done finishes that entry once the item is delivered,
