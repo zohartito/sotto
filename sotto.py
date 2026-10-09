@@ -52,6 +52,9 @@ HOLD_THRESHOLD_S = 0.35
 DOUBLE_TAP_WINDOW_S = 0.40
 HANDS_FREE_MAX_S = 600.0        # watchdog: force-finish a forgotten open mic
 RESTORE_DELAY_S = 0.6
+DELIVERY_POLL_S = 0.15           # re-check a held key this often before pasting
+DELIVERY_WAIT_MAX_S = 30.0       # key held, no recording: give up, the text stays in History
+SOTTO_EVENT_TAG = 0x534F5454     # "SOTT" in kCGEventSourceUserData on every key event Sotto posts
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
@@ -1909,6 +1912,29 @@ def character_before_caret(timeout: float = 0.15) -> str | None:
         return None
 
 
+def post_own_event(event) -> None:
+    """Tag a synthetic key event as Sotto's own and post it into the session.
+
+    The event tap in run() skips tagged events, so a ⌘V or ⌘Z Sotto posts can
+    never be read as a chord that discards a live dictation, nor as the user
+    typing (which would disarm "scratch that")."""
+    Quartz.CGEventSetIntegerValueField(event, Quartz.kCGEventSourceUserData, SOTTO_EVENT_TAG)
+    Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+
+
+def is_own_event(event) -> bool:
+    """Did Sotto post this key event itself (see post_own_event)?"""
+    return Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData) == SOTTO_EVENT_TAG
+
+
+def post_command_key(keycode: int) -> None:
+    """Press and release ⌘+key (9 = V to paste, 6 = Z to undo) as Sotto's own events."""
+    for key_down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(None, keycode, key_down)
+        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+        post_own_event(event)
+
+
 def type_text(text: str) -> None:
     """Type Unicode text with synthetic key events; the clipboard is untouched."""
     characters = list(text)
@@ -1918,7 +1944,7 @@ def type_text(text: str) -> None:
         for key_down in (True, False):
             event = Quartz.CGEventCreateKeyboardEvent(None, 0, key_down)
             Quartz.CGEventKeyboardSetUnicodeString(event, units, chunk)
-            Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+            post_own_event(event)
         time.sleep(0.004)
 
 
@@ -1970,11 +1996,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
     pasteboard.clearContents()
     pasteboard.setString_forType_(text, NSPasteboardTypeString)
     own_count = pasteboard.changeCount()
-
-    for key_down in (True, False):
-        event = Quartz.CGEventCreateKeyboardEvent(None, 9, key_down)  # 9 = V
-        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
-        Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+    post_command_key(9)  # ⌘V
 
     _restore_generation += 1
     generation = _restore_generation
@@ -2009,6 +2031,114 @@ def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
         items.append(item)
     if items:
         pasteboard.writeObjects_(items)
+
+
+class DeliveryQueue:
+    """One FIFO for everything Sotto hands to the frontmost app — finished
+    dictations and "scratch that" undos — in capture order, so a newer result
+    can never overtake an older one.
+
+    Nothing is posted while the trigger or any modifier is physically held: a
+    synthetic ⌘V under a held modifier is a different shortcut in the app, and
+    during a hold macOS emits phantom flag edges on the trigger keycode that
+    chop the live dictation. The head of the queue waits as long as a
+    recording is active (the release delivers it); with no recording, a key
+    held longer than DELIVERY_WAIT_MAX_S drops the pending text — it is already
+    in History — with one note.
+
+    Every method runs on the main thread (deliver_call / AppHelper.callAfter);
+    the poll timer only bounces back there, so there is no lock.
+    """
+
+    def __init__(self, *, insert, undo_keys, keys_held, recording, secure_input,
+                 call_after, note, log=log, shutdown_requested=lambda: False,
+                 clock=time.monotonic, timer=threading.Timer) -> None:
+        self._insert = insert            # (text) -> bool: did the text reach the app?
+        self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
+        self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
+        self._recording = recording      # () -> bool: a dictation is being captured
+        self._secure_input = secure_input
+        self._call_after = call_after
+        self._note = note                # (title, message) -> None: one user-visible note
+        self._log = log
+        self._shutdown_requested = shutdown_requested
+        self._clock = clock
+        self._timer = timer
+        self._items: list[tuple] = []
+        self._poll_armed = False
+        self._waiting = False
+        self._blocked_since: float | None = None
+        self.last_delivery: dict | None = None  # the insert "scratch that" may undo
+
+    def paste(self, text: str) -> None:
+        self._items.append(("paste", text))
+        self._pump()
+
+    def undo(self) -> None:
+        self._items.append(("undo",))
+        self._pump()
+
+    def _pump(self) -> None:
+        if self._shutdown_requested():
+            self._items.clear()
+            return
+        while self._items:
+            if self._keys_held():
+                self._wait_or_drop()
+                return
+            self._blocked_since = None
+            self._waiting = False
+            item = self._items.pop(0)
+            if item[0] == "paste":
+                self._deliver(item[1])
+            else:
+                self._undo()
+
+    def _wait_or_drop(self) -> None:
+        now = self._clock()
+        if self._recording():
+            self._blocked_since = None  # the user is dictating: the release will deliver
+        elif self._blocked_since is None:
+            self._blocked_since = now
+        elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
+            dropped = sum(1 for item in self._items if item[0] == "paste")
+            self._items.clear()
+            self._blocked_since = None
+            self._waiting = False
+            self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — "
+                      f"{dropped} dictation(s) not pasted, kept in History")
+            self._note("Dictation kept in History",
+                       "A key was held for too long to paste it. Open History to copy the text.")
+            return
+        if not self._waiting:
+            self._waiting = True
+            self._log("  paste deferred — a key is still held")
+        if not self._poll_armed:
+            self._poll_armed = True
+            timer = self._timer(DELIVERY_POLL_S, self._call_after, (self._resume,))
+            timer.daemon = True
+            timer.start()
+
+    def _resume(self) -> None:
+        self._poll_armed = False
+        self._pump()
+
+    def _deliver(self, text: str) -> None:
+        self._insert(text)
+        self.last_delivery = {"at": self._clock()}
+
+    def _undo(self) -> None:
+        """'scratch that': the app's own ⌘Z, only for a recent Sotto paste."""
+        import voice_commands
+        last = self.last_delivery
+        if last is None or self._clock() - last["at"] > voice_commands.SCRATCH_WINDOW_S:
+            self._log("  scratch that: nothing recent to undo")
+            return
+        if self._secure_input():
+            return
+        self._undo_keys()
+        self.last_delivery = None
+        self._log("↶ scratch that — undid the last dictation")
 
 
 # -- daemon ------------------------------------------------------------------
@@ -2999,50 +3129,35 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             hotkey_state.update(pressed_at=None, skip_up=False)
             log(f"● alternate hotkey {'is now ' + new_hotkey_spec if parsed else 'off'}")
 
-    def inject_when_clear(text: str, attempts: int) -> None:
-        """Never paste while the trigger key is physically held — a synthetic
-        cmd-V during a hold makes macOS emit phantom flag edges on the trigger
-        keycode, which chops the live dictation and can mis-arm hands-free."""
-        if shutdown.requested():
-            return
-        if trigger_physically_down() and attempts < 40:
-            if attempts == 0:
-                log("  paste deferred — trigger key still held")
-            timer = threading.Timer(
-                0.15, lambda: AppHelper.callAfter(inject_when_clear, text,
-                                                  attempts + 1))
-            timer.daemon = True
-            timer.start()
-            return
+    def keys_held() -> bool:
+        """Is the trigger or any modifier physically down right now?"""
+        flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateCombinedSessionState)
+        return bool(flags & ALL_MODIFIERS) or trigger_down_in(
+            flags, binding["mask"], binding["device_bit"])
+
+    def insert_text(text: str) -> bool:
         import settings
         preferences = settings.load(settings.SETTINGS_PATH)
-        inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
-        last_delivery["at"] = time.monotonic()
+        return inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
 
-    last_delivery = {"at": 0.0}
+    def delivery_note(title: str, message: str) -> None:
+        if status_ui is not None:
+            ui_call(status_ui.show_info, title, message)
 
-    def undo_when_clear(attempts: int) -> None:
-        """'scratch that': undo the last dictation with the app's own ⌘Z,
-        only when Sotto pasted something within the last minute."""
-        import voice_commands
-        if shutdown.requested():
-            return
-        if trigger_physically_down() and attempts < 40:
-            timer = threading.Timer(0.15, lambda: AppHelper.callAfter(undo_when_clear, attempts + 1))
-            timer.daemon = True
-            timer.start()
-            return
-        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
-            log("  scratch that: nothing recent to undo")
-            return
-        if secure_input_active():
-            return
-        for key_down in (True, False):
-            event = Quartz.CGEventCreateKeyboardEvent(None, 6, key_down)  # 6 = Z
-            Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
-            Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
-        last_delivery["at"] = 0.0
-        log("↶ scratch that — undid the last dictation")
+    # Finished text and "scratch that" share one FIFO (see DeliveryQueue):
+    # capture order is kept, and nothing is posted while a key is held.
+    delivery = DeliveryQueue(
+        insert=insert_text, undo_keys=lambda: post_command_key(6), keys_held=keys_held,
+        recording=lambda: engine.snapshot()[0], secure_input=secure_input_active,
+        call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested)
+
+    def inject_when_clear(text: str, _attempts: int = 0) -> None:
+        """Queue a finished dictation for the cursor (worker call shape kept)."""
+        delivery.paste(text)
+
+    def undo_when_clear(_attempts: int = 0) -> None:
+        """Queue a 'scratch that' behind whatever is still waiting to paste."""
+        delivery.undo()
 
     tap_watch = {"warned_at": 0.0}
 
@@ -3074,6 +3189,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     def callback(_proxy, event_type, event, _refcon):
         if shutdown.requested():
             return event
+        if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp,
+                          Quartz.kCGEventFlagsChanged) and is_own_event(event):
+            return event  # Sotto's own ⌘V / ⌘Z / typing: never a chord, never the user typing
         if event_type == Quartz.kCGEventKeyDown and trigger_state["down"]:
             # Any other key during a trigger hold makes it a shortcut.
             code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)

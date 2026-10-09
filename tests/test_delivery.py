@@ -5,6 +5,7 @@ key events, and "scratch that".
 Everything runs against fakes: no key event is posted, the real pasteboard is
 never touched, and a virtual clock drives threading.Timer, so nothing sleeps.
 """
+import ast
 import threading
 import types
 import unittest
@@ -15,6 +16,22 @@ import Quartz as RealQuartz
 import sotto
 
 PLAIN_TEXT = "public.utf8-plain-text"
+CMD = RealQuartz.kCGEventFlagMaskCommand
+
+
+def run_closures(names, namespace):
+    """Compile the named functions nested directly inside sotto.run() into
+    `namespace`, whose entries stand in for the closure variables they read."""
+    source = open(sotto.__file__, encoding="utf-8").read()
+    tree = ast.parse(source)
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    found = {node.name: node for node in run.body
+             if isinstance(node, ast.FunctionDef) and node.name in names}
+    missing = set(names) - set(found)
+    assert not missing, f"not nested in run(): {sorted(missing)}"
+    module = ast.Module(body=[found[name] for name in names], type_ignores=[])
+    exec(compile(module, sotto.__file__, "exec"), namespace)
+    return namespace
 
 
 # -- fakes -------------------------------------------------------------------
@@ -230,6 +247,181 @@ class ClipboardCarryForwardTests(unittest.TestCase):
         world.pasteboard.user_copies("USER COPY")
         world.timers.advance_to(sotto.RESTORE_DELAY_S * 2 + 1.0)
         self.assertEqual(world.pasteboard.text(), "USER COPY")
+
+
+# -- F10: Sotto's own key events are tagged ------------------------------------
+
+class OwnEventTagTests(unittest.TestCase):
+    def test_paste_tags_both_cmd_v_events(self):
+        world = patch_insertion(self)
+        sotto.inject("hello", spacing="none")
+        self.assertEqual([(e["keycode"], e["flags"], e["user_data"]) for e in world.quartz.posted],
+                         [(9, CMD, sotto.SOTTO_EVENT_TAG), (9, CMD, sotto.SOTTO_EVENT_TAG)])
+        self.assertTrue(all(sotto.is_own_event(e) for e in world.quartz.posted))
+
+    def test_typing_mode_tags_every_event(self):
+        world = patch_insertion(self)
+        sotto.inject("typed across chunks, well over sixteen characters",
+                     insert_mode="type", spacing="none")
+        self.assertGreater(len(world.quartz.posted), 2)
+        self.assertTrue(all(e["user_data"] == sotto.SOTTO_EVENT_TAG for e in world.quartz.posted))
+
+    def test_undo_shortcut_is_tagged(self):
+        world = patch_insertion(self)
+        sotto.post_command_key(6)
+        self.assertEqual([(e["keycode"], e["down"], e["flags"], e["user_data"]) for e in world.quartz.posted],
+                         [(6, True, CMD, sotto.SOTTO_EVENT_TAG), (6, False, CMD, sotto.SOTTO_EVENT_TAG)])
+
+    def test_a_users_key_event_is_not_sottos(self):
+        world = patch_insertion(self)
+        event = world.quartz.CGEventCreateKeyboardEvent(None, 9, True)
+        world.quartz.CGEventSetFlags(event, CMD)
+        self.assertFalse(sotto.is_own_event(event))
+
+
+# -- F10 / F7: the FIFO delivery queue -----------------------------------------
+
+class DeliveryQueueHarness:
+    """A DeliveryQueue over fakes: a virtual clock, scripted key/recording
+    state, and recorders for inserts, undos, notes and log lines."""
+
+    def __init__(self, *, held_until=0.0, recording_while_held=True, pid=4242):
+        self.timers = VirtualTimers()
+        self.held_until = held_until
+        self.recording_while_held = recording_while_held
+        self.pid = pid
+        self.keydowns = 0
+        self.secure = False
+        self.inserts_ok = True
+        self.shutdown = False
+        self.delivered, self.undos, self.notes, self.logs = [], [], [], []
+        self.queue = sotto.DeliveryQueue(
+            insert=self._insert, undo_keys=lambda: self.undos.append(round(self.timers.now, 2)),
+            keys_held=self.held, recording=lambda: self.held() and self.recording_while_held,
+            secure_input=lambda: self.secure, call_after=lambda fn, *args: fn(*args),
+            note=lambda title, message: self.notes.append((title, message)), log=self.logs.append,
+            shutdown_requested=lambda: self.shutdown, clock=lambda: self.timers.now,
+            timer=self.timers.Timer)
+
+    def held(self):
+        return self.timers.now < self.held_until
+
+    def _insert(self, text):
+        self.delivered.append((text, round(self.timers.now, 2), self.held()))
+        return self.inserts_ok
+
+
+class DeliveryQueueOrderTests(unittest.TestCase):
+    def test_results_behind_a_held_key_paste_in_capture_order(self):
+        # The key is held for dictation 3 from t=0 to t=0.5; results 1 and 2 of
+        # the serial worker land while it is held.
+        world = DeliveryQueueHarness(held_until=0.5)
+        world.queue.paste("result-1 ")                        # t = 0.0
+        world.timers.advance_to(0.1)
+        world.queue.paste("result-2 ")                        # t = 0.1
+        world.timers.advance_to(3.0)
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-1 ", "result-2 "])
+        self.assertFalse(any(held for _text, _t, held in world.delivered))
+
+    def test_nothing_is_pasted_while_the_trigger_is_held_during_a_recording(self):
+        world = DeliveryQueueHarness(held_until=90.0)         # a long push-to-talk hold
+        world.queue.paste("result-1 ")
+        world.timers.advance_to(60.0)
+        self.assertEqual(world.delivered, [])
+        self.assertEqual(world.notes, [])                     # a recording is active: keep waiting
+        world.timers.advance_to(91.0)                         # released
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-1 "])
+        self.assertFalse(world.delivered[0][2])
+
+    def test_a_key_held_with_no_recording_drops_the_paste_after_the_bound_with_one_note(self):
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)  # a stuck modifier
+        world.queue.paste("result-1 ")
+        world.timers.advance_to(5.0)
+        world.queue.paste("result-2 ")
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S - 0.5)
+        self.assertEqual(world.notes, [])                     # still inside the bound
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(world.delivered, [])
+        self.assertEqual(len(world.notes), 1)
+        self.assertIn("History", world.notes[0][0] + world.notes[0][1])
+        world.timers.advance_to(2 * sotto.DELIVERY_WAIT_MAX_S + 5.0)
+        self.assertEqual(len(world.notes), 1)                 # nothing left to drop, no second note
+        world.held_until = 0.0                                # key released: the queue works again
+        world.queue.paste("result-3 ")
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-3 "])
+
+    def test_undo_waits_in_the_same_queue_behind_the_paste(self):
+        world = DeliveryQueueHarness(held_until=0.5)
+        world.queue.paste("result-1 ")
+        world.timers.advance_to(0.1)
+        world.queue.undo()                                    # "scratch that" dictated right after
+        self.assertEqual(world.undos, [])
+        world.timers.advance_to(3.0)
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-1 "])
+        self.assertEqual(len(world.undos), 1)
+        self.assertGreaterEqual(world.undos[0], world.delivered[0][1])
+
+    def test_shutdown_drops_pending_deliveries(self):
+        world = DeliveryQueueHarness(held_until=0.5)
+        world.queue.paste("result-1 ")
+        world.shutdown = True
+        world.timers.advance_to(3.0)
+        self.assertEqual(world.delivered, [])
+
+
+# -- the event tap: Sotto's own events are never chords or user typing ----------
+
+class EventTapCallbackHarness:
+    def __init__(self, test, quartz, trigger="right-option"):
+        self.events = []
+        self.engine = sotto.GestureEngine(lambda: self.events.append("start"),
+                                          lambda: self.events.append("finish"),
+                                          lambda: self.events.append("discard"))
+        test.addCleanup(self.engine.force_reset)
+        mask, keycode, device_bit = sotto.TRIGGERS[trigger]
+        self.binding = {"keycode": keycode, "mask": mask, "device_bit": device_bit, "trigger": trigger}
+        self.trigger_state = {"down": False}
+        self.user_keydowns = {"count": 0}
+        self.quartz = quartz
+        namespace = dict(vars(sotto))
+        namespace.update({
+            "Quartz": quartz, "shutdown": types.SimpleNamespace(requested=lambda: False),
+            "trigger_state": self.trigger_state, "binding": self.binding, "engine": self.engine,
+            "hotkey": sotto.parse_hotkey("ctrl-opt-d"),        # run()'s default
+            "hotkey_state": {"pressed_at": None, "skip_up": False},
+            "log": lambda _m: None, "revive_tap": lambda _reason: None,
+            "user_keydowns": self.user_keydowns,
+        })
+        self.callback = run_closures(["callback"], namespace)["callback"]
+
+    def press_trigger(self):
+        event = {"keycode": self.binding["keycode"], "flags": self.binding["mask"] | self.binding["device_bit"],
+                 "down": True, "user_data": 0}
+        self.callback(None, RealQuartz.kCGEventFlagsChanged, event, None)
+
+    def key_down(self, keycode, flags=0, user_data=0):
+        event = {"keycode": keycode, "flags": flags, "down": True, "user_data": user_data}
+        self.callback(None, RealQuartz.kCGEventKeyDown, event, None)
+
+
+class EventTapCallbackTests(unittest.TestCase):
+    def test_sottos_own_cmd_v_during_a_hold_is_not_a_chord(self):
+        world = patch_insertion(self)
+        tap = EventTapCallbackHarness(self, world.quartz)
+        tap.press_trigger()
+        self.assertEqual(tap.events, ["start"])
+        sotto.inject("earlier result", spacing="none")        # a deferred paste going out
+        own_cmd_v = world.quartz.key_downs(9)[0]              # exactly what a session tap receives
+        tap.callback(None, RealQuartz.kCGEventKeyDown, own_cmd_v, None)
+        self.assertEqual(tap.events, ["start"])
+        self.assertTrue(tap.engine.snapshot()[0], "live dictation discarded by Sotto's own ⌘V")
+
+    def test_a_real_key_during_a_hold_is_still_a_chord(self):
+        world = patch_insertion(self)
+        tap = EventTapCallbackHarness(self, world.quartz)
+        tap.press_trigger()
+        tap.key_down(9, flags=CMD)                             # the user's own ⌘V
+        self.assertEqual(tap.events, ["start", "discard"])
 
 
 if __name__ == "__main__":
