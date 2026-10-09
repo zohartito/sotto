@@ -153,7 +153,8 @@ class RestartTests(unittest.TestCase):
 
     def test_dead_route_uses_its_own_runtime_restart_callback(self):
         service = sotto.CaptureService()
-        service._process_started_at = 0
+        # Old enough to restart, whatever the machine's uptime (CI runners boot minutes before).
+        service._process_started_at = time.monotonic() - sotto.SILENCE_RESTART_AFTER_S - 1
         service.restart_callback = Mock(return_value=True)
         with patch('subprocess.run') as external:
             self.assertTrue(service._restart_app())
@@ -162,7 +163,7 @@ class RestartTests(unittest.TestCase):
 
     def test_dead_route_restart_refusal_keeps_the_rung_armed(self):
         service = sotto.CaptureService()
-        service._process_started_at = 0
+        service._process_started_at = time.monotonic() - sotto.SILENCE_RESTART_AFTER_S - 1
         service.restart_callback = controller(sealed=True).request
         self.assertFalse(service._restart_app())
 

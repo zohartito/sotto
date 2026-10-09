@@ -28,9 +28,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Python 3.12 from Homebrew
+      # ffmpeg: the sealed-release tests expect Homebrew's, as on a dev Mac.
+      - name: Python 3.12 and ffmpeg from Homebrew
         run: |
           brew list python@3.12 >/dev/null 2>&1 || brew install python@3.12
+          brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
           echo "PYTHON=$(brew --prefix python@3.12)/bin/python3.12" >> "$GITHUB_ENV"
 
       - name: Pinned packages
