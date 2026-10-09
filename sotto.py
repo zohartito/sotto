@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -74,6 +75,10 @@ DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
+QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
+# An installed update restarts once dictation is done: the longest recording
+# (the hands-free watchdog) plus time to transcribe and paste it, then anyway.
+UPDATE_DRAIN_DEADLINE_S = HANDS_FREE_MAX_S + 120.0
 RESTART_RELEASE_WAIT_S = 2.0     # bounded wait for the async mic teardown before exec
 FAST_MARGIN_FRAMES = 500         # Fast: encode the speech plus 5 s, not a padded 30 s
 MODEL_REWARM_AFTER_S = 240.0
@@ -269,6 +274,7 @@ def parse_hotkey(spec: str) -> tuple[int, int] | None:
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+    keep_app_log_small()
 
 
 LAUNCHD_LABEL = "com.zohartito.sotto.app"  # must match launchd/ and scripts/rollout.sh
@@ -279,19 +285,43 @@ def app_mode() -> bool:
     return os.environ.get("SOTTO_LAUNCHER") == "app"
 
 
+_app_log: dict = {"path": None, "max_bytes": 0}  # set once logs are routed to a file
+
+
 def route_app_logs(data_dir: Path, max_bytes: int = 2_000_000) -> Path:
     """Sotto.app has no terminal: send stdout/stderr to a small rotating log.
     Logs hold counts and timings only, never what was said."""
     folder = data_dir / "logs"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = folder / "sotto.log"
+    _rotate_if_large(path, max_bytes)
+    _point_output_at(path)
+    _app_log.update(path=path, max_bytes=max_bytes)
+    return path
+
+
+def _rotate_if_large(path: Path, max_bytes: int) -> bool:
+    """Move a log past max_bytes to sotto.log.1 (replacing the older one)."""
     if path.exists() and path.stat().st_size > max_bytes:
         os.replace(path, path.with_suffix(".log.1"))
+        return True
+    return False
+
+
+def _point_output_at(path: Path) -> None:
+    """Send this process's stdout and stderr to the log file at path."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     for stream in (1, 2):
         os.dup2(descriptor, stream)
     os.close(descriptor)
-    return path
+
+
+def keep_app_log_small() -> None:
+    """Rotate a routed log that grew past its limit while Sotto runs; the old
+    file keeps the open descriptors, so point output at a fresh one."""
+    path = _app_log["path"]
+    if path is not None and _rotate_if_large(path, _app_log["max_bytes"]):
+        _point_output_at(path)
 
 
 def sotto_icon_path() -> Path | None:
@@ -508,14 +538,42 @@ def live_preview(text: str) -> str:
         return text
 
 
-def main_thread_dispatch(has_ui: bool, call_after):
+class PendingDeliveries:
+    """Pastes and undos handed to the main thread but not yet delivered.
+
+    The transcription queue counts a job done once its paste is scheduled,
+    before the main loop runs it, so Quit also waits for this to reach zero.
+    add() runs on the worker, finish() on the main thread; hence the lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def add(self) -> None:
+        with self._lock:
+            self._count += 1
+
+    def finish(self) -> None:
+        with self._lock:
+            self._count = max(0, self._count - 1)
+
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+
+def main_thread_dispatch(has_ui: bool, call_after, deliveries: PendingDeliveries | None = None):
     """Return (ui_call, deliver_call), both scheduling work on the main thread.
 
     ui_call updates the menu bar and pill, so it does nothing under
     --no-overlay. deliver_call (pasting, voice undo) always runs: hiding the
-    UI must never stop text from reaching the cursor.
+    UI must never stop text from reaching the cursor. Each delivery is counted
+    in deliveries until the scheduled method calls deliveries.finish().
     """
     def deliver_call(method, *call_args) -> None:
+        if deliveries is not None:
+            deliveries.add()
         call_after(method, *call_args)
 
     def ui_call(method, *call_args) -> None:
@@ -525,14 +583,88 @@ def main_thread_dispatch(has_ui: bool, call_after):
     return ui_call, deliver_call
 
 
-def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep) -> None:
-    """Block the calling worker thread until busy() is False.
+def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep,
+                    deadline_s: float | None = None, clock=time.monotonic) -> bool:
+    """Block the calling worker thread until busy() is False, or until
+    deadline_s has passed. Returns whether it became idle.
 
-    Side effects: sleeps. Used before an update restart, because a restart
-    discards any recording or transcription still in progress.
+    Side effects: sleeps. Used before an update restart and Quit, because
+    shutdown discards any recording or transcription still in progress.
     """
+    give_up = None if deadline_s is None else clock() + deadline_s
     while busy():
+        if give_up is not None and clock() >= give_up:
+            return False
         sleep(poll_s)
+    return True
+
+
+def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries) -> bool:
+    """Whether a dictation is still recording, transcribing, or waiting to be
+    pasted — the three stages Quit lets finish before shutting down."""
+    return capture.is_active() or jobs.unfinished_tasks > 0 or deliveries.count() > 0
+
+
+def end_capture_now(engine, capture, on_finish) -> str | None:
+    """End the recording in progress so it is transcribed, not dropped.
+
+    Returns "gesture" when the gesture engine ended it, "orphan" when the
+    capture outlived the engine's state (a gesture callback raised after the
+    mic started) and was ended directly, or None when nothing was recording.
+    Side effects: may stop the capture and queue it for transcription.
+    """
+    if engine.force_finish():
+        return "gesture"
+    if capture.is_active():
+        on_finish()
+        return "orphan"
+    return None
+
+
+INSTALL_TIMEOUT_S = 3600.0  # an engine download on a slow link, but never forever
+
+
+def run_installer(argv: list[str], *, run=subprocess.run) -> tuple[bool, str]:
+    """Run an optional-engine installer; (succeeded, its last output). Never
+    raises, so the caller always clears its "installing" state."""
+    try:
+        result = run(argv, capture_output=True, text=True, timeout=INSTALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {INSTALL_TIMEOUT_S / 60:.0f} minutes"
+    except OSError as exc:
+        return False, f"could not start ({exc.strerror or exc})"
+    return result.returncode == 0, (result.stderr or result.stdout).strip()[-200:]
+
+
+def desktop_audio_path(folder: Path, timestamp: float) -> Path:
+    """Where "Save audio to Desktop" writes a recording: named by the second
+    it was captured, with -2, -3, … so an earlier save is never overwritten.
+
+    Side effects: creates the file empty with exclusive create, so two saves
+    running at once can never pick the same name.
+    """
+    import datetime
+    stem = f"sotto-{datetime.datetime.fromtimestamp(timestamp):%Y%m%d-%H%M%S}"
+    candidate, number = folder / f"{stem}.wav", 2
+    while True:
+        try:
+            with open(candidate, "xb"):
+                return candidate
+        except FileExistsError:
+            candidate, number = folder / f"{stem}-{number}.wav", number + 1
+
+
+def save_audio_copy(source: Path, folder: Path, timestamp: float) -> Path:
+    """Copy a recording into folder under a fresh desktop_audio_path name.
+
+    Side effects: writes one new file. The source is opened first, so a
+    missing recording raises FileNotFoundError without leaving a file behind.
+    """
+    with open(source, "rb") as audio:
+        target = desktop_audio_path(folder, timestamp)
+        with open(target, "wb") as saved:
+            shutil.copyfileobj(audio, saved)
+    return target
 
 
 class CaptureGate:
@@ -2117,11 +2249,16 @@ class DeliveryQueue:
 
     Every method runs on the main thread (deliver_call / AppHelper.callAfter);
     the poll timer only bounces back there, so there is no lock.
+
+    on_done runs exactly once for every item the queue takes — when it is
+    delivered (even if the insert raises), dropped after a long hold, or
+    cleared at shutdown — so run() can count it in PendingDeliveries from the
+    moment deliver_call schedules it until it leaves the queue.
     """
 
     def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
                  secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
-                 clock=time.monotonic, timer=threading.Timer) -> None:
+                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None) -> None:
         self._insert = insert            # (text) -> bool: did the text reach the app?
         self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
         self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
@@ -2135,6 +2272,7 @@ class DeliveryQueue:
         self._shutdown_requested = shutdown_requested
         self._clock = clock
         self._timer = timer
+        self._on_done = on_done          # () -> None: one item left the queue
         self._items: list[tuple] = []
         self._poll_armed = False
         self._waiting = False
@@ -2152,7 +2290,7 @@ class DeliveryQueue:
     def _pump(self) -> None:
         while self._items:
             if self._shutdown_requested():  # checked per item: Quit can land mid-pump
-                self._items.clear()
+                self._discard_all()  # nothing is posted once shutdown is requested
                 return
             if self._keys_held():
                 self._wait_or_drop()
@@ -2170,6 +2308,14 @@ class DeliveryQueue:
                 if item[0] == "paste":
                     self._note("Could not paste the dictation",
                                "It is in History. Open History to copy the text.")
+            finally:
+                self._on_done()
+
+    def _discard_all(self) -> None:
+        """Drop every waiting item; each one still reports done."""
+        items, self._items = self._items, []
+        for _item in items:
+            self._on_done()
 
     def _wait_or_drop(self) -> None:
         now = self._clock()
@@ -2179,7 +2325,7 @@ class DeliveryQueue:
             self._blocked_since = now
         elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
             dropped = sum(1 for item in self._items if item[0] == "paste")
-            self._items.clear()
+            self._discard_all()
             self._blocked_since = None
             self._waiting = False
             self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — "
@@ -2688,7 +2834,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         status_ui.set_language_mode(language_state["mode"],
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
-    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter)
+    pending_deliveries = PendingDeliveries()
+    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
+                                                 pending_deliveries)
 
     def refresh_history() -> None:
         if status_ui is not None:
@@ -2780,6 +2928,15 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             threading.Thread(target=announce_live, daemon=True).start()
 
     def on_finish() -> None:
+        # In flight from before the capture ends until its job is queued, so
+        # Quit's drain never sees an idle gap between the two.
+        pending_deliveries.add()
+        try:
+            finish_capture()
+        finally:
+            pending_deliveries.finish()
+
+    def finish_capture() -> None:
         released_at = time.monotonic()  # latency is measured from the key release
         if shutdown.requested():
             shutdown.stop_capture(capture)
@@ -2885,8 +3042,12 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         insert=insert_text, undo_keys=lambda: post_command_key(6), keys_held=keys_held,
         recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
         keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
-        call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested)
+        call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested,
+        on_done=pending_deliveries.finish)
 
+    # deliver_call counts each of these in pending_deliveries when it schedules
+    # it; the queue's on_done finishes that entry once the item is delivered,
+    # dropped or cleared, so Quit and the update restart wait for the paste.
     def inject_when_clear(text: str, _attempts: int = 0) -> None:
         """Queue a finished dictation for the cursor (worker call shape kept)."""
         delivery.paste(text)
@@ -3062,18 +3223,20 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             # every paste/commit, so nothing it produces is kept.
             transcription_thread.join(APP_DRAIN_TIMEOUT)
             drained = not transcription_thread.is_alive()
-        if not drained and restart.foreground_pending:
+        if not drained:
             if restart_drain["deadline"] is None:
                 restart_drain["deadline"] = time.monotonic() + RESTART_DRAIN_DEADLINE_S
             if time.monotonic() < restart_drain["deadline"]:
                 AppHelper.callLater(0.1, stop_runtime_on_main)
                 return
+            if not restart.foreground_pending:
+                # A wedged native call must not hang Quit forever, and freeing
+                # the native engine underneath it could crash: leave directly.
+                log("! transcription did not finish in time — quitting anyway")
+                os._exit(0)
             # exec replaces the whole image, so a wedged native call cannot
             # follow it; waiting forever would strand the user instead.
             log("! transcription did not finish in time — restarting anyway")
-        elif not drained:
-            AppHelper.callLater(0.1, stop_runtime_on_main)
-            return
         if nemotron is not None and drained:
             # Cocoa terminate exits without unwinding run()'s finally block.
             # Free native streams/model before Metal's global destructors run.
@@ -3153,7 +3316,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         def action_set_engine(mode: str) -> None:
             if adaptive or not engine_switching or mode == active_engine:
                 return
-            if capture.is_active() or jobs.unfinished_tasks:
+            if dictation_in_flight(capture, jobs, pending_deliveries):
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Switch engines after the current recording and transcription finish.")
                 return
@@ -3163,7 +3326,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     installation()  # verify before persisting a restart choice
                 if mode == "parakeet" and not parakeet_cached():
                     raise RuntimeError("Download Parakeet first: Settings → Download Parakeet.")
-                if capture.is_active() or jobs.unfinished_tasks:
+                if dictation_in_flight(capture, jobs, pending_deliveries):
                     raise RuntimeError("Finish the current dictation before switching engines.")
                 persist_engine_and_restart(
                     mode, restart.request,
@@ -3174,17 +3337,13 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
         def action_save(entry_id: str) -> None:
             def work() -> None:
-                import datetime
-                import shutil
-                from pathlib import Path
                 try:
                     entry = store.get(entry_id)
                     if not entry:
                         return
-                    stamp = datetime.datetime.fromtimestamp(
-                        entry["ts"]).strftime("%Y%m%d-%H%M")
-                    shutil.copy(store.audio_path(entry_id),
-                                Path.home() / "Desktop" / f"sotto-{stamp}.wav")
+                    target = save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",
+                                             entry["ts"])
+                    log(f"✓ saved audio to Desktop as {target.name}")
                 except FileNotFoundError:
                     log("! audio missing for that entry")
                     ui_call(status_ui.show_error, "Could not save audio",
@@ -3327,10 +3486,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Menu escape hatch — always works, no gesture required."""
             if shutdown.requested():
                 return
-            if engine.force_finish():
+            ended = end_capture_now(engine, capture, on_finish)
+            if ended == "gesture":
                 log("● finished via menu")
-            elif capture.is_active():
-                on_finish()  # gesture engine desynced; end the capture anyway
+            elif ended == "orphan":
                 log("● orphan capture finished via menu")
 
         def action_start_now() -> None:
@@ -3352,6 +3511,24 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log("● restart requested from the menu")
             except Exception as exc:
                 failed(str(exc))
+
+        def action_quit() -> None:
+            """Quit once the dictation in progress is done, waiting at most
+            QUIT_DRAIN_S. Side effects: refuses new recordings, ends the
+            recording in progress (even one the gesture engine lost), waits
+            until it is pasted, then requests shutdown."""
+            if shutdown.requested():
+                return
+            capture_gate.close()
+            if end_capture_now(engine, capture, on_finish):
+                log("● finishing the recording before quitting")
+
+            def work() -> None:
+                if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                                       deadline_s=QUIT_DRAIN_S):
+                    log(f"! dictation still running after {QUIT_DRAIN_S:.0f}s — quitting anyway")
+                shutdown.request()
+            threading.Thread(target=work, daemon=True).start()
 
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
@@ -3434,22 +3611,22 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             settings_view["installing"] = True
 
             def work() -> None:
-                import subprocess
                 script = Path(__file__).resolve().parent / "scripts" / "setup_nemotron.py"
                 log("● installing Nemotron (about 700 MB) ...")
-                result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
-                settings_view["installing"] = False
+                try:
+                    ok, detail = run_installer([sys.executable, str(script)])
+                finally:
+                    settings_view["installing"] = False
                 refresh_history()
                 if settings_view["controller"] is not None:
                     ui_call(settings_view["controller"].refresh)
-                if result.returncode == 0:
+                if ok:
                     log("✓ Nemotron installed")
                     ui_call(status_ui.show_info, "Nemotron installed",
                             "Choose Speech engine → Nemotron (English streaming) to use it.")
                 else:
-                    log(f"! Nemotron install failed ({result.returncode})")
-                    ui_call(status_ui.show_error, "Could not install Nemotron",
-                            (result.stderr or result.stdout).strip()[-200:])
+                    log(f"! Nemotron install failed ({detail[:80]})")
+                    ui_call(status_ui.show_error, "Could not install Nemotron", detail)
             threading.Thread(target=work, daemon=True).start()
 
         def install_parakeet_in_background() -> None:
@@ -3461,22 +3638,22 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             settings_view["parakeet_installing"] = True
 
             def work() -> None:
-                import subprocess
                 log("● downloading Parakeet (about 2.5 GB) ...")
-                result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "setup",
-                                         "--profile", "parakeet"], capture_output=True, text=True)
-                settings_view["parakeet_installing"] = False
+                try:
+                    ok, detail = run_installer([sys.executable, str(Path(__file__).resolve()),
+                                                "setup", "--profile", "parakeet"])
+                finally:
+                    settings_view["parakeet_installing"] = False
                 refresh_history()
                 if settings_view["controller"] is not None:
                     ui_call(settings_view["controller"].refresh)
-                if result.returncode == 0:
+                if ok:
                     log("✓ Parakeet downloaded")
                     ui_call(status_ui.show_info, "Parakeet downloaded",
                             "Choose Speech engine → Parakeet to use it.")
                 else:
-                    log(f"! Parakeet download failed ({result.returncode})")
-                    ui_call(status_ui.show_error, "Could not download Parakeet",
-                            (result.stdout or result.stderr).strip()[-200:])
+                    log(f"! Parakeet download failed ({detail[:80]})")
+                    ui_call(status_ui.show_error, "Could not download Parakeet", detail)
             threading.Thread(target=work, daemon=True).start()
 
         def action_open_settings() -> None:
@@ -3491,7 +3668,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Update this checkout with the installer, then restart into it."""
             if update_state["running"]:
                 return
-            if capture.is_active() or jobs.unfinished_tasks:
+            if dictation_in_flight(capture, jobs, pending_deliveries):
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Update after the current recording and transcription finish.")
                 return
@@ -3510,7 +3687,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     # and the user may have dictated while the update ran. Refuse new
                     # recordings first, then drain, so none can start in between.
                     capture_gate.close()
-                    wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0)
+                    if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                                           deadline_s=UPDATE_DRAIN_DEADLINE_S):
+                        log(f"! dictation still running after {UPDATE_DRAIN_DEADLINE_S:.0f}s — "
+                            "restarting into the update anyway")
                     action_restart(after_failure=capture_gate.reopen)
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
@@ -3553,7 +3733,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             threading.Thread(target=work, daemon=True).start()
 
         status_ui.set_history_callbacks({
-            "quit": shutdown.request,
+            "quit": action_quit,
             "restart": only_while_running(action_restart),
             "copy": only_while_running(action_copy), "retry": only_while_running(action_retry),
             "save": only_while_running(action_save), "delete": only_while_running(action_delete),
