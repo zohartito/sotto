@@ -62,6 +62,15 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(updates.check(self.root, offline=False, run=FakeGit(), which=lambda name: None).state,
                          "failed")
 
+    def test_a_failed_git_inspection_is_never_reported_as_up_to_date(self):
+        broken_count = FakeGit()
+        broken_count.answers["rev-list"] = completed(returncode=128, stderr="fatal: bad revision")
+        self.assertEqual(self.check(broken_count).state, "failed")
+        self.assertEqual(self.check(FakeGit(counts="garbage")).state, "failed")
+        broken_status = FakeGit(counts="0 2")
+        broken_status.answers["status"] = completed(returncode=128, stderr="fatal: index file corrupt")
+        self.assertEqual(self.check(broken_status).state, "failed")
+
     def test_descriptions_name_the_changes_and_the_manual_path(self):
         title, text = updates.describe(updates.UpdateCheck("available", behind=7, changes=("Add A",)), "x")
         self.assertEqual(title, "7 updates available")
@@ -109,25 +118,35 @@ class RealGitTests(unittest.TestCase):
 
 
 class ApplyMacTests(unittest.TestCase):
-    def test_runs_the_installer_update_and_reports_its_last_line(self):
+    """The installer's update path, and whether it switched the source."""
+
+    def apply(self, heads, installer_code, output):
+        heads = iter(heads)
+        installer_calls = []
+
+        def fake(argv, **kwargs):
+            if argv[0] == "git":
+                return completed(next(heads) + "\n")
+            installer_calls.append(argv)
+            kwargs["stdout"].write(output)
+            return completed(returncode=installer_code)
         with tempfile.TemporaryDirectory() as temporary:
-            root, log_path = Path(temporary), Path(temporary) / "logs" / "update.log"
-            calls = []
+            root = Path(temporary)
+            result = updates.apply_mac(root, "/venv/bin/python", root / "logs" / "update.log", run=fake)
+        self.assertEqual(installer_calls, [["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update",
+                                            "--python", "/venv/bin/python"]])
+        return result
 
-            def fake(argv, **kwargs):
-                calls.append(argv)
-                kwargs["stdout"].write("== Sotto.app\nDone.\n")
-                return completed(returncode=0)
-            ok, tail = updates.apply_mac(root, "/venv/bin/python", log_path, run=fake)
-            self.assertEqual((ok, tail), (True, "Done."))
-            self.assertEqual(calls[0], ["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update",
-                                        "--python", "/venv/bin/python"])
+    def test_a_finished_update_reports_its_last_line_and_the_new_source(self):
+        self.assertEqual(self.apply(["aaa", "bbb"], 0, "== Sotto.app\nDone.\n"), (True, "Done.", True))
 
-            def failing(argv, **kwargs):
-                kwargs["stdout"].write("✗ git pull failed; resolve it and run again.\n")
-                return completed(returncode=1)
-            self.assertEqual(updates.apply_mac(root, "/venv/bin/python", log_path, run=failing),
-                             (False, "✗ git pull failed; resolve it and run again."))
+    def test_a_failure_before_the_switch_leaves_the_source_alone(self):
+        self.assertEqual(self.apply(["aaa", "aaa"], 1, "✗ Installing packages failed.\n"),
+                         (False, "✗ Installing packages failed.", False))
+
+    def test_a_failure_after_the_switch_says_the_source_changed(self):
+        self.assertEqual(self.apply(["aaa", "bbb"], 1, "✗ model download failed\n"),
+                         (False, "✗ model download failed", True))
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows tray updater")
