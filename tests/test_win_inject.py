@@ -299,6 +299,28 @@ class ClipboardPasterTest(unittest.TestCase):
         with mock.patch.object(win_inject, "_paster", None):
             self.assertFalse(win_inject.paste_settling(), "no paste yet: nothing to settle")
 
+    def test_a_paste_whose_watch_cannot_start_is_not_left_settling(self) -> None:
+        # The Ctrl+V was counted, then the watch thread could not start: the
+        # count never dropped, so every Quit waited out its drain, Restart its
+        # cap, and Update was refused for good.
+        logs: list = []
+
+        def no_thread(function):
+            raise RuntimeError("can't start new thread")
+
+        paster = win_inject.ClipboardPaster(self.clipboard, send=self.sent.append,
+                                            spawn=no_thread, log=logs.append)
+        outcome: list = []
+        try:
+            outcome.append(paster.paste("dictated "))
+        except RuntimeError as exc:
+            outcome.append(exc)
+        self.assertFalse(paster.settling(), "no watch will ever settle this paste")
+        self.assertEqual(outcome, [True], "the Ctrl+V was sent: the text was pasted")
+        self.assertEqual(len(logs), 1, logs)
+        paster.flush()  # the restore is still pending: the shutdown flush puts it back
+        self.assertEqual(self.clipboard.text(), "user")
+
     def test_flush_restores_immediately_at_shutdown(self) -> None:
         self.paster.paste("dictated ")
         self.paster.flush()

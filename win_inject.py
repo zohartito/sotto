@@ -597,7 +597,15 @@ class ClipboardPaster:
                 self._restore(generation)  # nothing was pasted: put the clipboard back now
                 raise
             self._unread += 1
-        self._spawn(lambda: self._watch(generation))
+        try:
+            self._spawn(lambda: self._watch(generation))
+        except Exception as exc:  # "can't start new thread"
+            with self._lock:
+                self._unread -= 1  # no watch will ever settle this paste
+            # The restore stays pending: the next paste reuses its snapshot,
+            # and the shutdown flush puts it back.
+            self._log(f"! clipboard restore not scheduled ({str(exc)[:80]}); "
+                      "it is put back on the next paste or at quit")
         return True
 
     def settling(self) -> bool:
