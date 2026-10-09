@@ -40,6 +40,7 @@ PUBLIC_TEST_FILES = (
     'tests/fixtures/calibration_v2_expected/part-18.json',
     'tests/fixtures/calibration_v2_expected/part-19.json',
     'tests/gesture_check.py',
+    'tests/test_00_hermetic.py',
     'tests/test_adaptive_learning.py',
     'tests/test_adaptive_runtime.py',
     'tests/test_alpha_onboarding.py',
