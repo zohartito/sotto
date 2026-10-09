@@ -28,6 +28,10 @@ from sotto import (DEAD_ROUTE_TEXT, LONG_CAPTURE_S, SAMPLE_RATE, LocalWhisper, _
                    prepare_for_whisper, transcribe_canonical_samples, transcribe_prepared,
                    warm_speech_runtime)
 
+# A live capture whose speech model failed (F4): the audio is kept under this
+# text so Retry can transcribe it again.
+TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"
+
 
 class TranscriptionWorker:
     """Runs transcription jobs from ``jobs`` on the calling thread until
@@ -139,7 +143,18 @@ class TranscriptionWorker:
         stream_prepared = None
         stream_text = None
         if stream is not None and raw.any():
-            stream_text, stream_prepared = stream.finish()
+            try:
+                stream_text, stream_prepared = stream.finish()
+            except Exception as exc:
+                # The native stream and its one canonical retry both failed;
+                # the capture is still in hand, so keep it for Retry (F4).
+                self._keep_failed_live_capture(
+                    exc, raw=raw, native_rate=native_rate, captured_ts=captured_ts, queued_at=queued_at,
+                    job_config=job_config,
+                    preprocessing={"resampled_normalized": True, "vad_trimmed": False,
+                                   "silence_collapsed": False, "streaming": True,
+                                   "streaming_retry": stream.fallback})
+                return
         elif stream is not None:
             stream.close()
         samples = (stream_prepared.asr_samples if stream_prepared is not None
@@ -272,14 +287,23 @@ class TranscriptionWorker:
                 actual_model = self.model
                 entry_adaptive = False
                 self._publication = None
-        elif self.use_nemotron:
-            from nemotron_backend import metadata
-            text = stream_text if stream_text is not None else self.nemotron.transcribe(prepared.asr_samples)
-            attempt_metadata = metadata()
-            actual_model = self.model
         else:
-            text, attempt_metadata = transcribe_prepared(
-                self.mlx_whisper, prepared, job_config, self.glossary_terms)
+            try:
+                if self.use_nemotron:
+                    from nemotron_backend import metadata
+                    text = stream_text if stream_text is not None else self.nemotron.transcribe(prepared.asr_samples)
+                    attempt_metadata = metadata()
+                else:
+                    text, attempt_metadata = transcribe_prepared(
+                        self.mlx_whisper, prepared, job_config, self.glossary_terms)
+            except Exception as exc:
+                # A Metal/MLX or native error must not cost the user the
+                # recording (F4). The adaptive lane above keeps its own fallback.
+                self._keep_failed_live_capture(
+                    exc, raw=raw, native_rate=native_rate, captured_ts=captured_ts, queued_at=queued_at,
+                    job_config=job_config, prepared=prepared, vad_metadata=vad_metadata,
+                    preprocessing=preprocessing)
+                return
             actual_model = self.model
         # A backend may ignore cancellation.  Its result is never
         # pasted, registered, or persisted after shutdown.
@@ -363,6 +387,51 @@ class TranscriptionWorker:
             discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
         self.log(f"→ {time.monotonic() - queued_at:.2f}s after release "
                  f"(speech model {elapsed:.2f}s) · {len(text)} chars")
+
+    def _keep_failed_live_capture(self, exc: Exception, *, raw, native_rate, captured_ts, queued_at,
+                                  job_config, preprocessing: dict, prepared=None, vad_metadata=None) -> None:
+        """The speech model failed on a live capture (F4). The recording is not
+        lost: it becomes a ``live_suspect`` History row reading
+        TRANSCRIPTION_FAILED_TEXT, so Retry can transcribe it again.
+
+        Side effects: appends that row with the raw audio and the error in its
+        preprocessing receipt, refreshes the History menu, logs the error, and
+        shows one alert. Nothing once shutdown is requested."""
+        if self.shutdown.requested():
+            return
+        error = f"{type(exc).__name__}: {str(exc)[:160]}"
+        self.log(f"! transcription failed ({error}) — audio kept in History for Retry")
+        if prepared is None:  # the stream failed before any canonical audio existed
+            from audio_codec import prepare_canonical
+            prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
+        seconds = len(prepared.asr_samples) / SAMPLE_RATE
+        _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
+        attempt_metadata.update({
+            "vad": vad_metadata or {"available": None, "speech_fraction": None, "span_count": None},
+            "preprocessing": {**preprocessing, "outcome": "suspect", "error": error},
+            "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4), "asr_seconds": 0.0},
+        })
+        try:
+            finalize_primary_live_delivery(
+                append=lambda: self.coordinator.append_live(
+                    TRANSCRIPTION_FAILED_TEXT, prepared, seconds, self.model, ts=captured_ts,
+                    raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
+                    adaptive=False, **attempt_metadata),
+                adaptive_runtime=None, appended_publication=None, shutdown=self.shutdown, inject=None)
+        except Exception as append_exc:
+            self.log(f"! failed capture not saved ({type(append_exc).__name__}: {str(append_exc)[:160]})")
+            self._show_error("Transcription failed",
+                             f"{error}\n\nThe recording could not be saved to History either; please dictate again.")
+            return
+        self.refresh_history()
+        self._show_error("Transcription failed", f"The audio is in History; use Retry.\n\n{error}")
+
+    def _show_error(self, title: str, message: str) -> None:
+        """One alert on AppKit's main thread, when there is a menu bar to show it.
+
+        Side effects: the alert (ui.show_error also logs it); none after shutdown."""
+        if self.status_ui is not None and not self.shutdown.requested():
+            self.ui_call(self.status_ui.show_error, title, message)
 
     def _retry(self, job) -> None:
         """Transcribe a History row's saved canonical audio again.

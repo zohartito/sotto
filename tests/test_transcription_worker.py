@@ -663,5 +663,53 @@ class TranscriptionWorkerGoldenMaster(TemporaryUserFiles, unittest.TestCase):
         self.check("j_nemotron_stream", h)
 
 
+FAILED_TEXT = "[transcription failed]"
+
+
+class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
+    """F4 and F16(a): neither a failed speech model nor a failed History write
+    may cost the user the dictation."""
+
+    def assert_kept_for_retry(self, h: Harness, raw, error_type: str):
+        self.assertEqual(len(h.coordinator.appended), 1, h.logs)
+        row = h.coordinator.appended[0]
+        self.assertEqual((row["provenance"], row["text"]), ("live_suspect", FAILED_TEXT))
+        self.assertIs(row["raw_samples"], raw)
+        self.assertEqual(row["preprocessing"]["outcome"], "suspect")
+        self.assertIn(error_type, row["preprocessing"]["error"])
+        self.assertEqual(h.injected, [])
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Transcription failed"])
+        self.assertIn("History", h.status_ui.errors[0][1])
+        self.assertTrue(any(error_type in line for line in h.logs), h.logs)
+        self.assertEqual(h.refreshed, 1)
+
+    def test_f4_whisper_exception_keeps_the_recording_and_tells_the_user(self):
+        def boom(samples, **kwargs):
+            raise RuntimeError("[metal::malloc] Resource limit exceeded")
+        h, raw = Harness(boom), speech(2.0)
+        h.run_jobs(h.live_job(raw))
+        self.assert_kept_for_retry(h, raw, "RuntimeError")
+
+    def test_f4_nemotron_stream_failure_keeps_the_recording_and_tells_the_user(self):
+        class FailingStream(FakeStream):
+            def finish(self):
+                self.finished += 1
+                raise OSError("nemotron native stream failed after its canonical retry")
+        h, raw = Harness(nemotron=True), speech(2.0)
+        h.run_jobs(h.live_job(raw, stream=FailingStream("never delivered")))
+        self.assert_kept_for_retry(h, raw, "OSError")
+        self.assertEqual(h.nemotron.calls, 0)  # the stream already retried once
+
+    def test_f4_after_shutdown_nothing_is_kept_or_shown(self):
+        holder: dict = {}
+
+        def fail_after_shutdown(samples, **kwargs):
+            holder["harness"].shutdown.request()
+            raise RuntimeError("[metal::malloc] Resource limit exceeded")
+        h = holder["harness"] = Harness(fail_after_shutdown)
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual((h.coordinator.appended, h.status_ui.errors, h.injected), ([], [], []))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
