@@ -57,7 +57,12 @@ Silero VAD v6.2 voice detection (2.3 MB, SHA-256 checked) with
 `sotto_win.py setup` (`-SkipSetup` leaves the model to the first launch), and
 adds a Start Menu shortcut **Sotto** that starts the tray app without a
 console window, with that data folder applied. No admin rights, services or
-scheduled tasks. Running it again is safe and updates the environment.
+scheduled tasks. Running it again is safe and updates the environment; it
+keeps the CPU or CUDA set recorded at install (`-Cpu` / `-Cuda` switch it). It
+stops without changing anything while Sotto runs from that environment (quit
+Sotto first), and when the Start Menu already has a **Sotto** shortcut that
+starts another copy (remove that copy with its own `-Uninstall`, or pass
+`-ShortcutDir`); a shortcut to a copy that no longer exists is replaced.
 
 Then start **Sotto** from the Start Menu. A tray icon appears (grey while the
 model warms up); a "Ready — hold Right Ctrl to dictate" notification says when

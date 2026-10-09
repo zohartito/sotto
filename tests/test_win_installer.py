@@ -5,6 +5,7 @@ temporary location; no packages are downloaded and nothing real is touched.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -49,6 +50,79 @@ class InstallerTest(unittest.TestCase):
                                 text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
+
+    def shortcut(self, arguments: str) -> Path:
+        """A Start Menu "Sotto" entry with these arguments, as another copy's installer makes it."""
+        self.menu.mkdir(exist_ok=True)
+        path = self.menu / "Sotto.lnk"
+        self.psc(f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{path}'); "
+                 f"$s.TargetPath = '{sys.executable}'; $s.Arguments = '{arguments}'; $s.Save()")
+        return path
+
+    def shortcut_arguments(self, path: Path) -> str:
+        return self.psc(f"(New-Object -ComObject WScript.Shell).CreateShortcut('{path}').Arguments")
+
+    @contextmanager
+    def running_from_venv(self):
+        """A program running from the environment, like Sotto's pythonw."""
+        scripts = self.venv / "Scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        stand_in = scripts / "ping.exe"
+        shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stand_in)
+        running = subprocess.Popen([str(stand_in), "-n", "60", "127.0.0.1"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            yield
+        finally:
+            running.kill()
+            running.wait(10)
+
+    def test_a_shortcut_to_another_copy_is_never_replaced(self) -> None:
+        # [F11] Re-running an installer used to repoint another copy's entry
+        # (and its data folder) at this copy without a word.
+        other = Path(self._tmp.name) / "other-copy"
+        other.mkdir()
+        (other / "win_launch.py").write_text("", encoding="utf-8")
+        theirs = f'"{other / "win_launch.py"}" --data-dir "C:\\other-data"'
+        link = self.shortcut(theirs)
+        result = self.ps("-WhatIf", "-Cpu", "-Python", sys.executable)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("already starts another copy of Sotto", result.stdout)
+        self.assertNotIn("Install pinned packages", result.stdout, "refused before planning any change")
+        self.assertEqual(self.shortcut_arguments(link), theirs)
+        # An entry whose copy was deleted is replaced; one for this copy is kept up to date.
+        for arguments in (f'"{Path(self._tmp.name) / "gone" / "win_launch.py"}" --data-dir "C:\\x"',
+                          f'"{ROOT / "win_launch.py"}" --data-dir "{self.data}"'):
+            self.shortcut(arguments)
+            planned = self.ps("-WhatIf", "-Cpu", "-Python", sys.executable)
+            self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+            self.assertIn('Create Start Menu shortcut "Sotto"', planned.stdout)
+
+    def test_install_refuses_while_sotto_runs_from_the_environment(self) -> None:
+        # [F33] Installing under a running Sotto replaced its packages in use.
+        with self.running_from_venv():
+            result = self.ps("-WhatIf", "-Cpu", "-Python", sys.executable)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("still running", result.stdout)
+        self.assertNotIn("Install pinned packages", result.stdout)
+
+    def test_a_rerun_keeps_the_dependency_set_recorded_at_install(self) -> None:
+        # [F34] Every update re-detected the GPU, so a deliberate -Cpu install
+        # became CUDA (and the other way round). Both are checked, so one of them
+        # differs from what this PC would detect.
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(self.venv)], check=True,
+                       capture_output=True, timeout=300)
+        for recorded, requirements in (("cpu", "requirements-alpha-windows.txt"),
+                                       ("cuda", "requirements-alpha-windows-cuda.txt")):
+            (self.venv / "sotto-install.json").write_text(json.dumps({
+                "schema": 1, "created_venv": True, "created_data": False, "data_dir": str(self.data),
+                "flavor": recorded}), encoding="utf-8")
+            result = self.ps("-WhatIf", "-SkipSetup", "-Python", sys.executable)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"OK dependency set: {recorded} (recorded at install", result.stdout)
+            self.assertIn(f"Install pinned packages from {requirements}", result.stdout)
+        switched = self.ps("-WhatIf", "-SkipSetup", "-Cpu", "-Python", sys.executable)
+        self.assertIn("OK dependency set: cpu (-Cpu)", switched.stdout, "an explicit choice still wins")
 
     def test_whatif_checks_and_plans_every_step_without_changing_anything(self) -> None:
         result = self.ps("-WhatIf", "-Cpu", "-Python", sys.executable)

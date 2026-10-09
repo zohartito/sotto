@@ -122,6 +122,32 @@ class WindowsInstallerTests(unittest.TestCase):
             self.assertIn("not Sotto", refused.stdout, refused.stderr)
             self.assertNotIn("would run", refused.stdout)
 
+    def test_an_update_refuses_while_sotto_runs_from_the_copy(self):
+        # [F33] get.ps1 pulled and reinstalled under a running Sotto.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            dest = folder / "sotto"
+            env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)), SOTTO_SOURCE=str(dest),
+                       SOTTO_GET_DRY_RUN="1")
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                       str(ROOT / "scripts" / "get.ps1")]
+            first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("would run", first.stdout, first.stderr)
+            scripts = dest / "venv-alpha" / "Scripts"  # gitignored, like the installer's venv
+            scripts.mkdir(parents=True)
+            stand_in = scripts / "ping.exe"  # any program running from the copy, like pythonw
+            shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stand_in)
+            running = subprocess.Popen([str(stand_in), "-n", "60", "127.0.0.1"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            finally:
+                running.kill()
+                running.wait(10)
+            self.assertIn("Sotto is running from", refused.stdout, refused.stderr)
+            self.assertNotIn("Updating Sotto", refused.stdout)
+            self.assertNotIn("would run", refused.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

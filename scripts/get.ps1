@@ -30,6 +30,18 @@ function Install-Sotto {
       Write-Host "X $dest is a git copy of $origin, not Sotto. Choose another folder with `$env:SOTTO_SOURCE." -ForegroundColor Red
       return
     }
+    # Pulling and reinstalling under a running Sotto would swap its source and
+    # packages while they are in use.
+    $prefix = [IO.Path]::GetFullPath($dest).TrimEnd('\') + '\'
+    $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $path = $null
+        try { $path = $_.Path } catch { }
+        $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+      })
+    if ($running.Count -gt 0) {
+      Write-Host "X Sotto is running from $dest (process $($running[0].Id)). Quit it from its tray menu (or update it there with Check for updates), then run this line again." -ForegroundColor Red
+      return
+    }
     Write-Host "== Updating Sotto in $dest"
     git -C $dest pull --ff-only
     if ($LASTEXITCODE -ne 0) { Write-Host "X Could not update $dest (local changes?)." -ForegroundColor Red; return }
