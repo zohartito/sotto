@@ -595,7 +595,7 @@ class SpeechRuntimeTests(unittest.TestCase):
             self.assertNotIn("store.get", source[:worker])
             self.assertIn("threading.Thread(target=work, daemon=True).start()", source)
             self.assertLess(worker, source.index("store.get"))
-        self.assertIn("ui_call(_copy_text, entry[\"text\"])", copy_source)
+        self.assertIn("deliver_call(_copy_text, entry[\"text\"])", copy_source)  # counted (N19)
         self.assertIn('save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",',
                       save_source)
         self.assertNotIn("shutil.copy", save_source)
