@@ -1037,6 +1037,7 @@ class CaptureService:
         self._process_started_at = time.monotonic()
         self._restart_deferred_at = 0.0
         self.restart_callback = None
+        self.on_start_failed = None   # runtime hook: the mic never came up under a capture
         self._release_thread = None
         self._last_device_scan = 0.0
         self._device_id = None
@@ -1052,13 +1053,17 @@ class CaptureService:
         # overlap. A release racing the next press used to be able to stop the
         # newly started capture.
         with self._lifecycle_lock:
-            self._start_engine_locked()
+            started = self._start_engine_locked()
+        if not started:
+            self._report_start_failure()
 
-    def _start_engine_locked(self) -> None:
+    def _start_engine_locked(self) -> bool:
         """Build, pin, and start the capture engine. NEVER raises — an audio
         error must not kill the daemon (a stale tap format threw straight out
         of installTapOnBus and took the whole process down, which launchd then
         restarted in a loop while dictations silently captured nothing).
+        Returns whether the engine is live afterwards; a False under an
+        in-flight capture is surfaced by _report_start_failure.
 
         The format must be re-read on a FRESH engine AFTER pinning: a device
         switch (AirPods run at 24 kHz, built-in at 48 kHz) briefly leaves the
@@ -1075,11 +1080,11 @@ class CaptureService:
         try:
             with self._lock:
                 if self._closed:
-                    return
+                    return False
             for attempt in range(5):
                 with self._lock:
                     if self._closed:
-                        return
+                        return False
                 # ONE engine for the process lifetime. Allocating a new
                 # AVAudioEngine per wake leaked its CoreAudio threads (43
                 # threads / 10 audio threads observed after ~50 wake cycles,
@@ -1128,18 +1133,37 @@ class CaptureService:
                             engine.stop()
                         except Exception:
                             pass
-                        return
+                        return False
                 self._engine = engine
                 self._node = node
                 self._last_block_at = time.monotonic()
                 self._engine_started_at = time.monotonic()
                 self._zero_since = None
-                return
+                return True
             log("! could not start the mic after 5 tries")
+            return False
         except Exception as exc:
             log(f"! mic engine error: {str(exc)[:150]}")
+            return False
         finally:
             self._starting = False
+
+    def _report_start_failure(self) -> None:
+        """The engine never came up: stop pretending. Clear the waking flag
+        so the overlay cannot flip to "mic live", and if a capture is waiting
+        on this engine hand it to the runtime hook, which ends the gesture
+        and tells the user once. Idle failures (the device scan switching
+        mics) stay quiet: the next press retries and reports then."""
+        with self._lock:
+            self._waking = False
+            pending = (self._active is not None and self._engine is None
+                       and not self._closed)
+        handler = self.on_start_failed
+        if pending and handler is not None:
+            try:
+                handler()
+            except Exception as exc:
+                log(f"! mic failure handler failed: {str(exc)[:120]}")
 
     def _release_engine(self, *, only_if_idle: bool = False) -> bool:
         with self._lifecycle_lock:
@@ -1479,6 +1503,11 @@ class CaptureService:
     def is_waking(self) -> bool:
         """True until audio actually flows after a cold start (up to ~5s)."""
         return self._waking
+
+    def is_live(self) -> bool:
+        """An engine is up; False after a start that failed every try."""
+        with self._lock:
+            return self._engine is not None
 
     def end(self, *, include_stream=False):
         with self._lock:
@@ -3032,7 +3061,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 deadline = time.monotonic() + 10
                 while capture.is_waking() and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if engine.snapshot()[0]:
+                # A start that failed every try also ends the wait: say
+                # "live" only when an engine actually exists.
+                if engine.snapshot()[0] and capture.is_live():
                     ui_call(status_ui.show_recording)
                     log("● recording (mic live)")
 
@@ -3071,7 +3102,23 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if status_ui:
             ui_call(status_ui.show_hands_free, hands_free_hint(binding["trigger"]))
 
+    def on_mic_failed() -> None:
+        """The engine never started under this capture (device busy or gone).
+        End the gesture so the key-up finds nothing to finish, and say so
+        once — a dead mic used to show "recording" and then lose the dictation
+        without a word. Finishing (not discarding) keeps whatever a
+        mid-capture rebuild had already recorded."""
+        if engine.force_finish():
+            log("✗ could not start the microphone — dictation cancelled")
+        if status_ui:
+            ui_call(status_ui.show_error, "Could not start the microphone",
+                    "Sotto could not open the input device. Check that another app "
+                    "is not holding it and that Sotto may use the microphone "
+                    "(System Settings → Privacy & Security → Microphone), then "
+                    "press the key again.")
+
     engine = GestureEngine(on_start, on_finish, on_discard, on_hands_free=on_hands_free)
+    capture.on_start_failed = on_mic_failed
     hotkey = parse_hotkey(hotkey_spec) if hotkey_spec else None
     hotkey_state: dict = {"pressed_at": None, "skip_up": False}
     if hotkey_spec and hotkey is None:

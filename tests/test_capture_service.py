@@ -9,10 +9,17 @@ input bus, F45 a failed microphone start surfaces, F53 the CFString from
 name_of is released.
 """
 
+import ast
+import contextlib
 import ctypes
+import queue
 import sys
+import threading
+import time
 import types
 import unittest
+import uuid
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -359,6 +366,135 @@ class RouteChangeMidCaptureTest(unittest.TestCase):
         third = len(whisper_in) // 3
         self.assertAlmostEqual(dominant_hz(whisper_in[:third], 16000), 440, delta=10)
         self.assertAlmostEqual(dominant_hz(whisper_in[-third:], 16000), 440, delta=10)
+
+
+# -- F45: a failed microphone start surfaces ----------------------------------
+
+def run_closures(names, namespace):
+    """Compile the named functions nested directly inside sotto.run() verbatim
+    (same file, same line numbers) into `namespace`, whose entries stand in
+    for the closure variables they read. This exercises the real start /
+    finish / discard wiring without a menu bar, an event tap or a mic."""
+    tree = ast.parse(Path(sotto.__file__).read_text(encoding="utf-8"))
+    run = next(node for node in tree.body
+               if isinstance(node, ast.FunctionDef) and node.name == "run")
+    found = {node.name: node for node in run.body
+             if isinstance(node, ast.FunctionDef) and node.name in names}
+    missing = [name for name in names if name not in found]
+    if missing:
+        raise AssertionError(f"sotto.run() defines no closure(s) {missing}")
+    module = ast.Module(body=[found[name] for name in names], type_ignores=[])
+    exec(compile(module, sotto.__file__, "exec"), namespace)
+    return namespace
+
+
+class StatusUI:
+    """Records every overlay call as (method, *args)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *args: self.calls.append((name, *args))
+
+    def names(self):
+        return [call[0] for call in self.calls]
+
+
+class RecordingThread(threading.Thread):
+    """Every thread the code under test starts, so the test can join them."""
+    started = []
+
+    def start(self):
+        RecordingThread.started.append(self)
+        super().start()
+
+
+class FailedMicStartTest(unittest.TestCase):
+    def setUp(self):
+        RecordingThread.started = []
+        self.logs = []
+        real_sleep = time.sleep
+        for patcher in (mock.patch.object(sotto.threading, "Thread", RecordingThread),
+                        mock.patch.object(sotto.time, "sleep", lambda s: None),  # retry pauses
+                        mock.patch.object(sotto, "log", self.logs.append)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # announce_live's own clock: its 10 s "mic live" deadline passes in 0.5 s
+        self.fast_time = types.SimpleNamespace(monotonic=lambda: time.monotonic() * 20,
+                                               sleep=real_sleep, time=time.time)
+
+    def wire(self, *, with_handler):
+        capture = sotto.CaptureService()
+        capture._engine_obj = FakeEngine(start_ok=False)   # device busy or gone
+        ui, jobs = StatusUI(), queue.Queue()
+
+        @contextlib.contextmanager
+        def starting():
+            yield True
+
+        namespace = {
+            "shutdown": types.SimpleNamespace(requested=lambda: False,
+                                              enqueue=lambda q, job: q.put(job) or True,
+                                              stop_capture=lambda c: None),
+            "capture_gate": types.SimpleNamespace(starting=starting),
+            "use_nemotron": False, "capture": capture, "jobs": jobs,
+            "model_rewarm_due": lambda *a, **k: False,
+            "model_activity": {"last_finished": 0.0, "rewarming": False},
+            "adaptive": False, "status_ui": ui, "ui_call": lambda method, *a: method(*a),
+            "log": self.logs.append, "time": self.fast_time, "threading": threading,
+            "uuid": uuid, "current_speech_config": lambda: None, "np": np,
+        }
+        names = ["on_start", "on_finish", "on_discard"]
+        if with_handler:
+            names.append("on_mic_failed")
+        run_closures(names, namespace)
+        gesture = sotto.GestureEngine(namespace["on_start"], namespace["on_finish"],
+                                      namespace["on_discard"])
+        namespace["engine"] = gesture
+        if with_handler:
+            capture.on_start_failed = namespace["on_mic_failed"]
+        return capture, gesture, ui, jobs
+
+    def join_all(self):
+        """Wait for every thread started so far, including ones they start."""
+        seen = 0
+        while seen < len(RecordingThread.started):
+            batch = RecordingThread.started[seen:]
+            seen = len(RecordingThread.started)
+            for thread in batch:
+                thread.join(10)
+                self.assertFalse(thread.is_alive())
+
+    def test_a_failed_start_never_announces_a_live_mic(self):
+        with fake_avfoundation(lambda: None), \
+             mock.patch.object(sotto, "_pin_input_to_builtin", lambda node: 77):
+            capture, gesture, ui, jobs = self.wire(with_handler=False)
+            gesture.pressed()                               # key down: five failed starts
+            self.join_all()
+        self.assertIn("! could not start the mic after 5 tries", self.logs)
+        self.assertNotIn("● recording (mic live)", self.logs)
+        after_waking = ui.names()[ui.names().index("show_waking") + 1:]
+        self.assertNotIn("show_recording", after_waking, "the orb went solid on a dead mic")
+        self.assertFalse(capture.is_waking())
+
+    def test_a_failed_start_ends_the_gesture_and_tells_the_user_once(self):
+        with fake_avfoundation(lambda: None), \
+             mock.patch.object(sotto, "_pin_input_to_builtin", lambda node: 77):
+            capture, gesture, ui, jobs = self.wire(with_handler=True)
+            gesture.pressed()
+            self.join_all()
+            self.assertEqual(gesture.snapshot(), (False, False), "gesture kept recording a dead mic")
+            self.assertFalse(capture.is_active())
+            gesture.released()                              # the key-up finds nothing to finish
+            self.join_all()
+        errors = [call for call in ui.calls if call[0] == "show_error"]
+        self.assertEqual(len(errors), 1, ui.calls)
+        self.assertEqual(errors[0][1], "Could not start the microphone")
+        self.assertIn("hide", ui.names()[ui.names().index("show_waking") + 1:])  # the orb goes away
+        self.assertNotIn("● recording (mic live)", self.logs)
+        self.assertEqual(jobs.qsize(), 0)                   # nothing pretends to record
+        self.assertLessEqual(sum("captured" in line for line in self.logs), 1)
 
 
 if __name__ == "__main__":
