@@ -1146,7 +1146,13 @@ class CaptureService:
 
     def _release_engine_locked(self, *, only_if_idle: bool = False) -> bool:
         """Stop capture but KEEP the engine object — see _start_engine: a new
-        AVAudioEngine per wake leaks CoreAudio threads and CPU forever."""
+        AVAudioEngine per wake leaks CoreAudio threads and CPU forever.
+
+        Every teardown step runs even when an earlier one raises: a tap
+        removal that threw used to skip engine.stop(), and with the handle
+        already cleared nothing ever stopped that engine — idle Sotto kept
+        the microphone open. Returns True only when the engine actually
+        stopped; otherwise the handle stays so the next tick retries."""
         with self._lock:
             if only_if_idle and self._active is not None:
                 return False
@@ -1160,9 +1166,16 @@ class CaptureService:
         try:
             if node is not None:
                 node.removeTapOnBus_(0)
+        except Exception as exc:
+            log(f"! mic tap not removed: {str(exc)[:120]}")
+        try:
             engine.stop()
         except Exception as exc:
-            log(f"! mic release failed: {str(exc)[:120]}")
+            log(f"! mic engine not stopped: {str(exc)[:120]}")
+            with self._lock:
+                if not self._closed:
+                    self._engine, self._node = engine, node
+            return False
         return True
 
     def _observe_config_changes(self, engine) -> None:
@@ -1244,8 +1257,8 @@ class CaptureService:
                     self._start_engine()
                     return
             if not active and idle_for > self.idle_release_s:
-                self._release_engine()
-                log("○ mic released (idle) — wakes on next press")
+                if self._release_engine():
+                    log("○ mic released (idle) — wakes on next press")
         except Exception as exc:
             log(f"! mic health check failed: {str(exc)[:120]}")
 

@@ -43,6 +43,7 @@ PUBLIC_TEST_FILES = (
     'tests/test_adaptive_learning.py',
     'tests/test_adaptive_runtime.py',
     'tests/test_alpha_onboarding.py',
+    'tests/test_capture_service.py',
     'tests/test_comparator_spool.py',
     'tests/test_dead_route.py',
     'tests/test_dictionary.py',

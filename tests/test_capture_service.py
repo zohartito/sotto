@@ -212,5 +212,45 @@ class DeviceNameLeakTest(unittest.TestCase):
                          "kAudioObjectPropertyName is a +1 CFStringRef; name_of must CFRelease it")
 
 
+# -- F12: teardown releases every resource even if one step raises -----------
+
+class TeardownTest(unittest.TestCase):
+    def setUp(self):
+        self.logs = []
+        patcher = mock.patch.object(sotto, "log", self.logs.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def live_capture(self, engine):
+        capture = sotto.CaptureService()
+        engine.running = True
+        capture._engine_obj = engine
+        capture._engine, capture._node = engine, engine.node
+        capture._last_device_scan = sotto.time.monotonic()  # skip the device scan
+        return capture
+
+    def test_engine_is_stopped_even_if_tap_removal_raises(self):
+        engine = FakeEngine(FakeNode(remove_raises=True))
+        capture = self.live_capture(engine)
+        self.assertTrue(capture._release_engine())           # key-up release
+        self.assertIn("stop", engine.calls)
+        self.assertFalse(engine.isRunning(), "idle Sotto left the mic engine running")
+        for _ in range(3):
+            capture.tick()                                   # 1 Hz idle health check
+        self.assertFalse(engine.isRunning())
+
+    def test_release_reports_failure_and_keeps_the_handle_until_the_engine_stops(self):
+        engine = FakeEngine(stop_raises=True)
+        capture = self.live_capture(engine)
+        self.assertFalse(capture._release_engine(), "release claimed success while the engine ran")
+        self.assertIs(capture._engine, engine)               # tick retries, nothing is orphaned
+        self.assertEqual(engine.node.calls, ["removeTap"])
+        engine.stop_raises = False
+        capture.tick()                                       # idle release retried
+        self.assertFalse(engine.isRunning())
+        self.assertIsNone(capture._engine)
+        self.assertIn("○ mic released (idle) — wakes on next press", self.logs)
+
+
 if __name__ == "__main__":
     unittest.main()
