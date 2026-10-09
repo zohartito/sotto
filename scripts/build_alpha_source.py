@@ -40,6 +40,7 @@ PUBLIC_TEST_FILES = (
     'tests/fixtures/calibration_v2_expected/part-18.json',
     'tests/fixtures/calibration_v2_expected/part-19.json',
     'tests/gesture_check.py',
+    'tests/test_00_hermetic.py',
     'tests/test_adaptive_learning.py',
     'tests/test_adaptive_runtime.py',
     'tests/test_alpha_onboarding.py',
@@ -57,6 +58,7 @@ PUBLIC_TEST_FILES = (
     'tests/test_app_install.py',
     'tests/test_parakeet_engine.py',
     'tests/test_dead_route_repair.py',
+    'tests/test_dependency_pins.py',
     'tests/test_evaluation.py',
     'tests/test_history_learning.py',
     'tests/test_hotkey_state.py',
@@ -118,7 +120,7 @@ WINDOWS_FILES = (
 )
 
 PUBLIC_FILES = sorted(set(RUNTIME_SOURCE_FILES) | set(PUBLIC_TEST_FILES) | set(WINDOWS_FILES) | {
-    'README.md', 'LICENSE', 'AGENTS.md', 'requirements-alpha.txt', 'constraints-alpha.txt',
+    'README.md', 'LICENSE', 'AGENTS.md', 'pyproject.toml', 'requirements-alpha.txt', 'constraints-alpha.txt',
     'scripts/setup_nemotron.py', 'scripts/test_alpha.py', 'scripts/build_alpha_source.py',
     'scripts/install-mac.sh', 'scripts/install_app.py', 'scripts/get.sh',
     'scripts/rollout.sh', 'benchmark.py', 'docs/alpha-release-notes.md',
