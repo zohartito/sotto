@@ -795,5 +795,58 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         self.assertEqual((h.injected, h.status_ui.errors), ([], []))
 
 
+class UntranscribedAtShutdownTests(TemporaryUserFiles, unittest.TestCase):
+    """N9: a capture Sotto stops before transcribing stays in History with its
+    audio (Quit, Restart and SIGTERM waited as long as they may)."""
+
+    def test_the_teardown_keeps_the_capture_for_retry(self):
+        h, raw = Harness(says("never called")), speech(2.0)
+        h.shutdown.request()
+        h.worker.keep_untranscribed(h.live_job(raw))
+        self.assertEqual(len(h.coordinator.appended), 1, h.logs)
+        row = h.coordinator.appended[0]
+        self.assertEqual((row["provenance"], row["text"], row["adaptive"]),
+                         ("live_suspect", "[not transcribed: Sotto stopped]", False))
+        self.assertIs(row["raw_samples"], raw)
+        self.assertEqual(row["preprocessing"]["outcome"], "suspect")
+        self.assertEqual((h.injected, h.status_ui.errors, h.whisper.calls), ([], [], 0))
+        self.assertTrue(any("kept in History" in line for line in h.logs), h.logs)
+
+    def test_a_failed_keep_is_logged_never_raised(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        h = Harness(append=disk_full)
+        h.shutdown.request()
+        h.worker.keep_untranscribed(h.live_job(speech(1.0)))
+        self.assertTrue(any("not saved" in line and "OSError" in line for line in h.logs), h.logs)
+
+    def test_a_capture_taken_just_as_shutdown_came_is_kept(self):
+        h, raw = Harness(says("never called")), speech(2.0)
+
+        class ShutdownOnGet(queue.Queue):
+            def get(self, *args, **kwargs):
+                job = super().get(*args, **kwargs)
+                h.shutdown.request()  # shutdown lands between the get and the check
+                return job
+        h.jobs = h.worker.jobs = ShutdownOnGet()
+        h.jobs.put(h.live_job(raw))
+        h.run()
+        self.assertEqual([row["text"] for row in h.coordinator.appended], ["[not transcribed: Sotto stopped]"])
+        self.assertEqual((h.jobs.unfinished_tasks, h.worker.current_job), (0, None))
+
+    def test_the_running_job_is_visible_to_the_teardown(self):
+        seen = {}
+        holder: dict = {}
+
+        def look(samples, **kwargs):
+            seen["job"] = holder["harness"].worker.current_job
+            return {"text": "Please call me back at four", "segments": []}
+        h = holder["harness"] = Harness(look)
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        self.assertIs(seen["job"], job)
+        self.assertIsNone(h.worker.current_job)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

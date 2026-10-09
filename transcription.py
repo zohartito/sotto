@@ -30,6 +30,8 @@ from sotto import (DEAD_ROUTE_TEXT, LONG_CAPTURE_S, SAMPLE_RATE, LocalWhisper, _
 # A live capture whose speech model failed (F4): the audio is kept under this
 # text so Retry can transcribe it again.
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"
+# A live capture Sotto stopped before transcribing (N9): kept the same way.
+NOT_TRANSCRIBED_TEXT = "[not transcribed: Sotto stopped]"
 
 
 class TranscriptionWorker:
@@ -70,6 +72,8 @@ class TranscriptionWorker:
         self._publication = None
         self._publication_adopted = False
         self._publication_committed = False
+        # The job being run, for the teardown's keep_untranscribed (N9).
+        self.current_job = None
 
     def run(self) -> None:
         """The worker loop. Blocks until shutdown is requested.
@@ -84,8 +88,11 @@ class TranscriptionWorker:
             self._publication = None
             self._publication_adopted = False
             self._publication_committed = False
+            self.current_job = job
             try:
                 if self.shutdown.requested():
+                    if job[0] == "live":
+                        self.keep_untranscribed(job)  # taken just as shutdown came (N9)
                     continue
                 if job[0] == "stream-audio":
                     self._stream_audio(job)
@@ -107,6 +114,7 @@ class TranscriptionWorker:
                     self.adaptive_runtime.cancel_comparator_publication({"comparator_publication": self._publication})
                 if self.status_ui is not None and job[0] not in {"stream-audio", "stream-close"}:
                     self.ui_call(self.status_ui.hide_if_transcribing)
+                self.current_job = None
                 self.jobs.task_done()
 
     def _stream_audio(self, job) -> None:
@@ -438,6 +446,39 @@ class TranscriptionWorker:
             return
         self.refresh_history()
         self._show_error("Transcription failed", f"The audio is in History; use Retry.\n\n{error}")
+
+    def keep_untranscribed(self, job) -> None:
+        """Sotto is stopping and this live capture was never transcribed (N9):
+        Quit, Restart or SIGTERM waited as long as it may. The recording is
+        not lost: it becomes a ``live_suspect`` History row reading
+        NOT_TRANSCRIBED_TEXT, so Retry can transcribe it at the next start.
+        Unlike every other append this runs after shutdown is requested; the
+        teardown calls it only for captures nothing else will save.
+
+        Side effects: appends that row with the raw audio; logs. Never raises."""
+        _, raw, native_rate, captured_ts, queued_at, _capture_id, job_config, _stream = job
+        try:
+            from audio_codec import prepare_canonical
+            prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
+            seconds = len(prepared.asr_samples) / SAMPLE_RATE
+            _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
+            attempt_metadata.update({
+                "vad": {"available": None, "speech_fraction": None, "span_count": None},
+                "preprocessing": {"resampled_normalized": True, "vad_trimmed": False,
+                                  "silence_collapsed": False, "outcome": "suspect",
+                                  "error": "not transcribed before Sotto stopped"},
+                "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4),
+                            "asr_seconds": 0.0},
+            })
+            self.coordinator.append_live(
+                NOT_TRANSCRIBED_TEXT, prepared, seconds, self.model, ts=captured_ts,
+                raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
+                adaptive=False, **attempt_metadata)
+        except Exception as exc:
+            self.log(f"! untranscribed capture not saved ({type(exc).__name__}: {str(exc)[:160]})")
+            return
+        self.log(f"○ {len(raw) / max(native_rate, 1.0):.1f}s capture not transcribed before "
+                 "stopping — kept in History for Retry")
 
     def _history_append_failed(self, exc: Exception, deliver=None) -> None:
         """History could not take the live row (F16a): disk full, a locked or

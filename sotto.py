@@ -77,9 +77,15 @@ APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
 QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
 # launchd SIGKILLs Sotto's job 5 s after SIGTERM (`launchctl print` shows
-# "exit timeout = 5"; logout, kickstart -k and rollout all send SIGTERM), so
-# the SIGTERM drain leaves the teardown time to finish.
+# "exit timeout = 5"; logout, kickstart -k and rollout all send SIGTERM). The
+# drain and the clipboard restore stay short enough that the teardown still
+# keeps what is left in History before that.
 SIGTERM_DRAIN_S = 2.0
+SIGTERM_RESTORE_WAIT_S = 1.0
+# A foreground restart that cannot exec exits with this status, never 0:
+# KeepAlive {SuccessfulExit: false} (the login item, the sealed LaunchAgent)
+# then starts Sotto again instead of leaving the user without it.
+RESTART_FAILED_EXIT = 75         # EX_TEMPFAIL
 # An installed update restarts once dictation is done: the longest recording
 # (the hands-free watchdog) plus time to transcribe and paste it, then anyway.
 UPDATE_DRAIN_DEADLINE_S = HANDS_FREE_MAX_S + 120.0
@@ -129,16 +135,22 @@ class ShutdownBoundary:
         return True
 
     @staticmethod
-    def discard_queued(jobs: queue.Queue) -> int:
-        """Drain queued work with matching task accounting, never executing it."""
+    def discard_queued(jobs: queue.Queue, keep=None) -> int:
+        """Drain queued work with matching task accounting, never executing it.
+        ``keep`` is handed each queued live capture first, so its audio can
+        stay in History (N9)."""
         discarded = 0
         while True:
             try:
-                jobs.get_nowait()
+                job = jobs.get_nowait()
             except queue.Empty:
                 return discarded
             else:
-                jobs.task_done()
+                try:
+                    if keep is not None and job[0] == "live":
+                        keep(job)
+                finally:
+                    jobs.task_done()
                 discarded += 1
 
     def stop_capture(self, capture) -> None:
@@ -727,7 +739,8 @@ class Lifecycle:
     Quit, the menu Restart and the first SIGINT/SIGTERM stop the same way
     (F1c, N12): refuse new recordings, end the one in progress as a normal
     finish, wait until it is transcribed and pasted — at most QUIT_DRAIN_S,
-    SIGTERM_DRAIN_S for SIGTERM — then shut down or restart.
+    SIGTERM_DRAIN_S for SIGTERM — then shut down or restart. What is still
+    untranscribed past that wait is kept in History at teardown (N9).
     """
 
     def __init__(self, shutdown: ShutdownBoundary, capture_gate: CaptureGate, *,
@@ -818,7 +831,8 @@ class Lifecycle:
             try:
                 if not wait_until_idle(lambda: self.busy() and not self.shutdown.requested(),
                                        deadline_s=deadline_s, clock=self.clock, sleep=self.sleep):
-                    log(f"! dictation still running after {deadline_s:.0f}s — {verb} anyway")
+                    log(f"! dictation still running after {deadline_s:.0f}s — {verb} anyway; "
+                        "its audio stays in History")
             except Exception as exc:
                 log(f"! {verb} without waiting: {str(exc)[:160]}")
             finally:
@@ -2178,7 +2192,7 @@ class GestureEngine:
 # -- clipboard injection (main thread only) ---------------------------------
 
 _restore_generation = 0
-_pending_restore: dict | None = None  # {"own_count", "snapshot"} of the restore not yet run
+_pending_restore: dict | None = None  # {"own_count", "snapshot", "due"} of the restore not yet run
 
 
 _NO_SPACE_AFTER = "([{\"'“‘/-\n\t"
@@ -2331,7 +2345,8 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
 
     _restore_generation += 1
     generation = _restore_generation
-    _pending_restore = {"own_count": own_count, "snapshot": snapshot}
+    _pending_restore = {"own_count": own_count, "snapshot": snapshot,
+                        "due": time.monotonic() + RESTORE_DELAY_S}
 
     def queue_restore() -> None:
         from PyObjCTools import AppHelper
@@ -2363,6 +2378,25 @@ def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
         items.append(item)
     if items:
         pasteboard.writeObjects_(items)
+
+
+def flush_clipboard_restore(max_wait_s: float = RESTORE_DELAY_S, *, clock=time.monotonic,
+                            sleep=time.sleep) -> None:
+    """Run a clipboard restore that is still pending, before the process ends
+    (N6): its timer would otherwise die with it, leaving the dictation on the
+    clipboard and the user's own copy lost. Waits until the restore is due,
+    at most ``max_wait_s``, so the app can still read the paste; the restore
+    keeps its changeCount guard, so a user copy since the paste still wins.
+
+    Side effects: may sleep; may rewrite the general pasteboard. Main thread
+    only, like _restore_clipboard."""
+    pending = _pending_restore
+    if pending is None:
+        return
+    wait_s = min(max(pending["due"] - clock(), 0.0), max_wait_s)
+    if wait_s > 0:
+        sleep(wait_s)
+    _restore_clipboard(_restore_generation, pending["own_count"], pending["snapshot"])
 
 
 class DeliveryQueue:
@@ -3419,11 +3453,36 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     Quartz.CGEventTapEnable(tap, True)
     threading.Thread(target=resync_poller, daemon=True).start()
 
-    restart_drain = {"deadline": None}
+    restart_drain = {"deadline": None, "kept": False}
+
+    def keep_untranscribed() -> None:
+        """A capture still untranscribed at teardown stays in History with its
+        audio (N9), for Retry: every queued live capture, and the one the
+        worker is still on unless it finishes within APP_DRAIN_TIMEOUT (it
+        then appends nothing, shutdown fences it, so it is kept once).
+
+        Side effects: History rows; may join the worker briefly; logs."""
+        shutdown.discard_queued(jobs, keep=worker.keep_untranscribed)
+        running = worker.current_job
+        if running is not None and running[0] == "live":
+            transcription_thread.join(APP_DRAIN_TIMEOUT)
+            if transcription_thread.is_alive() and worker.current_job is running:
+                worker.keep_untranscribed(running)
 
     def stop_runtime_on_main() -> None:
-        """Main-loop teardown after the event-only signal handler fires."""
+        """Main-loop teardown once shutdown is requested (Quit and the signal
+        drain have already waited for the dictation in flight).
+
+        Side effects: the first pass puts back a pending clipboard restore
+        (N6) and keeps untranscribed captures in History (N9); then ends the
+        process — exec for a foreground restart, exit status
+        RESTART_FAILED_EXIT if that exec fails (N27)."""
         shutdown.stop_capture(capture)
+        if not restart_drain["kept"]:
+            restart_drain["kept"] = True
+            flush_clipboard_restore(SIGTERM_RESTORE_WAIT_S if shutdown.stop_signal == signal.SIGTERM
+                                    else RESTORE_DELAY_S)
+            keep_untranscribed()
         shutdown.discard_queued(jobs)
         drained = True
         if restart.foreground_pending or nemotron is not None:
@@ -3458,9 +3517,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log("! microphone teardown still running — restarting anyway")
             try:
                 restart.exec_foreground()
-            except OSError as exc:
+            except Exception as exc:
+                # Shutdown is one-way, so this process cannot carry on. Exit
+                # non-zero: KeepAlive (the login item, the LaunchAgent) starts
+                # Sotto again; exit 0 would be a Quit it leaves alone, and an
+                # alert queued now would never be shown.
                 restart.foreground_pending = False
-                restart.failed(f"foreground restart failed ({str(exc)[:120]}); run the command again")
+                restart.failed(f"foreground restart failed ({type(exc).__name__}: {str(exc)[:120]})")
+                log(f"! exiting with status {RESTART_FAILED_EXIT} so launchd can start Sotto again; "
+                    "from a terminal, run the command again")
+                os._exit(RESTART_FAILED_EXIT)
         if status_ui is not None:
             ui_call(status_ui.hide)
             try:

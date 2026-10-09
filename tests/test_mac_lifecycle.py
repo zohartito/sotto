@@ -1,5 +1,5 @@
 """How the Mac app stops, restarts and refuses work while it does (round-2
-audit rows F1c, N3, N8, N12, N18, N40, N44).
+audit rows F1c, N3, N6, N8, N9, N12, N18, N27, N40, N44).
 
 The menu actions and the main-loop teardown are closures inside sotto.run();
 these tests compile the real closures against fakes (no AppKit run loop, no
@@ -356,6 +356,100 @@ class WarmupIsNotDictationTests(unittest.TestCase):
         jobs.put(("live",))
         self.assertTrue(sotto.dictation_in_flight(capture, jobs, deliveries, warming=True))
         self.assertTrue(sotto.dictation_in_flight(capture, jobs, deliveries))
+
+
+# -- the main-loop teardown: N6, N9, N27 ---------------------------------------
+
+class TeardownTests(unittest.TestCase):
+    def wire(self, *, foreground=False, exec_error=None, worker_job=None, worker_alive=False,
+             queued=()):
+        self.events, self.exits, self.kept, self.failed = [], [], [], []
+        shutdown = sotto.ShutdownBoundary()
+        shutdown.request()
+        jobs = queue.Queue()
+        for job in queued:
+            jobs.put(job)
+        test = self
+
+        class Restart:
+            foreground_pending = foreground
+
+            def exec_foreground(self):
+                test.events.append("exec")
+                if exec_error is not None:
+                    raise exec_error
+
+            def failed(self, message):
+                test.failed.append(message)
+
+        class Thread:
+            def join(self, timeout=None):
+                pass
+
+            def is_alive(self):
+                return worker_alive
+
+        worker = types.SimpleNamespace(current_job=worker_job,
+                                       keep_untranscribed=lambda job: self.kept.append(job))
+        capture = types.SimpleNamespace(abort=lambda: None, shutdown=lambda: None,
+                                        wait_released=lambda timeout: True)
+        quartz = types.SimpleNamespace(CGEventTapEnable=lambda tap, on: None,
+                                       CFRunLoopGetMain=lambda: None,
+                                       CFRunLoopStop=lambda loop: self.events.append("stop"))
+        namespace = {
+            "shutdown": shutdown, "capture": capture, "jobs": jobs, "restart": Restart(),
+            "nemotron": None, "transcription_thread": Thread(), "worker": worker,
+            "restart_drain": {"deadline": None, "kept": False},
+            "APP_DRAIN_TIMEOUT": 0.0, "RESTART_DRAIN_DEADLINE_S": 0.0, "RESTART_RELEASE_WAIT_S": 0.0,
+            "AppHelper": types.SimpleNamespace(callLater=lambda *a: None), "time": time,
+            "log": lambda line: None, "os": types.SimpleNamespace(_exit=self.exits.append),
+            "Quartz": quartz, "tap": None, "status_ui": None, "ui_call": lambda *a: None,
+            "flush_clipboard_restore": lambda *a, **k: self.events.append("restore"),
+            "signal": signal,
+        }
+        for name in ("SIGTERM_RESTORE_WAIT_S", "RESTORE_DELAY_S", "RESTART_FAILED_EXIT"):
+            namespace[name] = getattr(sotto, name, None)
+        names = ["stop_runtime_on_main"] + (["keep_untranscribed"] if hasattr(sotto, "Lifecycle") else [])
+        return closures(names, namespace)["stop_runtime_on_main"], jobs
+
+    def test_n6_the_clipboard_is_put_back_before_the_process_ends(self):
+        stop, _ = self.wire()
+        stop()
+        self.assertIn("restore", self.events, "the paste's clipboard restore never ran")
+        self.assertLess(self.events.index("restore"), self.events.index("stop"))
+
+    def test_n6_and_before_a_foreground_restart_execs(self):
+        stop, _ = self.wire(foreground=True)
+        stop()
+        self.assertLess(self.events.index("restore"), self.events.index("exec"))
+
+    def test_n9_a_queued_capture_is_kept_in_history_not_discarded(self):
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap1", None, None)
+        stop, jobs = self.wire(queued=[("warmup",), live, ("retry", "row1")])
+        stop()
+        self.assertEqual(self.kept, [live])
+        self.assertEqual(jobs.unfinished_tasks, 0)
+
+    def test_n9_the_capture_the_model_is_still_on_is_kept(self):
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap2", None, None)
+        stop, _ = self.wire(worker_job=live, worker_alive=True)
+        stop()
+        self.assertEqual(self.kept, [live])
+
+    def test_n9_a_capture_the_worker_finished_is_not_kept_twice(self):
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap3", None, None)
+        stop, _ = self.wire(worker_job=live, worker_alive=False)
+        stop()
+        self.assertEqual(self.kept, [])
+
+    def test_n27_a_failed_exec_exits_so_launchd_starts_sotto_again(self):
+        for error in (OSError(7, "Argument list too long"), IndexError("tuple index out of range")):
+            with self.subTest(error=type(error).__name__):
+                stop, _ = self.wire(foreground=True, exec_error=error)
+                stop()
+                self.assertTrue(self.failed, "the failure callback (engine choice restore) did not run")
+                self.assertEqual(self.exits, [sotto.RESTART_FAILED_EXIT])
+                self.assertNotEqual(sotto.RESTART_FAILED_EXIT, 0)  # KeepAlive: SuccessfulExit false
 
 
 if __name__ == "__main__":
