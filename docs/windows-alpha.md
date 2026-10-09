@@ -141,6 +141,10 @@ time, in order, and wait while any Shift, Ctrl, Alt or Windows key is held, so
 the text cannot combine with a modifier; if one stays down for 2 minutes the
 text is kept in History instead.
 
+If the speech model itself fails on a dictation (for example CUDA runs out of
+memory), the recording is kept in History as **[transcription failed]** and a
+notification says so; **History → Retry** transcribes that audio again.
+
 ## Tray menu
 
 Right-click the tray icon (left-click opens Settings):

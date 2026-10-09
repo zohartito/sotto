@@ -262,6 +262,8 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
         def transcribe(self, samples, **kwargs):
             whisper_calls.append((np.array(samples), kwargs))
             text = replies.pop(0) if len(whisper_calls) > 1 else ""
+            if isinstance(text, Exception):
+                raise text  # the model failed (CUDA out of memory, a driver error)
             result = {"text": text}
             if kwargs.get("language") is None and kwargs.get("allowed_languages"):
                 result["language"] = tuple(kwargs["allowed_languages"])[0]
@@ -749,6 +751,133 @@ class IsolatedCliTest(unittest.TestCase):
         self.assertEqual(list((self.data / "audio").iterdir()), [])
         self.assertEqual(list((self.data / "audio-raw").iterdir()), [])
         self.assertEqual(self._run("history").stdout, "")
+
+
+def _patched_run(stack, data, fakes, *, logs, boundaries, controllers, settings=None):
+    """Enter the patches every ``run()`` test needs into ``stack``: fake model,
+    microphone and hook, History in ``data``, and recorded logs, shutdown
+    boundaries and controllers."""
+    from history import HistoryStore
+    from learning import LearningStore
+    import vad
+
+    FakeWhisper, FakeCapture, FakeHook = fakes
+
+    class RecordingBoundary(sotto.ShutdownBoundary):
+        def __init__(self):
+            super().__init__()
+            boundaries.append(self)
+
+    class RecordingController(sotto_win.Controller):
+        def __init__(self, **parts):
+            super().__init__(**parts)
+            controllers.append(self)
+
+    for patch in (
+            mock.patch.object(sotto_win.win_asr, "resolve_model_dir", return_value=data),
+            mock.patch.object(sotto_win.win_asr, "LocalCT2Whisper", FakeWhisper),
+            mock.patch.object(sotto_win.win_capture, "WinCapture", FakeCapture),
+            mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook),
+            mock.patch.object(sotto_win, "HistoryStore", lambda: HistoryStore(data)),
+            mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)),
+            mock.patch.object(sotto_win, "Controller", RecordingController),
+            mock.patch.object(sotto_win, "load_language_mode", return_value="auto"),
+            mock.patch.object(sotto_win.user_settings, "load",
+                              return_value=dict(settings or user_settings.DEFAULTS)),
+            mock.patch.object(dictionary, "DICTIONARY_PATH", data / "dictionary.txt"),
+            mock.patch.object(sotto_win, "log", logs.append),
+            mock.patch.object(sotto, "ShutdownBoundary", RecordingBoundary),
+            mock.patch.object(vad, "MODEL_PATH", data / "no-vad.onnx")):
+        stack.enter_context(patch)
+
+
+def _wait_for(condition, what, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.02)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class FailureAndTeardownTest(unittest.TestCase):
+    """A failing model, a stopping app and a queue of held insertions."""
+
+    def test_a_failed_transcription_keeps_its_recording_for_retry_and_says_so(self):
+        # [F4] A runtime model error (CUDA out of memory) used to lose the
+        # dictation: no History row, no Retry, no message.
+        import contextlib
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        replies = [RuntimeError("CUDA failed with error out of memory"), "recovered words"]
+        hooks, boundaries, controllers, logs, copied, delivered, notes = [], [], [], [], [], [], []
+        whisper_calls: list = []
+        fakes = _app_fakes(rate, [voiced], replies, hooks, whisper_calls)
+        results: dict = {}
+
+        class FakeTray:
+            def __init__(self, *, quit, log):
+                pass
+
+            def start(self): pass
+            def stop(self): pass
+            def set_phase(self, phase): pass
+            def set_state(self, state): pass
+            def attach(self, controller): pass
+
+            def notify(self, text):
+                notes.append(text)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-fail-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                try:
+                    _wait_for(lambda: controllers and hooks, "listening")
+                    controller, hook = controllers[0], hooks[0]
+                    hook.engine.pressed()
+                    time.sleep(0.45)
+                    hook.engine.released()
+                    _wait_for(lambda: HistoryStore(data).entries(1), "the History row")
+                    _wait_for(lambda: not controller.busy(), "the worker")
+                    entry = results["failed"] = HistoryStore(data).entries(1)[0]
+                    results["notes_after_failure"] = list(notes)
+                    controller.retry(entry["id"])
+                    _wait_for(lambda: copied, "the retry")
+                    results["retried"] = HistoryStore(data).get(entry["id"])
+                except BaseException as exc:
+                    results["error"] = exc
+                finally:
+                    boundaries[0].request()
+
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, fakes, logs=logs, boundaries=boundaries, controllers=controllers)
+                stack.enter_context(mock.patch("win_ui.TrayApp", FakeTray))
+                stack.enter_context(mock.patch.object(
+                    sotto_win.win_inject, "deliver", lambda text, **kwargs: delivered.append(text)))
+                stack.enter_context(mock.patch.object(sotto_win.win_inject, "copy_text", copied.append))
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu", tray=True)
+                driver.join(10)
+
+        self.assertNotIn("error", results, results)
+        failed = results["failed"]
+        self.assertEqual(failed["text"], "[transcription failed]")
+        self.assertEqual(failed["attempts"][-1]["provenance"], "live_suspect")
+        self.assertEqual(failed["attempts"][-1]["preprocessing"]["outcome"], "suspect")
+        self.assertEqual(delivered, [], "a failed transcription inserts nothing")
+        self.assertTrue(any("Retry" in note for note in results["notes_after_failure"]), notes)
+        self.assertTrue(any(line.startswith("! transcription failed: CUDA failed") for line in logs), logs)
+        # Retry recovers the dictation from the kept audio.
+        self.assertEqual(results["retried"]["text"], "recovered words")
+        self.assertEqual(copied, ["recovered words"])
+        self.assertEqual(len(whisper_calls[1][0]), len(whisper_calls[2][0]))
+        self.assertTrue(np.allclose(whisper_calls[1][0], whisper_calls[2][0], atol=1e-4),
+                        "Retry transcribes the audio the failed attempt had")
 
 
 if __name__ == "__main__":

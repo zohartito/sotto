@@ -61,6 +61,7 @@ from history import HistoryStore
 from learning import LearningCoordinator, LearningStore
 
 INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History only
+TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
 
@@ -726,8 +727,13 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         if shutdown.requested():
             return
         restricted = win_asr.LanguageRestricted(whisper, prefs.languages)
-        text, attempt_metadata = sotto.transcribe_prepared(
-            restricted, prepared, job_config, glossary_terms)
+        try:
+            text, attempt_metadata = sotto.transcribe_prepared(
+                restricted, prepared, job_config, glossary_terms)
+        except Exception as exc:
+            keep_failed_capture(exc, prepared, raw, native_rate, captured_ts, job_config,
+                                vad_metadata, preprocessing, queued_at, started)
+            return
         # A backend may ignore cancellation: its result is never pasted or
         # persisted after shutdown.
         if shutdown.requested():
@@ -769,6 +775,36 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             sotto.record_totals(text, len(raw) / max(native_rate, 1.0))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
             f"(speech model {elapsed:.2f}s) · {len(text)} chars")
+
+    def keep_failed_capture(exc, prepared, raw, native_rate, captured_ts, job_config,
+                            vad_metadata, preprocessing, queued_at, started) -> None:
+        """The speech model raised (CUDA out of memory, a driver error): the
+        recording must not be lost.  It is kept as a suspect History row that
+        Retry can transcribe again, and the tray says so.
+
+        Side effects: appends one History row with its audio; a tray notification.
+        """
+        model_activity["last_finished"] = time.monotonic()
+        log(f"! transcription failed: {str(exc)[:160]} — the recording is kept in History")
+        if shutdown.requested():
+            return
+        prepared_seconds = len(prepared.asr_samples) / sotto.SAMPLE_RATE
+        _, attempt_metadata = sotto._transcription_kwargs(job_config, glossary_terms,
+                                                         prepared_seconds)
+        preprocessing.update({"outcome": "suspect", "transcription_error": type(exc).__name__})
+        attempt_metadata.update({
+            "vad": vad_metadata, "preprocessing": preprocessing,
+            "latency": {"queue_wait_seconds": round(started - queued_at, 4),
+                        "asr_seconds": round(time.monotonic() - started, 4)}})
+        sotto.finalize_primary_live_delivery(
+            append=lambda: coordinator.append_live(
+                TRANSCRIPTION_FAILED_TEXT, prepared, prepared_seconds, model_repo,
+                ts=captured_ts, raw_samples=raw, raw_sample_rate=native_rate,
+                provenance="live_suspect", adaptive=False, **attempt_metadata),
+            adaptive_runtime=None, appended_publication=None, shutdown=shutdown, inject=None)
+        if ui is not None:
+            ui.notify("Transcription failed. The recording is in History: "
+                      "choose Retry there to transcribe it again.")
 
     def retry_job(job) -> None:
         _, entry_id, queued_at, _capture_id, job_config = job
@@ -858,6 +894,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                     raise RuntimeError("unknown transcription job")
             except Exception as exc:
                 log(f"! transcription failed: {str(exc)[:160]}")
+                if ui is not None and job[0] in ("live", "retry"):
+                    ui.notify("A dictation could not be transcribed; see sotto.log in the data folder.")
             finally:
                 jobs.task_done()
                 ui_state()
