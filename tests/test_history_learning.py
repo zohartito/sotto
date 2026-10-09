@@ -668,5 +668,30 @@ class HistoryLearningTests(unittest.TestCase):
         self.assertEqual([entry["text"] for entry in store.entries()], ["kept words"])
         self.assertNotIsInstance(sotto.history_coordinator(store, LearningStore(root)), sotto.UnsavedHistory)
 
+    def test_unicode_line_separators_never_split_a_row(self):
+        """N4: str.splitlines() also breaks on U+2028, U+2029 and U+0085. One
+        transcript or correction containing them used to make History and
+        learning.jsonl unreadable for good, including files already written
+        with the character raw by an earlier version."""
+        for char in (" ", " ", "\u0085"):
+            with self.subTest(f"U+{ord(char):04X}"):
+                root = self.root / f"separator-{ord(char):04x}"
+                coordinator = LearningCoordinator(HistoryStore(root), LearningStore(root))
+                row = coordinator.append_live(f"first{char}second", np.array([-1.0, 0, 1.0], np.float32),
+                                              .5, "model")
+                coordinator.correct(row["id"], f"fixed{char}text")
+                self.assertIsNotNone(coordinator.enroll(row["id"]))
+                indexes = (coordinator.history.index, coordinator.learning.index)
+                for index in indexes:
+                    self.assertNotIn(char, index.read_text(encoding="utf-8"), f"{index.name} is written escaped")
+                    # An earlier version wrote the character raw; that file must read too.
+                    escaped = json.dumps(char)[1:-1]
+                    index.write_text(index.read_text(encoding="utf-8").replace(escaped, char), encoding="utf-8")
+                    self.assertIn(char, index.read_text(encoding="utf-8"))
+                reopened = HistoryStore(root)
+                self.assertEqual(reopened.get(row["id"])["hypothesis"], f"first{char}second")
+                learning = LearningStore(root)
+                self.assertEqual([record["corrected_text"] for record in learning.active()], [f"fixed{char}text"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,10 +51,30 @@ def _fsync_dir(path: Path) -> None:
         pass
 
 
+# str.splitlines() also ends a line at these, and json.dumps(ensure_ascii=False)
+# leaves them raw inside strings: a transcript containing one made every reader
+# that split on them (this one before N4, and older Sotto versions after a
+# rollback) see a broken row. Written escaped, they are ordinary JSON text.
+_LINE_BREAKS_JSON_LEAVES_RAW = ("\u2028", "\u2029", "\u0085")
+
+
+def _jsonl_line(row: dict[str, Any]) -> str:
+    line = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    for char in _LINE_BREAKS_JSON_LEAVES_RAW:
+        line = line.replace(char, f"\\u{ord(char):04x}")
+    return line + "\n"
+
+
+def _jsonl_rows(text: str) -> list[str]:
+    """Split JSONL on "\\n" only: a row may hold a raw U+2028, U+2029 or U+0085
+    written before N4, and str.splitlines() would cut it in two."""
+    return text.split("\n")
+
+
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     ensure_private_directory(path.parent)
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    payload = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    payload = "".join(_jsonl_line(row) for row in rows)
     try:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -218,7 +238,7 @@ class HistoryStore:
             text = self.index.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise HistoryUnreadable("history metadata is malformed; refusing to sweep artifacts") from exc
-        for line_number,line in enumerate(text.splitlines(),start=1):
+        for line_number,line in enumerate(_jsonl_rows(text),start=1):
             if not line.strip():
                 continue
             try:

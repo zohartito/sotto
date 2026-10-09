@@ -19,7 +19,7 @@ from typing import Any, Iterator
 
 from audio_codec import AudioIdentity, PreparedAudio, read_canonical_wav, read_pcm16_wav
 from comparator_spool import ComparatorSpool
-from history import HistoryStore, STORE_DIR, _atomic_jsonl, _fsync_dir
+from history import HistoryStore, STORE_DIR, _atomic_jsonl, _fsync_dir, _jsonl_rows
 from storage_lock import advisory_lock, ensure_private_directory, ensure_private_file
 
 LEARNING_SCHEMA_VERSION = 1
@@ -184,7 +184,7 @@ def _read_records(index: Path) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     if not index.exists():
         return records
-    for line in index.read_text(encoding="utf-8").splitlines():
+    for line in _jsonl_rows(index.read_text(encoding="utf-8")):
         if not line.strip():
             continue
         try:
