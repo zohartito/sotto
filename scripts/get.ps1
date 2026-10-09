@@ -6,6 +6,14 @@
 # updates that copy, then runs its scripts\install-windows.ps1 and starts Sotto.
 # No admin rights. Missing tools are named with the command that installs them.
 
+# Same repository? Ignores https vs ssh form, a trailing .git and a trailing slash.
+function Test-SameRepo([string]$First, [string]$Second) {
+  $normalized = foreach ($url in $First, $Second) {
+    (($url -replace '^git@github\.com:', 'https://github.com/').TrimEnd('/')) -replace '\.git$', ''
+  }
+  return $normalized[0] -eq $normalized[1]
+}
+
 function Install-Sotto {
   $ErrorActionPreference = 'Stop'
   $repo = if ($env:SOTTO_REPO) { $env:SOTTO_REPO } else { 'https://github.com/zohartito/sotto.git' }
@@ -16,6 +24,12 @@ function Install-Sotto {
     return
   }
   if (Test-Path -LiteralPath (Join-Path $dest '.git')) {
+    $origin = ''
+    try { $origin = git -C $dest remote get-url origin 2>$null } catch { $origin = '' }
+    if (-not (Test-SameRepo $origin $repo)) {
+      Write-Host "X $dest is a git copy of $origin, not Sotto. Choose another folder with `$env:SOTTO_SOURCE." -ForegroundColor Red
+      return
+    }
     Write-Host "== Updating Sotto in $dest"
     git -C $dest pull --ff-only
     if ($LASTEXITCODE -ne 0) { Write-Host "X Could not update $dest (local changes?)." -ForegroundColor Red; return }

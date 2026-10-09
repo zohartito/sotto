@@ -9,6 +9,18 @@
 # Everything sits inside main(), so a partly downloaded script never runs.
 set -euo pipefail
 
+# Same repository? Ignores https vs ssh form, a trailing .git and a trailing slash.
+same_repo() {
+    local normalized=()
+    local url
+    for url in "$1" "$2"; do
+        url="${url/#git@github.com:/https://github.com/}"
+        url="${url%/}"
+        normalized+=("${url%.git}")
+    done
+    [ "${normalized[0]}" = "${normalized[1]}" ]
+}
+
 main() {
     local repo="${SOTTO_REPO:-https://github.com/zohartito/sotto.git}"
     local dest="${SOTTO_SOURCE:-$HOME/sotto}"
@@ -34,6 +46,10 @@ main() {
     fi
 
     if [ -d "$dest/.git" ]; then
+        local origin
+        origin="$(git -C "$dest" remote get-url origin 2>/dev/null || true)"
+        same_repo "$origin" "$repo" \
+            || fail "$dest is a git copy of ${origin:-an unknown project}, not Sotto. Choose another folder with SOTTO_SOURCE=..."
         echo "== Updating Sotto in $dest"
         git -C "$dest" pull --ff-only < /dev/null || fail "Could not update $dest (local changes?)."
     elif [ -e "$dest" ]; then
