@@ -57,6 +57,7 @@ PUBLIC_TEST_FILES = (
     'tests/test_app_install.py',
     'tests/test_parakeet_engine.py',
     'tests/test_dead_route_repair.py',
+    'tests/test_dependency_pins.py',
     'tests/test_evaluation.py',
     'tests/test_history_learning.py',
     'tests/test_hotkey_state.py',
