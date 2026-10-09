@@ -12,10 +12,8 @@
 # The full model A/B benchmark needs MLX on Apple Metal and is run locally, not
 # in CI. The monthly `schedule` run posts a re-benchmark reminder in the summary.
 #
-# Dormant-until-committed: benchmark.py and its imports (evaluation.py,
-# speech_config.py) may still be local WIP. Until they land on the default
-# branch this workflow no-ops green instead of failing, then activates
-# automatically once they are committed.
+# If benchmark.py is ever absent from a ref (an old branch), the gate reports
+# "dormant" and passes instead of failing.
 #
 # Pinning: the one third-party action is a full 40-char SHA (matches secret-scan.yml).
 name: benchmark-gate
@@ -58,7 +56,7 @@ jobs:
         RAN_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         if [ ! -f benchmark.py ]; then
           STATUS="dormant"
-          NOTE="benchmark.py not on this ref yet (local WIP) — gate no-ops until it lands"
+          NOTE="benchmark.py is not on this ref, so the gate has nothing to check"
           SAMPLES="0"
         else
           # Import-surface check first (stdlib-only; mirrors the compileall CI habit).
@@ -105,7 +103,7 @@ jobs:
           echo '  --output-json bench.json --output-markdown bench.md'
           echo '```'
           echo ''
-          echo 'Then log the outcome in `.claude/LEARNINGS.md`.'
+          echo 'Then record the outcome in `docs/alpha-validation.md`.'
         } >> "$GITHUB_STEP_SUMMARY"
 concurrency:
   group: benchmark-gate-${{ github.ref }}

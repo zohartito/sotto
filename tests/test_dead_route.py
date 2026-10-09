@@ -52,7 +52,13 @@ class DeadRouteTest(unittest.TestCase):
     def test_dead_route_placeholder_is_stable(self):
         self.assertEqual(DEAD_ROUTE_TEXT, "[dead microphone]")
 
-    def test_live_and_retry_jobs_consult_the_dead_route_guard(self):
-        source = Path("sotto.py").read_text(encoding="utf-8")
-        self.assertIn("asr_skip_reason(samples)", source)
-        self.assertIn("asr_skip_reason(snapshot.samples)", source)
+    def test_live_and_retry_jobs_call_the_dead_route_guard(self):
+        # Static check (run() cannot be called in a test yet): parse the code,
+        # so a guard that is commented out no longer counts.
+        import ast
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "sotto.py").read_text(encoding="utf-8"))
+        arguments = {ast.unparse(node.args[0]) for node in ast.walk(tree)
+                     if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "asr_skip_reason"
+                     and node.args}
+        self.assertIn("samples", arguments)
+        self.assertIn("snapshot.samples", arguments)

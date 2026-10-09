@@ -26,8 +26,9 @@ their own licenses.
 - A microphone, permission to use it, and Accessibility permission for the
   terminal/Python running Sotto.
 - Allow several GB of memory and at least 8 GB of free disk for the environment,
-  model and download caches. Latency and accuracy vary; this alpha makes no
-  benchmark or comparative accuracy claims.
+  model and download caches. Latency and accuracy vary: the speeds quoted below
+  were measured on one M4 Max with synthetic speech, and there are no accuracy
+  comparisons.
 
 If needed, install native Python 3.12 with Homebrew:
 

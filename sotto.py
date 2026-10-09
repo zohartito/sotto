@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """sotto — hold a key, speak, release; the words land at your cursor. All local.
 
-Gestures (on whichever trigger key you pick):
+Gestures (on whichever trigger key you pick; right Option by default):
     hold        push-to-talk — release to transcribe
     double-tap  hands-free — records until the next single tap
     lone tap    ignored (no accidental blips)
 
-    python sotto.py                          # run on fn, whisper-large-v3-turbo
-    python sotto.py --trigger right-option   # e.g. while fn is taken by parrot
-    python sotto.py --model mlx-community/whisper-large-v3-turbo
+    python sotto.py run                      # menu bar app with the pill
+    python sotto.py run --trigger fn         # another trigger key
     python sotto.py doctor                   # permission + device checks
 
-Runs from a terminal that already has Accessibility (no extra TCC dance).
-Transcription is mlx-whisper on Metal/unified memory — nothing leaves the Mac
-for inference (model files download once from Hugging Face).
+The installed Sotto.app asks for the Microphone and Accessibility itself; a
+terminal run needs both granted to the terminal. Speech engines (Whisper via
+mlx-whisper, Parakeet, Nemotron) run on this Mac; model files download once,
+at pinned revisions, and audio never leaves the Mac.
 """
 
 from __future__ import annotations

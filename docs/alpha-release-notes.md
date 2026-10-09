@@ -55,8 +55,10 @@ PowerShell: `irm https://raw.githubusercontent.com/zohartito/sotto/main/scripts/
 (or clone it and run `scripts\install-windows.ps1`), then start Sotto from the
 Start menu. Details: [windows-alpha.md](windows-alpha.md).
 
-The source archive attached to the release is built deterministically from the
-tagged commit; check it with `shasum -a 256` against the published SHA-256.
+The one-line installers and **Check for Updates** follow the `main` branch,
+which can be ahead of this release. The source archive attached to the release
+is the exact tagged build, made deterministically from the tagged commit; check
+it with `shasum -a 256` against the published SHA-256.
 
 ## Known limitations
 
