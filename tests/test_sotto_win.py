@@ -429,8 +429,8 @@ class QuitAndUpdateTest(unittest.TestCase):
         self.assertEqual(presses, [False], "no recording starts once the update is under way")
 
     def test_update_quits_through_the_drain(self):
-        # A Retry chosen from History while the updater starts is not gated:
-        # the final quit still lets it finish.
+        # Work queued while the updater starts (a capture the gesture engine
+        # lost, ended now) still finishes: the final quit drains it.
         controller, jobs = self.controller(busy=False)
         clock, polls = self.drain_polls(controller, {jobs: 2.0})
 
@@ -491,6 +491,31 @@ class QuitAndUpdateTest(unittest.TestCase):
                     self.assertFalse(may_start, f"{refused}: the gate stays closed for Quit")
                 self.assertEqual(controller.lifecycle["closed"], "quitting", refused)
                 self.assertTrue(controller.shutdown.event.wait(5), f"{refused}: Quit still stops")
+
+    def test_retry_adds_no_work_to_a_drain(self):
+        # A History Retry ignored the closed gate: it queued a new
+        # transcription and lengthened the Restart, Update or Quit drain.
+        controller, jobs = self.controller(busy=True)
+        controller.current_speech_config = lambda: None
+        quit_chosen = threading.Event()
+
+        def on_sleep(now):
+            quit_chosen.wait(5)  # the drain holds until the Retry was tried
+            if jobs.unfinished_tasks:
+                jobs.get_nowait()
+                jobs.task_done()
+
+        self.virtual_clock(controller, on_sleep)
+        with mock.patch.object(sotto_win, "log"):
+            accepted = controller.retry("before")
+            self.assertEqual(jobs.unfinished_tasks, 2, "Retry works while the gate is open")
+            controller.quit()
+            refused = controller.retry("during")
+            self.assertEqual(jobs.unfinished_tasks, 2, "Retry adds no work to the drain")
+            quit_chosen.set()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertIn("Retrying", accepted)
+        self.assertIn("quitting", refused)
 
     def test_a_refused_or_failed_update_reopens_the_gate_but_not_a_restarts(self):
         busy, _jobs = self.controller(busy=True)

@@ -339,8 +339,7 @@ class TrayApp:
         now = time.time()
         items = [Item(history_label(entry, now), Menu(
             Item("Copy", self._act(controller.copy, entry["id"], done="Copied.")),
-            Item("Retry", self._act(controller.retry, entry["id"],
-                                    done="Retrying — the new text is copied when ready.")),
+            Item("Retry", self._act(controller.retry, entry["id"])),  # it says what it did
             Item("Correct…", self._dialog(self.correct_dialog, entry)),
             Item("Delete", self._act(controller.delete, entry["id"])),
         )) for entry in entries]

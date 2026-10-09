@@ -540,9 +540,18 @@ class Controller:
         if entry:
             win_inject.copy_text(entry["text"])
 
-    def retry(self, entry_id: str) -> None:
-        self.shutdown.enqueue(self.jobs, ("retry", entry_id, time.monotonic(), uuid.uuid4().hex,
-                                          self.current_speech_config()))
+    def retry(self, entry_id: str) -> str:
+        """Transcribe a History entry again; returns the tray's message.
+        Refused while a Restart, Update or Quit drains: new work would keep
+        it waiting.  Checked and queued under _lifecycle_lock, so a drain
+        that closes the gate afterwards sees this Retry as in flight."""
+        with self._lifecycle_lock:
+            closed = self.lifecycle["closed"]
+            if closed or self.shutdown.requested():
+                return f"Not retried: Sotto is {closed or 'stopping'}."
+            self.shutdown.enqueue(self.jobs, ("retry", entry_id, time.monotonic(),
+                                              uuid.uuid4().hex, self.current_speech_config()))
+        return "Retrying — the new text is copied when ready."
 
     def delete(self, entry_id: str) -> None:
         if not self.shutdown.requested():
