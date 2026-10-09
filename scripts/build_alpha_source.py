@@ -51,6 +51,7 @@ PUBLIC_TEST_FILES = (
     'tests/test_settings_window.py',
     'tests/test_progress.py',
     'tests/test_updates.py',
+    'tests/test_mlx_whisper_contract.py',
     'tests/test_voice_commands.py',
     'tests/test_get_installers.py',
     'tests/test_app_install.py',

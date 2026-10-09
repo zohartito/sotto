@@ -60,12 +60,27 @@ def _valid(key: str, value):
     return None
 
 
+_reported: set[str] = set()  # problems already logged this run (load() runs often)
+
+
+def _report_once(problem: str, message: str) -> None:
+    """Log a settings problem once per run; never the value itself."""
+    if problem not in _reported:
+        _reported.add(problem)
+        print(message, file=sys.stderr, flush=True)
+
+
 def load(path: Path | str = SETTINGS_PATH) -> dict:
-    """Defaults overlaid with every valid saved value; bad values are ignored."""
+    """Defaults overlaid with every valid saved value; bad values are ignored
+    and reported once in the log."""
     settings = {key: (list(value) if isinstance(value, list) else value) for key, value in DEFAULTS.items()}
     try:
         saved = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return settings
+    except (OSError, ValueError) as exc:
+        _report_once("unreadable", f"! settings.json could not be read ({type(exc).__name__}); "
+                                   "using the defaults")
         return settings
     if isinstance(saved, dict):
         for key in DEFAULTS:
@@ -73,6 +88,8 @@ def load(path: Path | str = SETTINGS_PATH) -> dict:
                 value = _valid(key, saved[key])
                 if value is not None:
                     settings[key] = value
+                else:
+                    _report_once(key, f"! settings: ignored an invalid value for {key}; using the default")
     return settings
 
 

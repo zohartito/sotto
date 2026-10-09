@@ -44,5 +44,37 @@ class SettingsTests(unittest.TestCase):
         self.assertNotIn("extra", loaded)
 
 
+class IgnoredValueReportTests(unittest.TestCase):
+    """An ignored setting is reported once in the log, never silently."""
+
+    def test_an_invalid_value_is_reported_once_per_setting(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text(json.dumps({"speed": "warp", "spacing": "smart"}), encoding="utf-8")
+            settings._reported.clear()
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                self.assertEqual(settings.load(path)["speed"], settings.DEFAULTS["speed"])
+                settings.load(path)
+            lines = errors.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("speed", lines[0])
+            self.assertNotIn("warp", lines[0])   # values are not logged
+
+    def test_an_unreadable_file_is_reported(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text("{not json", encoding="utf-8")
+            settings._reported.clear()
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                settings.load(path)
+            self.assertIn("could not be read", errors.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

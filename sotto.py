@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +57,7 @@ DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
+QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
 RESTART_RELEASE_WAIT_S = 2.0     # bounded wait for the async mic teardown before exec
 FAST_MARGIN_FRAMES = 500         # Fast: encode the speech plus 5 s, not a padded 30 s
 MODEL_REWARM_AFTER_S = 240.0
@@ -251,6 +253,7 @@ def parse_hotkey(spec: str) -> tuple[int, int] | None:
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+    keep_app_log_small()
 
 
 LAUNCHD_LABEL = "com.zohartito.sotto.app"  # must match launchd/ and scripts/rollout.sh
@@ -261,19 +264,43 @@ def app_mode() -> bool:
     return os.environ.get("SOTTO_LAUNCHER") == "app"
 
 
+_app_log: dict = {"path": None, "max_bytes": 0}  # set once logs are routed to a file
+
+
 def route_app_logs(data_dir: Path, max_bytes: int = 2_000_000) -> Path:
     """Sotto.app has no terminal: send stdout/stderr to a small rotating log.
     Logs hold counts and timings only, never what was said."""
     folder = data_dir / "logs"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = folder / "sotto.log"
+    _rotate_if_large(path, max_bytes)
+    _point_output_at(path)
+    _app_log.update(path=path, max_bytes=max_bytes)
+    return path
+
+
+def _rotate_if_large(path: Path, max_bytes: int) -> bool:
+    """Move a log past max_bytes to sotto.log.1 (replacing the older one)."""
     if path.exists() and path.stat().st_size > max_bytes:
         os.replace(path, path.with_suffix(".log.1"))
+        return True
+    return False
+
+
+def _point_output_at(path: Path) -> None:
+    """Send this process's stdout and stderr to the log file at path."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     for stream in (1, 2):
         os.dup2(descriptor, stream)
     os.close(descriptor)
-    return path
+
+
+def keep_app_log_small() -> None:
+    """Rotate a routed log that grew past its limit while Sotto runs; the old
+    file keeps the open descriptors, so point output at a fresh one."""
+    path = _app_log["path"]
+    if path is not None and _rotate_if_large(path, _app_log["max_bytes"]):
+        _point_output_at(path)
 
 
 def sotto_icon_path() -> Path | None:
@@ -534,14 +561,46 @@ def main_thread_dispatch(has_ui: bool, call_after):
     return ui_call, deliver_call
 
 
-def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep) -> None:
-    """Block the calling worker thread until busy() is False.
+def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep,
+                    deadline_s: float | None = None, clock=time.monotonic) -> bool:
+    """Block the calling worker thread until busy() is False, or until
+    deadline_s has passed. Returns whether it became idle.
 
-    Side effects: sleeps. Used before an update restart, because a restart
-    discards any recording or transcription still in progress.
+    Side effects: sleeps. Used before an update restart and Quit, because
+    shutdown discards any recording or transcription still in progress.
     """
+    give_up = None if deadline_s is None else clock() + deadline_s
     while busy():
+        if give_up is not None and clock() >= give_up:
+            return False
         sleep(poll_s)
+    return True
+
+
+INSTALL_TIMEOUT_S = 3600.0  # an engine download on a slow link, but never forever
+
+
+def run_installer(argv: list[str], *, run=subprocess.run) -> tuple[bool, str]:
+    """Run an optional-engine installer; (succeeded, its last output). Never
+    raises, so the caller always clears its "installing" state."""
+    try:
+        result = run(argv, capture_output=True, text=True, timeout=INSTALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {INSTALL_TIMEOUT_S / 60:.0f} minutes"
+    except OSError as exc:
+        return False, f"could not start ({exc.strerror or exc})"
+    return result.returncode == 0, (result.stderr or result.stdout).strip()[-200:]
+
+
+def desktop_audio_path(folder: Path, timestamp: float) -> Path:
+    """Where "Save audio to Desktop" writes a recording: named by the second
+    it was captured, with -2, -3, … so an earlier save is never overwritten."""
+    import datetime
+    stem = f"sotto-{datetime.datetime.fromtimestamp(timestamp):%Y%m%d-%H%M%S}"
+    candidate, number = folder / f"{stem}.wav", 2
+    while candidate.exists():
+        candidate, number = folder / f"{stem}-{number}.wav", number + 1
+    return candidate
 
 
 class CaptureGate:
@@ -3176,18 +3235,20 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             # every paste/commit, so nothing it produces is kept.
             transcription_thread.join(APP_DRAIN_TIMEOUT)
             drained = not transcription_thread.is_alive()
-        if not drained and restart.foreground_pending:
+        if not drained:
             if restart_drain["deadline"] is None:
                 restart_drain["deadline"] = time.monotonic() + RESTART_DRAIN_DEADLINE_S
             if time.monotonic() < restart_drain["deadline"]:
                 AppHelper.callLater(0.1, stop_runtime_on_main)
                 return
+            if not restart.foreground_pending:
+                # A wedged native call must not hang Quit forever, and freeing
+                # the native engine underneath it could crash: leave directly.
+                log("! transcription did not finish in time — quitting anyway")
+                os._exit(0)
             # exec replaces the whole image, so a wedged native call cannot
             # follow it; waiting forever would strand the user instead.
             log("! transcription did not finish in time — restarting anyway")
-        elif not drained:
-            AppHelper.callLater(0.1, stop_runtime_on_main)
-            return
         if nemotron is not None and drained:
             # Cocoa terminate exits without unwinding run()'s finally block.
             # Free native streams/model before Metal's global destructors run.
@@ -3289,17 +3350,13 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
         def action_save(entry_id: str) -> None:
             def work() -> None:
-                import datetime
-                import shutil
-                from pathlib import Path
                 try:
                     entry = store.get(entry_id)
                     if not entry:
                         return
-                    stamp = datetime.datetime.fromtimestamp(
-                        entry["ts"]).strftime("%Y%m%d-%H%M")
-                    shutil.copy(store.audio_path(entry_id),
-                                Path.home() / "Desktop" / f"sotto-{stamp}.wav")
+                    target = desktop_audio_path(Path.home() / "Desktop", entry["ts"])
+                    shutil.copy(store.audio_path(entry_id), target)
+                    log(f"✓ saved audio to Desktop as {target.name}")
                 except FileNotFoundError:
                     log("! audio missing for that entry")
                     ui_call(status_ui.show_error, "Could not save audio",
@@ -3468,6 +3525,23 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             except Exception as exc:
                 failed(str(exc))
 
+        def action_quit() -> None:
+            """Quit once the dictation in progress is done, waiting at most
+            QUIT_DRAIN_S. Side effects: refuses new recordings, ends a
+            hands-free recording as if tapped, then requests shutdown."""
+            if shutdown.requested():
+                return
+            capture_gate.close()
+            if engine.force_finish():
+                log("● finishing the recording before quitting")
+
+            def work() -> None:
+                if not wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0,
+                                       deadline_s=QUIT_DRAIN_S):
+                    log(f"! dictation still running after {QUIT_DRAIN_S:.0f}s — quitting anyway")
+                shutdown.request()
+            threading.Thread(target=work, daemon=True).start()
+
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
         class SettingsModel:
@@ -3549,22 +3623,22 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             settings_view["installing"] = True
 
             def work() -> None:
-                import subprocess
                 script = Path(__file__).resolve().parent / "scripts" / "setup_nemotron.py"
                 log("● installing Nemotron (about 700 MB) ...")
-                result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
-                settings_view["installing"] = False
+                try:
+                    ok, detail = run_installer([sys.executable, str(script)])
+                finally:
+                    settings_view["installing"] = False
                 refresh_history()
                 if settings_view["controller"] is not None:
                     ui_call(settings_view["controller"].refresh)
-                if result.returncode == 0:
+                if ok:
                     log("✓ Nemotron installed")
                     ui_call(status_ui.show_info, "Nemotron installed",
                             "Choose Speech engine → Nemotron (English streaming) to use it.")
                 else:
-                    log(f"! Nemotron install failed ({result.returncode})")
-                    ui_call(status_ui.show_error, "Could not install Nemotron",
-                            (result.stderr or result.stdout).strip()[-200:])
+                    log(f"! Nemotron install failed ({detail[:80]})")
+                    ui_call(status_ui.show_error, "Could not install Nemotron", detail)
             threading.Thread(target=work, daemon=True).start()
 
         def install_parakeet_in_background() -> None:
@@ -3576,22 +3650,22 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             settings_view["parakeet_installing"] = True
 
             def work() -> None:
-                import subprocess
                 log("● downloading Parakeet (about 2.5 GB) ...")
-                result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "setup",
-                                         "--profile", "parakeet"], capture_output=True, text=True)
-                settings_view["parakeet_installing"] = False
+                try:
+                    ok, detail = run_installer([sys.executable, str(Path(__file__).resolve()),
+                                                "setup", "--profile", "parakeet"])
+                finally:
+                    settings_view["parakeet_installing"] = False
                 refresh_history()
                 if settings_view["controller"] is not None:
                     ui_call(settings_view["controller"].refresh)
-                if result.returncode == 0:
+                if ok:
                     log("✓ Parakeet downloaded")
                     ui_call(status_ui.show_info, "Parakeet downloaded",
                             "Choose Speech engine → Parakeet to use it.")
                 else:
-                    log(f"! Parakeet download failed ({result.returncode})")
-                    ui_call(status_ui.show_error, "Could not download Parakeet",
-                            (result.stdout or result.stderr).strip()[-200:])
+                    log(f"! Parakeet download failed ({detail[:80]})")
+                    ui_call(status_ui.show_error, "Could not download Parakeet", detail)
             threading.Thread(target=work, daemon=True).start()
 
         def action_open_settings() -> None:
@@ -3668,7 +3742,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             threading.Thread(target=work, daemon=True).start()
 
         status_ui.set_history_callbacks({
-            "quit": shutdown.request,
+            "quit": action_quit,
             "restart": only_while_running(action_restart),
             "copy": only_while_running(action_copy), "retry": only_while_running(action_retry),
             "save": only_while_running(action_save), "delete": only_while_running(action_delete),

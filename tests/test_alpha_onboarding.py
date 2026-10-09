@@ -320,8 +320,108 @@ class UpdateRestartTests(unittest.TestCase):
 
     def test_returns_at_once_when_already_idle(self):
         sleeps = []
-        sotto.wait_until_idle(lambda: False, sleep=sleeps.append)
+        self.assertTrue(sotto.wait_until_idle(lambda: False, sleep=sleeps.append))
         self.assertEqual(sleeps, [])
+
+    def test_quit_waits_at_most_its_deadline(self):
+        # Quit finishes the dictation in progress, but never waits forever.
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+        reached = sotto.wait_until_idle(lambda: True, poll_s=0.5, sleep=sleep,
+                                        deadline_s=sotto.QUIT_DRAIN_S, clock=lambda: clock[0])
+        self.assertFalse(reached)
+        self.assertEqual(clock[0], sotto.QUIT_DRAIN_S)
+        self.assertEqual(sotto.QUIT_DRAIN_S, 10.0)
+
+
+class EngineInstallerTests(unittest.TestCase):
+    """An engine download that fails to start or hangs reports it; it never raises."""
+
+    def test_success_failure_launch_error_and_timeout(self):
+        def finished(code, out="", err=""):
+            return lambda argv, **kwargs: subprocess.CompletedProcess(argv, code, out, err)
+
+        self.assertEqual(sotto.run_installer(["x"], run=finished(0, "done\n")), (True, "done"))
+        self.assertEqual(sotto.run_installer(["x"], run=finished(1, "", "boom\n")), (False, "boom"))
+
+        def cannot_start(argv, **kwargs):
+            raise OSError(35, "Resource temporarily unavailable")
+        ok, detail = sotto.run_installer(["x"], run=cannot_start)
+        self.assertFalse(ok)
+        self.assertIn("could not start", detail)
+
+        def hangs(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], sotto.INSTALL_TIMEOUT_S)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        ok, detail = sotto.run_installer(["x"], run=hangs)
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'AppKit menu bar')
+class TapWarningTests(unittest.TestCase):
+    """A deaf hotkey's ⚠ stays in the menu bar until the tap recovers."""
+
+    def test_hiding_the_pill_keeps_the_warning(self):
+        import ui
+        titles = []
+        status = ui.StatusUI.__new__(ui.StatusUI)
+        status._mode, status._hint, status._live_text = "idle", None, ""
+        status._indicator_state, status._visibility_generation, status._level_timer = "idle", 0, None
+        status._status = types.SimpleNamespace(button=lambda: types.SimpleNamespace(setTitle_=titles.append))
+        status._orb = Mock()
+        status._panel = Mock()
+        status.set_tap_health(False)
+        status.hide()
+        self.assertEqual(titles[-1], "⚠")
+        status.set_tap_health(True)
+        status.hide()
+        self.assertEqual(titles[-1], "◦")
+
+
+class AppLogRotationTests(unittest.TestCase):
+    """The app's log is rotated while Sotto runs, not only at launch."""
+
+    def test_a_log_that_grows_past_its_limit_is_rotated_and_reopened(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sotto.log"
+            path.write_text("x" * 50)
+            reopened = []
+            with patch.object(sotto, "_point_output_at", reopened.append), \
+                    patch.dict(sotto._app_log, {"path": path, "max_bytes": 100}):
+                sotto.keep_app_log_small()
+                self.assertEqual(reopened, [])           # under the limit: untouched
+                path.write_text("x" * 150)
+                sotto.keep_app_log_small()
+            self.assertEqual(reopened, [path])
+            self.assertEqual(path.with_suffix(".log.1").read_text(), "x" * 150)
+            self.assertFalse(path.exists())             # the reopen creates the fresh file
+
+    def test_nothing_happens_when_logs_are_not_routed(self):
+        with patch.object(sotto, "_point_output_at") as reopen, \
+                patch.dict(sotto._app_log, {"path": None, "max_bytes": 100}):
+            sotto.keep_app_log_small()
+        reopen.assert_not_called()
+
+
+class SaveAudioNameTests(unittest.TestCase):
+    """Save audio to Desktop never overwrites an earlier save."""
+
+    def test_names_carry_seconds_and_never_reuse_a_file(self):
+        import datetime
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            moment = datetime.datetime(2026, 10, 9, 1, 53, 7).timestamp()
+            first = sotto.desktop_audio_path(desktop, moment)
+            self.assertEqual(first.name, "sotto-20261009-015307.wav")
+            first.write_bytes(b"one")
+            second = sotto.desktop_audio_path(desktop, moment)
+            self.assertEqual(second.name, "sotto-20261009-015307-2.wav")
+            second.write_bytes(b"two")
+            self.assertEqual(sotto.desktop_audio_path(desktop, moment + 20).name, "sotto-20261009-015327.wav")
+            self.assertEqual(sotto.desktop_audio_path(desktop, moment).name, "sotto-20261009-015307-3.wav")
 
 
 class LiveWordsTests(unittest.TestCase):
