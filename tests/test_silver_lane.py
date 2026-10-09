@@ -1605,6 +1605,29 @@ class SilverLaneTests(unittest.TestCase):
         self.assertEqual([item["history_revision"] for item in LearningStore(self.root).active_for_history(row["id"])],
                          [corrected["revision"]])
 
+    def test_a_later_correction_without_consent_clears_a_stale_pending_enrollment(self):
+        # Consent belongs to the text it was given for: a correction made with
+        # auto-enroll off must not let an earlier failed enrollment's marker
+        # enroll the new text, now or after the worker's recovery.
+        from learning import LearningStore
+        row=self.live(); store=SilverStore(self.root)
+        with mock.patch.object(LearningCoordinator,"enroll",side_effect=OSError(5,"I/O error")):
+            first=self.coordinator.correct(row["id"],"first",expected_revision=row["revision"],auto_enroll=True)
+        self.assertEqual([item["history_id"] for item in LearningStore(self.root).pending_gold()],[row["id"]])
+        for mutate in ("correct","correct_as_is","no_speech"):
+            with self.subTest(mutate=mutate):
+                if mutate=="correct":
+                    self.coordinator.correct(row["id"],"second",auto_enroll=False)
+                else:
+                    getattr(self.coordinator,mutate)(row["id"],auto_enroll=False)
+                self.assertEqual(LearningStore(self.root).pending_gold(),[])
+                worker=AdaptiveWorker(self.root,history=HistoryStore(self.root),silver=store,teachers=_Teachers())
+                worker.recover_markers()
+                retried=LearningCoordinator(HistoryStore(self.root),base_dir=self.root)
+                self.assertEqual(retried.retry_pending_gold(),0)
+                self.assertEqual(LearningStore(self.root).active_for_history(row["id"]),[])
+                self.coordinator.learning.mark_pending_gold(row["id"],"enrollment_conflict")  # stale again
+
     def test_interrupted_correction_recovery_revokes_old_revision_sample_and_pending_enrollment(self):
         from learning import LearningStore
         row=self.live(); store=SilverStore(self.root)
