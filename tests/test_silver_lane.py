@@ -1549,6 +1549,24 @@ class SilverLaneTests(unittest.TestCase):
         self.assertEqual(current["text"],"new retry")
         self.assertTrue(audio.exists())
 
+    def test_delete_still_revokes_existing_silver_evidence_for_the_row(self):
+        row=self.live(); store=SilverStore(self.root)
+        job_args=dict(history_id=row["id"],history_revision=row["revision"],audio_sha256=row["audio"]["inference"]["sha256"],
+                      teacher_family_hash=family_hash(),consensus_policy_hash=policy_hash(),receipt_hash="frozen-receipt")
+        key=store.enqueue(**job_args); self.assertIsNotNone(key)
+        job=store.claim("owner"); self.assertIsNotNone(job)
+        self.assertTrue(store.finish(job,outcome="accepted",reference="candidate",vote_digest="vote"))
+        AdaptiveLearning(self.root).revoke(row["id"],reason="history_deleted")  # sotto.nonadaptive_delete order
+        self.assertTrue(self.coordinator.delete(row["id"]))
+        self.assertIsNone(self.history.get(row["id"]))
+        with store._connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM jobs WHERE job_key=?",(key,)).fetchone(),("discarded",))
+            self.assertEqual(db.execute("SELECT state,reference FROM labels WHERE job_key=?",(key,)).fetchone(),("revoked",None))
+            self.assertIsNotNone(db.execute("SELECT 1 FROM history_tombstones WHERE history_id=? AND history_revision=?",
+                                            (row["id"],row["revision"])).fetchone())
+        self.assertIsNone(store.enqueue(**job_args))
+        self.assertEqual([(item["history_id"],item["operation"]) for item in store.scrub_pending()["intents"]],[(row["id"],"delete")])
+
     def test_worker_recovers_schema2_delete_intent_before_selective_scrub_ack(self):
         from adaptive_learning import AdaptiveLearning
         from learning import LearningStore
