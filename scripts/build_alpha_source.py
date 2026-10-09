@@ -48,6 +48,7 @@ PUBLIC_TEST_FILES = (
     'tests/test_dictionary.py',
     'tests/test_settings.py',
     'tests/test_insertion.py',
+    'tests/test_delivery.py',
     'tests/test_settings_window.py',
     'tests/test_progress.py',
     'tests/test_updates.py',
