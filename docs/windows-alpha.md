@@ -59,7 +59,12 @@ Silero VAD v6.2 voice detection (2.3 MB, SHA-256 checked) with
 `sotto_win.py setup` (`-SkipSetup` leaves the model to the first launch), and
 adds a Start Menu shortcut **Sotto** that starts the tray app without a
 console window, with that data folder applied. No admin rights, services or
-scheduled tasks. Running it again is safe and updates the environment.
+scheduled tasks. Running it again is safe and updates the environment; it
+keeps the CPU or CUDA set recorded at install (`-Cpu` / `-Cuda` switch it). It
+stops without changing anything while Sotto runs from that environment (quit
+Sotto first), and when the Start Menu already has a **Sotto** shortcut that
+starts another copy (remove that copy with its own `-Uninstall`, or pass
+`-ShortcutDir`); a shortcut to a copy that no longer exists is replaced.
 
 Then start **Sotto** from the Start Menu. A tray icon appears (grey while the
 model warms up); a "Ready — hold Right Ctrl to dictate" notification says when
@@ -140,8 +145,13 @@ microphone never reaches the model, and empty, no-speech or looping output is
 kept in History instead (a clean prefix before a repetition loop is kept).
 History is written before anything is inserted. Insertions happen one at a
 time, in order, and wait while any Shift, Ctrl, Alt or Windows key is held, so
-the text cannot combine with a modifier; if one stays down for 2 minutes the
-text is kept in History instead.
+the text cannot combine with a modifier; a text not inserted within 2 minutes of
+being ready (counted for each text, however many wait in line) is kept in
+History instead.
+
+If the speech model itself fails on a dictation (for example CUDA runs out of
+memory), the recording is kept in History as **[transcription failed]** and a
+notification says so; **History → Retry** transcribes that audio again.
 
 ## Tray menu
 
@@ -156,8 +166,15 @@ Right-click the tray icon (left-click opens Settings):
 - **Speed** — Accurate or Fast; switching restarts Sotto once the current
   dictation is done.
 - **Progress** — see below. **Dictionary** — opens your dictionary in Notepad.
-- **Settings…**, **Restart** (finishes a dictation in flight first and ignores
-  new presses meanwhile), **Quit**.
+- **Settings…**, **Restart** (finishes a dictation in flight first, however
+  long the model takes, and ignores new presses meanwhile), **Quit**.
+- **Check for updates…** — compares this git copy with GitHub. **Update**
+  waits for Sotto to quit, installs the new version's pinned packages (the CPU
+  or CUDA set recorded at install) before it switches the source, and puts the
+  previous packages back if that fails, so the source never runs on the wrong
+  packages. Sotto starts again either way, and the tray then says whether the
+  update worked; the details are in `update.log` in the data folder. The
+  one-line `get.ps1` refuses to update a copy while Sotto runs from it.
 
 Opening the tray menu takes the focus away from the app you were dictating
 into, so a dictation finished with **Finish dictation** is copied to the
@@ -403,8 +420,10 @@ History copies are separate.
 - **"Sotto is already running":** another Sotto (tray or console) is running
   in this Windows sign-in; quit it from its tray menu or its console.
 - **`✗ microphone`:** pick a default input in **Settings → System → Sound**
-  and check the microphone privacy switch for desktop apps. `! mic open failed`
-  in the log usually means another app holds the device exclusively.
+  and check the microphone privacy switch for desktop apps. Sotto records from
+  the Windows default input through PortAudio's default host API (MME), which
+  converts to 16 kHz. `! mic open failed` in the log usually means another app
+  holds the device exclusively.
 - **`! cuda (float16) unavailable … falling back to CPU`:** expected on a
   CPU-only install. For the GPU, run the installer with `-Cuda` (or install
   `requirements-alpha-windows-cuda.txt`) and update the NVIDIA driver;

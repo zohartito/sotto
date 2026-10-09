@@ -6,6 +6,7 @@ stream exists — the mic must never be left open).
 """
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 import threading
 import time
@@ -15,6 +16,8 @@ import numpy as np
 
 if sys.platform == "win32":
     import win_capture
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only module")
@@ -57,6 +60,13 @@ class WinCaptureTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail("stream never opened")
 
+    def _wait_closed(self, stream) -> None:
+        for _ in range(500):  # up to 5 s: streams close on their own thread
+            if stream.closed:
+                return
+            time.sleep(0.01)
+        self.fail("stream was never closed")
+
     def _feed(self, values: list[float]) -> None:
         block = np.array([[v] for v in values], dtype=np.float32)
         self.factory.callback(block, len(block), None, None)
@@ -68,7 +78,7 @@ class WinCaptureTest(unittest.TestCase):
         self._feed([0.1, 0.2])
         self.assertFalse(self.capture.is_waking())
         samples = self.capture.end()
-        self.assertTrue(stream.closed)
+        self._wait_closed(stream)
         self.assertFalse(self.capture.is_active())
         self.assertEqual(samples.dtype, np.float32)
         self.assertEqual(list(samples), [0.1, 0.2])
@@ -135,7 +145,88 @@ class WinCaptureTest(unittest.TestCase):
         callbacks[0](np.array([[0.9]], dtype=np.float32), 1, None, None)
         callbacks[1](np.array([[0.1]], dtype=np.float32), 1, None, None)
         self.assertEqual(list(capture.end()), [np.float32(0.1)])
-        self.assertTrue(all(stream.closed for stream in streams))
+        wait_for(lambda: all(stream.closed for stream in streams))
+
+    def test_a_slow_stream_teardown_never_holds_up_end_or_abort(self) -> None:
+        # [F32] end()/abort() run on the keyboard-hook thread; a Bluetooth or
+        # driver stop() that takes 0.4 s must happen elsewhere.
+        class SlowStream(WinCaptureTest.FakeStream):
+            def stop(self) -> None:
+                time.sleep(0.4)
+
+        streams: list = []
+
+        def factory(**kwargs):
+            streams.append(SlowStream())
+            factory.callback = kwargs["callback"]
+            return streams[-1]
+
+        capture = win_capture.WinCapture(stream_factory=factory)
+        for finish in (capture.end, capture.abort):
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s; the second open waits for the first close
+                if streams and capture._stream is streams[-1]:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("stream never opened")
+            stream = streams[-1]
+            factory.callback(np.array([[0.3]], dtype=np.float32), 1, None, None)
+            started = time.monotonic()
+            result = finish()
+            self.assertLess(time.monotonic() - started, 0.1, f"{finish.__name__} waited for stop()")
+            if finish == capture.end:
+                self.assertEqual(list(result), [np.float32(0.3)])
+            self.assertFalse(capture.is_active())
+            self._wait_closed(stream)
+        capture.shutdown()
+
+    def test_no_second_stream_opens_while_the_last_one_is_still_closing(self) -> None:
+        # [PR15 review] A driver whose stop() outlasts the close wait used to
+        # let join(timeout) return and the next open run anyway: two streams on
+        # the mic.  The start must fail cleanly instead, and work once closed.
+        release = threading.Event()
+
+        class StuckStream(WinCaptureTest.FakeStream):
+            def stop(self) -> None:
+                release.wait(10)
+
+        streams: list = []
+        logs: list[str] = []
+
+        def factory(**kwargs):
+            streams.append(StuckStream() if not streams else WinCaptureTest.FakeStream())
+            return streams[-1]
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=logs.append)
+        capture._close_wait_s = 0.2
+        try:
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s
+                if capture._stream is not None:
+                    break
+                time.sleep(0.01)
+            capture.end()  # the stuck stop() now holds the closing thread
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s: the start fails, or (the defect) a 2nd stream opens
+                if not capture.is_active() or len(streams) > 1:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(streams), 1, "a second stream opened while the first was closing")
+            self.assertFalse(capture.is_active())
+            self.assertFalse(capture.is_waking())
+            self.assertTrue(any("still closing" in line for line in logs), logs)
+        finally:
+            release.set()
+        self._wait_closed(streams[0])
+        self.assertTrue(capture.begin())  # the closed mic opens normally again
+        for _ in range(500):  # up to 5 s
+            if capture._stream is not None:
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(streams), 2)
+        capture.end()
+        self._wait_closed(streams[1])
 
     def test_abort_discards_frames(self) -> None:
         self.capture.begin()
@@ -161,3 +252,17 @@ class WinCaptureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostApiDocsTest(unittest.TestCase):
+    """[F39] The stream opens PortAudio's default input, which is MME on
+    Windows; the docs used to call it WASAPI."""
+
+    def test_the_docs_name_the_host_api_the_stream_really_uses(self) -> None:
+        source = (ROOT / "win_capture.py").read_text(encoding="utf-8")
+        opened = source.split("self._stream_factory(", 1)[1].split(")", 1)[0]
+        self.assertNotIn("device", opened, "no device or host API is chosen: PortAudio's default")
+        self.assertIn("MME", source.split('"""', 2)[1])
+        for name in ("win_capture.py", "sotto_win.py", "AGENTS.md", "docs/windows-alpha.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"WASAPI (stream|capture)", name)

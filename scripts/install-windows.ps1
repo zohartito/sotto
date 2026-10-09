@@ -5,7 +5,8 @@
 .DESCRIPTION
   Checks for Windows x64 and Python 3.13 (64-bit), creates venv-alpha in this
   folder, installs the pinned CPU or CUDA dependency set (CUDA when
-  nvidia-smi sees a GPU; -Cpu / -Cuda override), prepares the alpha data
+  nvidia-smi sees a GPU; a re-run or update keeps the set recorded at
+  install; -Cpu / -Cuda override), prepares the alpha data
   folder, downloads the pinned speech model and voice detection into it
   (sotto_win.py setup; -SkipSetup leaves that to the first launch), and adds a
   Start Menu shortcut "Sotto" that starts the tray app without a console
@@ -13,9 +14,15 @@
 
   Nothing is installed system-wide: no admin rights, services or scheduled
   tasks. Python itself is never installed for you; the script says exactly
-  what to install instead. Re-running is safe. -Uninstall removes only what
+  what to install instead. Re-running is safe. It refuses to run while Sotto
+  runs from this environment (Windows would swap its packages underneath it)
+  and never replaces a Start Menu "Sotto" shortcut that starts another copy.
+  -Uninstall removes only what
   this script recorded creating (and the login entry the Settings window may
   have added); your data folder stays unless you add -RemoveData.
+  -CheckOnly runs only the running-Sotto and shortcut checks, for the copy in -SourceDir
+  (default: this one), and changes nothing; get.ps1 asks the update's
+  installer this before it moves an existing copy's source.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
@@ -35,6 +42,8 @@ param(
   [switch]$SkipSetup,
   [switch]$Uninstall,
   [switch]$RemoveData,
+  [switch]$CheckOnly,
+  [string]$SourceDir = '',
   # Tests point this at a throwaway key; the default is the per-user login list.
   [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 )
@@ -43,6 +52,10 @@ Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
+if ($SourceDir) {
+  if (-not $CheckOnly) { Write-Host 'X -SourceDir goes with -CheckOnly.' -ForegroundColor Red; exit 1 }
+  $Root = [IO.Path]::GetFullPath($SourceDir)
+}
 $Launcher = Join-Path $Root 'win_launch.py'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'sotto-alpha' }
 if (-not $VenvDir) { $VenvDir = Join-Path $Root 'venv-alpha' }
@@ -148,6 +161,23 @@ if ($Uninstall) {
 
 # ---------------------------------------------------------------- checks
 if ($Cpu -and $Cuda) { Fail 'Choose at most one of -Cpu and -Cuda.' }
+$running = @(Running-From-Venv)
+if ($running.Count -gt 0) {
+  Fail "Sotto is still running from $VenvDir (process $($running[0].Id)); installing now would replace its packages while they are in use. Quit it from its tray menu (or update it there with Check for updates), then run this again."
+}
+# Never take over a Start Menu entry that starts another copy of Sotto (or
+# another program). One whose copy no longer exists is replaced.
+if (Test-Path -LiteralPath $Shortcut -PathType Leaf) {
+  $existing = (New-Object -ComObject WScript.Shell).CreateShortcut($Shortcut)
+  if (-not (Points-Here $existing.Arguments)) {
+    $gone = ($existing.Arguments -match '^\s*"([^"]*win_launch\.py)"') -and -not (Test-Path -LiteralPath $Matches[1])
+    if (-not $gone) {
+      Fail "$Shortcut already starts another copy of Sotto or another program ($($existing.TargetPath) $($existing.Arguments)). Remove that copy with its own install-windows.ps1 -Uninstall, or pass -ShortcutDir with another folder."
+    }
+    Say "! $Shortcut started a copy of Sotto that no longer exists; it will start this one"
+  }
+}
+if ($CheckOnly) { Say "OK nothing stops installing Sotto in $Root"; exit 0 }
 $arch = $env:PROCESSOR_ARCHITEW6432
 if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
 if (-not [Environment]::Is64BitOperatingSystem -or $arch -ne 'AMD64') {
@@ -183,8 +213,14 @@ if ($LASTEXITCODE -ne 0) {
   Say "! This Python has no tkinter: the tray works, but Settings and Correct need it. Re-run the python.org installer, choose Modify, tick 'tcl/tk and IDLE'."
 }
 
+$record = Read-Manifest
+$recorded = ''
+if ($record -and $record.PSObject.Properties['flavor'] -and @('cpu', 'cuda') -contains $record.flavor) {
+  $recorded = $record.flavor
+}
 if ($Cuda) { $flavor = 'cuda'; $why = '-Cuda' }
 elseif ($Cpu) { $flavor = 'cpu'; $why = '-Cpu' }
+elseif ($recorded) { $flavor = $recorded; $why = 'recorded at install; -Cpu or -Cuda changes it' }
 else {
   $flavor = 'cpu'; $why = 'no NVIDIA GPU found'
   if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
@@ -197,7 +233,6 @@ else { $Requirements = Join-Path $Root 'requirements-alpha-windows.txt' }
 Say "OK dependency set: $flavor ($why)"
 
 # ---------------------------------------------------------------- install
-$record = Read-Manifest
 $createdVenv = [bool]($record -and $record.created_venv)
 $createdData = [bool]($record -and $record.created_data -and $record.data_dir -eq $DataDir)
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'

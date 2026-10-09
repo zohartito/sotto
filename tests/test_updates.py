@@ -151,6 +151,23 @@ class ApplyMacTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows tray updater")
 class WindowsUpdateTests(unittest.TestCase):
+    def test_git_never_opens_a_console_window(self):
+        # [F37] The tray runs under pythonw; each git call used to flash a console.
+        kwargs_seen = []
+        fake = FakeGit(counts="0 2")
+
+        def run(argv, **kwargs):
+            kwargs_seen.append(kwargs)
+            return fake(argv, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / ".git").mkdir()
+            self.assertEqual(updates.check(Path(temporary), offline=False, run=run,
+                                           which=lambda name: "git").state, "available")
+        self.assertEqual(len(kwargs_seen), 6)
+        for kwargs in kwargs_seen:
+            self.assertTrue(kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW, kwargs)
+
     def test_hand_off_waits_for_quiet_and_reports_once(self):
         import queue
         import sotto

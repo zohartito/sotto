@@ -21,6 +21,20 @@ def bare_copy_of_this_checkout(folder: Path) -> Path:
     return remote
 
 
+def windows_get_script(folder: Path) -> tuple[Path, Path]:
+    """A copy of get.ps1 whose Start Menu folder is a temporary one, so a
+    test never reads or starts the real "Sotto" entry."""
+    menu = folder / "menu"
+    menu.mkdir()
+    text = (ROOT / "scripts" / "get.ps1").read_text(encoding="utf-8")
+    text = text.replace("[Environment]::GetFolderPath('Programs')", f"'{menu}'")
+    if "GetFolderPath" in text or f"'{menu}'" not in text:
+        raise AssertionError("refusing to run get.ps1: its Start Menu folder could not be redirected")
+    script = folder / "get.ps1"
+    script.write_text(text, encoding="utf-8")
+    return script, menu
+
+
 class ScriptShapeTests(unittest.TestCase):
     def test_mac_script_parses_runs_from_main_and_is_executable(self):
         script = ROOT / "scripts" / "get.sh"
@@ -115,7 +129,7 @@ class WindowsInstallerTests(unittest.TestCase):
             env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)), SOTTO_SOURCE=str(dest),
                        SOTTO_GET_DRY_RUN="1")
             command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                       str(ROOT / "scripts" / "get.ps1")]
+                       str(windows_get_script(folder)[0])]
             first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
             self.assertIn("would run", first.stdout, first.stderr)
             self.assertTrue((dest / "scripts" / "install-windows.ps1").is_file())
@@ -133,10 +147,82 @@ class WindowsInstallerTests(unittest.TestCase):
             env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)), SOTTO_SOURCE=str(dest),
                        SOTTO_GET_DRY_RUN="1")
             command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                       str(ROOT / "scripts" / "get.ps1")]
+                       str(windows_get_script(folder)[0])]
             refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
             self.assertIn("not Sotto", refused.stdout, refused.stderr)
             self.assertNotIn("would run", refused.stdout)
+
+    def test_an_update_refuses_while_sotto_runs_from_the_copy(self):
+        # [F33] get.ps1 pulled and reinstalled under a running Sotto.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            dest = folder / "sotto"
+            env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)), SOTTO_SOURCE=str(dest),
+                       SOTTO_GET_DRY_RUN="1")
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                       str(windows_get_script(folder)[0])]
+            first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("would run", first.stdout, first.stderr)
+            scripts = dest / "venv-alpha" / "Scripts"  # gitignored, like the installer's venv
+            scripts.mkdir(parents=True)
+            stand_in = scripts / "ping.exe"  # any program running from the copy, like pythonw
+            shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stand_in)
+            running = subprocess.Popen([str(stand_in), "-n", "60", "127.0.0.1"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            finally:
+                running.kill()
+                running.wait(10)
+            self.assertIn("Sotto is running from", refused.stdout, refused.stderr)
+            self.assertNotIn("Updating Sotto", refused.stdout)
+            self.assertNotIn("would run", refused.stdout)
+
+
+    def test_an_update_its_installer_would_refuse_leaves_the_copy_unchanged(self):
+        # [PR15 review] get.ps1 pulled first; the installer's [F11] refusal
+        # (the Start Menu entry starts another copy) then left this copy's new
+        # source on its old packages.
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            dest = folder / "sotto"
+            remote = bare_copy_of_this_checkout(folder)
+            script, menu = windows_get_script(folder)
+            env = dict(os.environ, SOTTO_REPO=str(remote), SOTTO_SOURCE=str(dest), SOTTO_GET_DRY_RUN="1")
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+            first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("would run", first.stdout, first.stderr)
+
+            def git(cwd: Path, *args: str) -> str:
+                return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                       *args], cwd=cwd, check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            upstream = folder / "upstream"
+            git(folder, "clone", "--quiet", str(remote), str(upstream))
+            (upstream / "CHANGES.txt").write_text("new version\n", encoding="utf-8")
+            git(upstream, "add", "CHANGES.txt")
+            git(upstream, "commit", "--quiet", "-m", "new version")
+            git(upstream, "push", "--quiet", "origin", "HEAD:main")
+            newer = git(upstream, "rev-parse", "HEAD")
+            before = git(dest, "rev-parse", "HEAD")
+            other = folder / "other-copy"
+            other.mkdir()
+            (other / "win_launch.py").write_text("", encoding="utf-8")
+            link = menu / "Sotto.lnk"
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{link}'); "
+                            f"$s.TargetPath = '{sys.executable}'; "
+                            f"$s.Arguments = '\"{other / 'win_launch.py'}\" --data-dir \"C:\\other-data\"'; "
+                            "$s.Save()"], check=True, capture_output=True, timeout=60)
+            refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(git(dest, "rev-parse", "HEAD"), before, "the source did not move")
+            self.assertIn("already starts another copy of Sotto", refused.stdout, refused.stderr)
+            self.assertNotIn("would run", refused.stdout)
+            link.unlink()  # without the other copy's entry the update goes ahead
+            again = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("would run", again.stdout, again.stderr)
+            self.assertEqual(git(dest, "rev-parse", "HEAD"), newer)
 
 
 if __name__ == "__main__":

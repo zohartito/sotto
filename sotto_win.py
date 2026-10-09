@@ -5,7 +5,7 @@ Same pipeline as sotto.py — the pure logic (GestureEngine, VAD, hallucination
 guards, history/learning stores, dictionary, settings) is imported and shared —
 with Windows I/O:
   * trigger   pynput low-level keyboard hook (win_hotkey)
-  * capture   one fresh WASAPI stream per capture (win_capture / sounddevice)
+  * capture   one fresh stream per capture on the default input, MME (win_capture)
   * ASR       faster-whisper / CTranslate2: CUDA float16, else CPU int8 (win_asr)
   * insert    paste (clipboard restored) or type (SendInput Unicode) (win_inject)
   * tray      system-tray menu, Settings and History dialogs (win_ui, --tray)
@@ -26,6 +26,7 @@ counts, never dictated text.
 from __future__ import annotations
 
 import argparse
+import atexit
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass, field
@@ -61,6 +62,11 @@ from history import HistoryStore
 from learning import LearningCoordinator, LearningStore
 
 INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History only
+# Restart waits this long for the dictation in flight: a long CPU dictation
+# finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
+RESTART_DRAIN_CAP_S = 300.0
+DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
+TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
 
@@ -70,6 +76,11 @@ class _ConsoleLog:
     sotto.log() prints to sys.stderr; teeing it here gives a durable log.
     Under pythonw there is no console (sys.stderr is None): file only.  It
     holds timings and character counts, never transcript text.
+
+    Callers only queue the text; one writer thread does the console and file
+    I/O.  Gesture callbacks log on the keyboard-hook thread, and Windows
+    silently drops a low-level hook that is slow to return, so a log line must
+    never wait for the disk there.  drain() (also at exit) writes what is left.
     """
 
     def __init__(self) -> None:
@@ -83,25 +94,58 @@ class _ConsoleLog:
             self._file = open(path, "a", encoding="utf-8", buffering=1)
         except OSError:
             pass  # console-only rather than crash on a read-only profile
+        self._pending: queue.SimpleQueue = queue.SimpleQueue()
+        self._draining = False
+        self._writer = threading.Thread(target=self._write_pending, daemon=True,
+                                        name="sotto-log")
+        self._writer.start()
+        atexit.register(self.drain)
 
     def write(self, text: str) -> int:
-        if self._console is not None:
-            try:
-                self._console.write(text)
-            except (OSError, ValueError):
-                self._console = None  # the console went away
-        if self._file is not None:
-            self._file.write(text)
+        if self._draining:
+            self._emit(text)  # after drain(): nothing reads the queue any more
+        else:
+            self._pending.put(text)
         return len(text)
 
     def flush(self) -> None:
+        pass  # the writer flushes every line it writes
+
+    def drain(self, timeout: float = 2.0) -> None:
+        """Write every queued line, then write directly from now on.
+
+        Side effects: stops the writer thread.
+        """
+        if self._draining:
+            return
+        self._pending.put(None)
+        self._writer.join(timeout)
+        self._draining = True
+        while True:  # a line queued behind the stop marker is written, never dropped
+            try:
+                text = self._pending.get_nowait()
+            except queue.Empty:
+                return
+            if text is not None:
+                self._emit(text)
+
+    def _write_pending(self) -> None:
+        while (text := self._pending.get()) is not None:
+            self._emit(text)
+
+    def _emit(self, text: str) -> None:
         if self._console is not None:
             try:
+                self._console.write(text)
                 self._console.flush()
             except (OSError, ValueError):
-                self._console = None
+                self._console = None  # the console went away
         if self._file is not None:
-            self._file.flush()
+            try:
+                self._file.write(text)
+                self._file.flush()
+            except (OSError, ValueError):
+                self._file = None
 
 
 def log(msg: str) -> None:
@@ -213,9 +257,28 @@ def release_instance(handle: int | None) -> None:
 
 
 def restart_command() -> list[str]:
-    """The same launch again, without a console window."""
+    """The same launch again, without a console window.  A relative script
+    path is made absolute: the restart runs in the repository folder, not in
+    the folder Sotto was started from."""
     import win_startup
-    return [str(win_startup.gui_python()), *sys.argv]
+    script = sys.argv[0]
+    if script and not Path(script).is_absolute():
+        script = str(Path(script).absolute())
+    return [str(win_startup.gui_python()), script, *sys.argv[1:]]
+
+
+def drain_until_idle(busy, *, deadline_s: float, clock=time.monotonic,
+                     sleep=time.sleep) -> bool:
+    """Poll until busy() is False (True) or deadline_s has passed (False).
+
+    Side effects: sleeps on the calling thread.
+    """
+    give_up = clock() + deadline_s
+    while busy():
+        if clock() >= give_up:
+            return False
+        sleep(DRAIN_POLL_S)
+    return True
 
 
 def spawn_restart() -> None:
@@ -376,6 +439,10 @@ def history_command(command: str, *, limit: int, entry_id: str | None,
 class Controller:
     """Tray/Settings actions on the running app (win_ui calls these off its menu thread)."""
 
+    # The drains' time source; tests drive them on a virtual clock.
+    clock = staticmethod(time.monotonic)
+    sleep = staticmethod(time.sleep)
+
     def __init__(self, **parts) -> None:
         self.__dict__.update(parts)
         self.restart_requested = False
@@ -401,10 +468,20 @@ class Controller:
     def recording(self) -> bool:
         return self.engine.snapshot()[0]
 
+    def in_flight(self) -> list[str]:
+        """The captures, transcriptions and insertions still in flight, in words."""
+        work = []
+        if self.capture.is_active() or self.finishing():
+            work.append("a recording")
+        if self.jobs.unfinished_tasks:
+            work.append(f"{self.jobs.unfinished_tasks} transcription job(s)")
+        if self.deliveries.unfinished_tasks:
+            work.append(f"{self.deliveries.unfinished_tasks} insertion(s)")
+        return work
+
     def busy(self) -> bool:
         """A capture, a transcription or an insertion is still in flight."""
-        return (self.capture.is_active() or self.finishing() or bool(self.jobs.unfinished_tasks)
-                or bool(self.deliveries.unfinished_tasks))
+        return bool(self.in_flight())
 
     # history
     def entries(self, limit: int = 10) -> list[dict]:
@@ -506,7 +583,15 @@ class Controller:
 
     # lifecycle
     def restart(self) -> str:
-        """Restart once nothing is in flight (bounded, like the Mac's drained restart)."""
+        """Restart once nothing is in flight.  A dictation being recorded,
+        transcribed or inserted finishes first, however slowly the model runs
+        (a long dictation on the CPU can take well over 20 s), up to
+        RESTART_DRAIN_CAP_S: past that the model call is taken to be wedged,
+        and the restart goes ahead and logs what it abandoned.  Quit still
+        stops at once.
+
+        Side effects: refuses new captures from now on; requests shutdown once idle.
+        """
         if self.shutdown.requested():
             return "Sotto is already stopping."
         if self.restart_requested:
@@ -519,12 +604,17 @@ class Controller:
             return "Restarting…"
 
         def when_idle() -> None:
-            deadline = time.monotonic() + sotto.RESTART_DRAIN_DEADLINE_S
-            while self.busy() and time.monotonic() < deadline and not self.shutdown.requested():
-                time.sleep(0.1)
-            if self.restart_requested:
+            idle = drain_until_idle(lambda: self.busy() and not self.shutdown.requested(),
+                                    deadline_s=RESTART_DRAIN_CAP_S,
+                                    clock=self.clock, sleep=self.sleep)
+            if not self.restart_requested:
+                return  # Quit won
+            if idle:
                 log("● restarting after the current dictation")
-                self.shutdown.request()
+            else:
+                log(f"! restarting anyway after {RESTART_DRAIN_CAP_S / 60:.0f} minutes; "
+                    f"abandoned: {', '.join(self.in_flight())}")
+            self.shutdown.request()
 
         threading.Thread(target=when_idle, daemon=True).start()
         return "Restarting after the current dictation…"
@@ -731,8 +821,13 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         if shutdown.requested():
             return
         restricted = win_asr.LanguageRestricted(whisper, prefs.languages)
-        text, attempt_metadata = sotto.transcribe_prepared(
-            restricted, prepared, job_config, glossary_terms)
+        try:
+            text, attempt_metadata = sotto.transcribe_prepared(
+                restricted, prepared, job_config, glossary_terms)
+        except Exception as exc:
+            keep_failed_capture(exc, prepared, raw, native_rate, captured_ts, job_config,
+                                vad_metadata, preprocessing, queued_at, started)
+            return
         # A backend may ignore cancellation: its result is never pasted or
         # persisted after shutdown.
         if shutdown.requested():
@@ -769,11 +864,42 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                 **attempt_metadata),
             adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
             inject=None if reason or not (text or voice_action) else lambda: deliveries.put(
-                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only)))
+                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only,
+                 time.monotonic())))
         if appended is not None and text and not reason and voice_action is None:
             sotto.record_totals(text, len(raw) / max(native_rate, 1.0))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
             f"(speech model {elapsed:.2f}s) · {len(text)} chars")
+
+    def keep_failed_capture(exc, prepared, raw, native_rate, captured_ts, job_config,
+                            vad_metadata, preprocessing, queued_at, started) -> None:
+        """The speech model raised (CUDA out of memory, a driver error): the
+        recording must not be lost.  It is kept as a suspect History row that
+        Retry can transcribe again, and the tray says so.
+
+        Side effects: appends one History row with its audio; a tray notification.
+        """
+        model_activity["last_finished"] = time.monotonic()
+        log(f"! transcription failed: {str(exc)[:160]} — the recording is kept in History")
+        if shutdown.requested():
+            return
+        prepared_seconds = len(prepared.asr_samples) / sotto.SAMPLE_RATE
+        _, attempt_metadata = sotto._transcription_kwargs(job_config, glossary_terms,
+                                                         prepared_seconds)
+        preprocessing.update({"outcome": "suspect", "transcription_error": type(exc).__name__})
+        attempt_metadata.update({
+            "vad": vad_metadata, "preprocessing": preprocessing,
+            "latency": {"queue_wait_seconds": round(started - queued_at, 4),
+                        "asr_seconds": round(time.monotonic() - started, 4)}})
+        sotto.finalize_primary_live_delivery(
+            append=lambda: coordinator.append_live(
+                TRANSCRIPTION_FAILED_TEXT, prepared, prepared_seconds, model_repo,
+                ts=captured_ts, raw_samples=raw, raw_sample_rate=native_rate,
+                provenance="live_suspect", adaptive=False, **attempt_metadata),
+            adaptive_runtime=None, appended_publication=None, shutdown=shutdown, inject=None)
+        if ui is not None:
+            ui.notify("Transcription failed. The recording is in History: "
+                      "choose Retry there to transcribe it again.")
 
     def retry_job(job) -> None:
         _, entry_id, queued_at, _capture_id, job_config = job
@@ -863,6 +989,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                     raise RuntimeError("unknown transcription job")
             except Exception as exc:
                 log(f"! transcription failed: {str(exc)[:160]}")
+                if ui is not None and job[0] in ("live", "retry"):
+                    ui.notify("A dictation could not be transcribed; see sotto.log in the data folder.")
             finally:
                 jobs.task_done()
                 ui_state()
@@ -937,12 +1065,15 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     engine = sotto.GestureEngine(on_start, on_finish, on_discard)
     hook = win_hotkey.TriggerHook(engine, trigger=trigger)
     hook.start()
+    hook_lock = threading.Lock()  # the resync poller's revive vs the teardown's stop
 
-    def insert_one(text: str, prefs: DeliveryPrefs) -> None:
+    def insert_one(text: str, prefs: DeliveryPrefs, ready_at: float) -> None:
         """Never insert while a modifier key is held — synthetic keystrokes or
         Ctrl+V during a hold race the release edge and could combine with it.
-        A key held past INSERT_WAIT_S keeps the text in History instead."""
-        deadline = time.monotonic() + INSERT_WAIT_S
+        A text not inserted within INSERT_WAIT_S of being ready stays in History
+        instead; the wait counts from ready_at, so a queued text never gets a
+        fresh wait after the ones ahead of it used theirs up."""
+        deadline = ready_at + INSERT_WAIT_S
         deferred = False
         while hook.modifiers_held:
             if shutdown.requested():
@@ -991,14 +1122,14 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     def delivery_worker() -> None:
         while not shutdown.requested():
             try:
-                text, prefs, copy_only = deliveries.get(timeout=0.05)
+                text, prefs, copy_only, ready_at = deliveries.get(timeout=0.05)
             except queue.Empty:
                 continue
             try:
                 if copy_only and text is SCRATCH:
                     pass  # finished from the tray: there is no insertion to undo
                 else:
-                    copy_instead(text) if copy_only else insert_one(text, prefs)
+                    copy_instead(text) if copy_only else insert_one(text, prefs, ready_at)
             except Exception as exc:
                 log(f"! not inserted ({str(exc)[:120]}) — kept in history")
             finally:
@@ -1010,12 +1141,15 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         consecutive polls gets its release synthesized. Hands-free is exempt —
         its key is legitimately up while recording."""
         misses = 0
-        while not shutdown.requested():
-            time.sleep(1.0)
+        while not shutdown.event.wait(1.0):
             capture.tick()
             if not hook.alive():
-                log("! keyboard listener died — restarting it")
-                hook.start()
+                # The teardown requests shutdown before it stops the hook under
+                # this lock, so a hook it stopped is never started again.
+                with hook_lock:
+                    if not shutdown.requested():
+                        log("! keyboard listener died — restarting it")
+                        hook.start()
             recording, hands_free = engine.snapshot()
             if recording and not hands_free and not hook.physically_down:
                 misses += 1
@@ -1059,7 +1193,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             shutdown.stop_capture(capture)
             shutdown.discard_queued(jobs)
             shutdown.discard_queued(deliveries)  # their text is already in History
-            hook.stop()
+            with hook_lock:
+                hook.stop()
             transcription_thread.join(sotto.APP_DRAIN_TIMEOUT)
             if transcription_thread.is_alive():
                 log("  an in-flight transcription was abandoned (never pasted or saved)")

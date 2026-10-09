@@ -164,6 +164,21 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(Path(command[0]), pythonw if pythonw.is_file() else Path(sys.executable))
         self.assertEqual(command[1:], ["C:/sotto/win_launch.py", "--data-dir", "D:/x"])
 
+    def test_restart_finds_a_script_started_by_a_relative_path(self):
+        # [F36] `python sotto-copy\sotto_win.py --tray` from another folder: the
+        # restart runs in the repository folder, so a relative path must not reach it.
+        with tempfile.TemporaryDirectory(prefix="sotto-win-cwd-") as folder, \
+                mock.patch.object(sys, "argv", ["sotto-copy\\sotto_win.py", "--tray"]):
+            previous = os.getcwd()
+            os.chdir(folder)
+            try:
+                command = sotto_win.restart_command()
+            finally:
+                os.chdir(previous)
+        self.assertTrue(Path(command[1]).is_absolute(), command)
+        self.assertEqual(Path(command[1]).resolve(), (Path(folder) / "sotto-copy" / "sotto_win.py").resolve())
+        self.assertEqual(command[2:], ["--tray"])
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class RestartTest(unittest.TestCase):
@@ -201,6 +216,79 @@ class RestartTest(unittest.TestCase):
             waiting.quit()
         self.assertTrue(waiting.shutdown.requested())
         self.assertFalse(waiting.restart_requested, "Quit wins over a pending restart")
+
+    def test_restart_and_speed_change_never_abandon_a_slow_dictation(self):
+        # [F30] A long dictation on the CPU outlasts the old 20 s drain deadline;
+        # Restart and a Speed change must still wait for it (deadline shrunk here).
+        for start in ("restart", "speed"):
+            controller, jobs = self.controller(busy=True)
+            controller.speed = "accurate"
+            with mock.patch.object(sotto, "RESTART_DRAIN_DEADLINE_S", 0.2), \
+                    mock.patch.object(sotto_win.user_settings, "save"), \
+                    mock.patch.object(sotto_win, "log"):
+                message = controller.restart() if start == "restart" else controller.set_speed("fast")
+                self.assertIn("after the current dictation", message)
+                time.sleep(0.8)
+                self.assertFalse(controller.shutdown.requested(),
+                                 f"{start}: a dictation still transcribing is never abandoned")
+                jobs.get_nowait()
+                jobs.task_done()
+                deadline = time.monotonic() + 5
+                while not controller.shutdown.requested() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            self.assertTrue(controller.shutdown.requested(), f"{start}: restarts once idle")
+            self.assertTrue(controller.restart_requested)
+
+    @staticmethod
+    def virtual_clock(controller, on_sleep=lambda now: None) -> dict:
+        """Drive the controller's drains on a virtual clock: every poll's
+        sleep advances it at once, then runs ``on_sleep(now)``."""
+        clock = {"now": 0.0}
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            on_sleep(clock["now"])
+
+        controller.clock, controller.sleep = (lambda: clock["now"]), sleep
+        return clock
+
+    def test_restart_waits_minutes_for_a_slow_dictation(self):
+        # A long dictation on the CPU can take minutes: it still finishes first.
+        controller, jobs = self.controller(busy=True)
+        slow_s = 4 * 60.0
+        stopped_while_busy = []
+
+        def on_sleep(now):
+            stopped_while_busy.append(controller.shutdown.requested())
+            if now >= slow_s and jobs.unfinished_tasks:
+                jobs.get_nowait()
+                jobs.task_done()
+
+        clock, logs = self.virtual_clock(controller, on_sleep), []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            self.assertIn("after the current dictation", controller.restart())
+            self.assertTrue(controller.shutdown.event.wait(5), "restarts once the dictation is done")
+        self.assertTrue(stopped_while_busy, "the drain polls on the controller's clock")
+        self.assertFalse(any(stopped_while_busy), "a slow dictation is never abandoned")
+        self.assertGreaterEqual(clock["now"], slow_s)
+        self.assertIn("● restarting after the current dictation", logs)
+        self.assertFalse([line for line in logs if "abandoned" in line], logs)
+
+    def test_a_wedged_dictation_cannot_hold_a_restart_forever(self):
+        # [F30 follow-up] A hung CUDA/CT2 call left Restart refusing every
+        # capture until the user quit: past the cap, the restart goes ahead.
+        controller, jobs = self.controller(busy=True)
+        clock, logs = self.virtual_clock(controller), []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.restart()
+            self.assertTrue(controller.shutdown.event.wait(5), "a wedged dictation still restarts")
+        self.assertTrue(controller.restart_requested)
+        self.assertEqual(jobs.unfinished_tasks, 1, "the dictation never finished")
+        self.assertAlmostEqual(clock["now"], sotto_win.RESTART_DRAIN_CAP_S, delta=1.0)
+        self.assertGreaterEqual(sotto_win.RESTART_DRAIN_CAP_S, 2 * 60, "minutes, not seconds")
+        abandoned = [line for line in logs if "abandoned" in line]
+        self.assertEqual(len(abandoned), 1, logs)
+        self.assertIn("1 transcription job(s)", abandoned[0])
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
@@ -262,6 +350,8 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
         def transcribe(self, samples, **kwargs):
             whisper_calls.append((np.array(samples), kwargs))
             text = replies.pop(0) if len(whisper_calls) > 1 else ""
+            if isinstance(text, Exception):
+                raise text  # the model failed (CUDA out of memory, a driver error)
             result = {"text": text}
             if kwargs.get("language") is None and kwargs.get("allowed_languages"):
                 result["language"] = tuple(kwargs["allowed_languages"])[0]
@@ -787,7 +877,7 @@ class LifecycleTest(unittest.TestCase):
                     mock.patch.object(sotto_win.win_inject, "deliver",
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
-                    mock.patch.object(sotto_win, "HistoryStore", lambda: HistoryStore(data)), \
+                    mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
@@ -900,6 +990,309 @@ class IsolatedCliTest(unittest.TestCase):
         self.assertEqual(list((self.data / "audio").iterdir()), [])
         self.assertEqual(list((self.data / "audio-raw").iterdir()), [])
         self.assertEqual(self._run("history").stdout, "")
+
+
+def _patched_run(stack, data, fakes, *, logs, boundaries, controllers, settings=None):
+    """Enter the patches every ``run()`` test needs into ``stack``: fake model,
+    microphone and hook, History in ``data``, and recorded logs, shutdown
+    boundaries and controllers."""
+    from history import HistoryStore
+    from learning import LearningStore
+    import vad
+
+    FakeWhisper, FakeCapture, FakeHook = fakes
+
+    class RecordingBoundary(sotto.ShutdownBoundary):
+        def __init__(self):
+            super().__init__()
+            boundaries.append(self)
+
+    class RecordingController(sotto_win.Controller):
+        def __init__(self, **parts):
+            super().__init__(**parts)
+            controllers.append(self)
+
+    for patch in (
+            mock.patch.object(sotto_win.win_asr, "resolve_model_dir", return_value=data),
+            mock.patch.object(sotto_win.win_asr, "LocalCT2Whisper", FakeWhisper),
+            mock.patch.object(sotto_win.win_capture, "WinCapture", FakeCapture),
+            mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook),
+            mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)),
+            mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)),
+            mock.patch.object(sotto_win, "Controller", RecordingController),
+            mock.patch.object(sotto_win, "load_language_mode", return_value="auto"),
+            mock.patch.object(sotto_win.user_settings, "load",
+                              return_value=dict(settings or user_settings.DEFAULTS)),
+            mock.patch.object(dictionary, "DICTIONARY_PATH", data / "dictionary.txt"),
+            mock.patch.object(sotto_win, "log", logs.append),
+            mock.patch.object(sotto, "ShutdownBoundary", RecordingBoundary),
+            mock.patch.object(vad, "MODEL_PATH", data / "no-vad.onnx")):
+        stack.enter_context(patch)
+
+
+def _wait_for(condition, what, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.02)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class FailureAndTeardownTest(unittest.TestCase):
+    """A failing model, a stopping app and a queue of held insertions."""
+
+    def test_a_failed_transcription_keeps_its_recording_for_retry_and_says_so(self):
+        # [F4] A runtime model error (CUDA out of memory) used to lose the
+        # dictation: no History row, no Retry, no message.
+        import contextlib
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        replies = [RuntimeError("CUDA failed with error out of memory"), "recovered words"]
+        hooks, boundaries, controllers, logs, copied, delivered, notes = [], [], [], [], [], [], []
+        whisper_calls: list = []
+        fakes = _app_fakes(rate, [voiced], replies, hooks, whisper_calls)
+        results: dict = {}
+
+        class FakeTray:
+            def __init__(self, *, quit, log):
+                pass
+
+            def start(self): pass
+            def stop(self): pass
+            def set_phase(self, phase): pass
+            def set_state(self, state): pass
+            def attach(self, controller): pass
+
+            def notify(self, text):
+                notes.append(text)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-fail-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                try:
+                    _wait_for(lambda: controllers and hooks, "listening")
+                    controller, hook = controllers[0], hooks[0]
+                    hook.engine.pressed()
+                    time.sleep(0.45)
+                    hook.engine.released()
+                    _wait_for(lambda: HistoryStore(data).entries(1), "the History row")
+                    _wait_for(lambda: not controller.busy(), "the worker")
+                    entry = results["failed"] = HistoryStore(data).entries(1)[0]
+                    results["notes_after_failure"] = list(notes)
+                    controller.retry(entry["id"])
+                    _wait_for(lambda: copied, "the retry")
+                    results["retried"] = HistoryStore(data).get(entry["id"])
+                except BaseException as exc:
+                    results["error"] = exc
+                finally:
+                    boundaries[0].request()
+
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, fakes, logs=logs, boundaries=boundaries, controllers=controllers)
+                stack.enter_context(mock.patch("win_ui.TrayApp", FakeTray))
+                stack.enter_context(mock.patch.object(
+                    sotto_win.win_inject, "deliver", lambda text, **kwargs: delivered.append(text)))
+                stack.enter_context(mock.patch.object(sotto_win.win_inject, "copy_text", copied.append))
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu", tray=True)
+                driver.join(10)
+
+        self.assertNotIn("error", results, results)
+        failed = results["failed"]
+        self.assertEqual(failed["text"], "[transcription failed]")
+        self.assertEqual(failed["attempts"][-1]["provenance"], "live_suspect")
+        self.assertEqual(failed["attempts"][-1]["preprocessing"]["outcome"], "suspect")
+        self.assertEqual(delivered, [], "a failed transcription inserts nothing")
+        self.assertTrue(any("Retry" in note for note in results["notes_after_failure"]), notes)
+        self.assertTrue(any(line.startswith("! transcription failed: CUDA failed") for line in logs), logs)
+        # Retry recovers the dictation from the kept audio.
+        self.assertEqual(results["retried"]["text"], "recovered words")
+        self.assertEqual(copied, ["recovered words"])
+        self.assertEqual(len(whisper_calls[1][0]), len(whisper_calls[2][0]))
+        self.assertTrue(np.allclose(whisper_calls[1][0], whisper_calls[2][0], atol=1e-4),
+                        "Retry transcribes the audio the failed attempt had")
+
+    def test_the_keyboard_hook_is_never_started_again_after_shutdown(self):
+        # [F35] The resync poller slept through the shutdown request and then
+        # revived the stopped hook behind the teardown.
+        import contextlib
+
+        hooks, boundaries, controllers, logs = [], [], [], []
+        FakeWhisper, FakeCapture, FakeHook = _app_fakes(16_000, [], [], hooks, [])
+
+        class CountingHook(FakeHook):
+            def __init__(self, engine, *, trigger):
+                super().__init__(engine, trigger=trigger)
+                self.starts = 0
+
+            def start(self):
+                self.starts += 1
+
+            def alive(self):
+                return not self.stopped
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-stop-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                _wait_for(lambda: controllers and hooks, "listening")
+                time.sleep(1.5)  # the poller is mid-sleep, as it nearly always is
+                controllers[0].quit()
+
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, (FakeWhisper, FakeCapture, CountingHook), logs=logs,
+                             boundaries=boundaries, controllers=controllers)
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+                driver.join(10)
+                time.sleep(1.5)  # longer than one poll after the hook stopped
+
+        self.assertTrue(hooks[0].stopped)
+        self.assertEqual(hooks[0].starts, 1, logs)
+        self.assertNotIn("! keyboard listener died — restarting it", logs)
+
+    def test_a_shutdown_during_the_poll_never_revives_the_stopped_hook(self):
+        # [F35] The poller woke from its wait, found the listener dead, and
+        # started it again although teardown had stopped it in between.
+        import contextlib
+
+        hooks, boundaries, controllers, logs = [], [], [], []
+        FakeWhisper, FakeCapture, FakeHook = _app_fakes(16_000, [], [], hooks, [])
+        polled = threading.Event()
+
+        class DyingHook(FakeHook):
+            """The listener dies while Quit arrives: the shutdown and the
+            teardown's stop both land between the poller's wait and its start."""
+
+            def __init__(self, engine, *, trigger):
+                super().__init__(engine, trigger=trigger)
+                self.starts, self.checks = 0, 0
+                self.stop_event = threading.Event()
+                snapshot = engine.snapshot
+
+                def snapshot_after_the_revive_check():
+                    if self.checks:
+                        polled.set()
+                    return snapshot()
+
+                engine.snapshot = snapshot_after_the_revive_check
+
+            def start(self):
+                self.starts += 1
+
+            def stop(self):
+                super().stop()
+                self.stop_event.set()
+
+            def alive(self):
+                self.checks += 1
+                boundaries[0].request()
+                self.stop_event.wait(10)
+                return False
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-poll-") as temporary:
+            data = Path(temporary)
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, (FakeWhisper, FakeCapture, DyingHook), logs=logs,
+                             boundaries=boundaries, controllers=controllers)
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+                self.assertTrue(polled.wait(10), "the poller finished the poll it was in")
+
+        self.assertTrue(hooks[0].stopped)
+        self.assertEqual(hooks[0].checks, 1)
+        self.assertEqual(hooks[0].starts, 1, logs)
+        self.assertNotIn("! keyboard listener died — restarting it", logs)
+
+    def test_a_queued_insertion_never_outlives_its_own_wait(self):
+        # [F46] Each queued text got a fresh modifier wait after the ones ahead
+        # of it used theirs up, so dictation N could land N waits late.
+        import contextlib
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs, delivered = [], [], [], [], []
+        fakes = _app_fakes(rate, [voiced, voiced.copy()], ["first words", "second words"], hooks, [])
+        ready: list[float] = []
+        wait_s = 2.0
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-held-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                try:
+                    _wait_for(lambda: controllers and hooks, "listening")
+                    hook = hooks[0]
+                    hook.modifiers_held = True  # e.g. a stuck Shift: nothing may be inserted
+                    for index in range(2):
+                        hook.engine.pressed()
+                        time.sleep(0.45)
+                        hook.engine.released()
+                        _wait_for(lambda index=index: len(HistoryStore(data).entries(10)) > index, "the History row")
+                        ready.append(time.monotonic())
+                    # Past the second text's own wait (with a margin), but well
+                    # before a second full wait after the first one expired.
+                    time.sleep(max(0.0, ready[1] + wait_s + 0.4 - time.monotonic()))
+                    hook.modifiers_held = False
+                    time.sleep(0.6)
+                finally:
+                    boundaries[0].request()
+
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, fakes, logs=logs, boundaries=boundaries, controllers=controllers)
+                stack.enter_context(mock.patch.object(sotto_win, "INSERT_WAIT_S", wait_s))
+                stack.enter_context(mock.patch.object(
+                    sotto_win.win_inject, "deliver", lambda text, **kwargs: delivered.append(text)))
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+                driver.join(10)
+            texts = [entry["text"] for entry in HistoryStore(data).entries(10)][::-1]
+
+        self.assertLess(ready[1] - ready[0], wait_s - 0.5, "the test needs both texts ready close together")
+        self.assertEqual(delivered, [], "no text is inserted after its own wait ran out")
+        self.assertEqual(sum(line.startswith("! not inserted (a modifier key held") for line in logs), 2, logs)
+        self.assertEqual(texts, ["first words", "second words"], "both stay in History")
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class ConsoleLogTest(unittest.TestCase):
+    def test_a_log_line_never_waits_for_the_disk(self):
+        # [F32] Gesture callbacks log on the keyboard-hook thread; a slow disk
+        # or console must not hold that thread (Windows drops slow hooks).
+        written: list[str] = []
+
+        class SlowFile:
+            def write(self, text):
+                time.sleep(0.3)
+                written.append(text)
+
+            def flush(self):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-log-") as temporary, \
+                mock.patch.object(sotto_win, "DATA_DIR", Path(temporary)), \
+                mock.patch.object(sys, "stderr", None):
+            sink = sotto_win._ConsoleLog()
+            sink._file.close()
+            sink._file = SlowFile()
+            started = time.monotonic()
+            print("● recording", file=sink, flush=True)
+            print("○ 0.98s captured", file=sink, flush=True)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.1, "logging waited for the file")
+            sink.drain(timeout=5)
+        self.assertEqual("".join(written), "● recording\n○ 0.98s captured\n")
+        print("after drain", file=sink)  # written directly once the writer has stopped
+        self.assertTrue("".join(written).endswith("after drain\n"), written)
 
 
 if __name__ == "__main__":
