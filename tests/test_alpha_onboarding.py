@@ -578,6 +578,21 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip().splitlines()[-1:], ["True"], result.stderr[-800:])
 
 
+class SetupCommandTests(unittest.TestCase):
+    def test_n42_setup_for_parakeet_also_installs_voice_detection(self):
+        import vad
+        installed = []
+        fake_parakeet = types.SimpleNamespace(path="/models/parakeet-snapshot")
+        with patch.object(sys, "argv", ["sotto.py", "setup", "--profile", "parakeet"]), \
+                patch.object(sotto, "LocalParakeet", lambda repo: fake_parakeet), \
+                patch.object(sotto, "LocalWhisper", side_effect=AssertionError("Whisper not asked for")), \
+                patch.object(vad, "install", lambda allow_download: installed.append(allow_download)
+                             or Path("/data/models/silero_vad.onnx")), \
+                patch("builtins.print"):
+            sotto.main()
+        self.assertEqual(len(installed), 1)
+
+
 class SaveAudioNameTests(unittest.TestCase):
     """Save audio to Desktop never overwrites an earlier save."""
 

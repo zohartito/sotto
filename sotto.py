@@ -3952,14 +3952,13 @@ def main() -> None:
         try:
             if args.profile == "parakeet":
                 from speech_config import MODEL_PROFILES
-                path = LocalParakeet(MODEL_PROFILES["parakeet"].repo).path
-                print(f"✓ Parakeet model ready ({Path(path).name[:12]}) in {SOTTO_HF_HOME}")
-                return
-            path = LocalWhisper(None, DEFAULT_MODEL).path
+                engine, path = "Parakeet", LocalParakeet(MODEL_PROFILES["parakeet"].repo).path
+            else:
+                engine, path = "Whisper", LocalWhisper(None, DEFAULT_MODEL).path
         except ModelUnavailable as exc:
             print(f"✗ {exc}")
             sys.exit(1)
-        print(f"✓ Whisper model ready ({Path(path).name[:12]}) in {SOTTO_HF_HOME}")
+        print(f"✓ {engine} model ready ({Path(path).name[:12]}) in {SOTTO_HF_HOME}")
         from offline_runtime import offline_requested
         import vad
         try:
