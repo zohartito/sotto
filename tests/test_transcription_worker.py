@@ -804,6 +804,27 @@ class RoundTwoWorkerTests(TemporaryUserFiles, unittest.TestCase):
     """F4b, N10, N16, N17 and N19: a live job or a Retry that fails anywhere is
     kept or reported once, and nothing claims History holds what it does not."""
 
+    def test_n10_read_only_history_never_says_the_failed_audio_is_in_history(self):
+        def boom(samples, **kwargs):
+            raise RuntimeError("[metal::malloc] Resource limit exceeded")
+        h = Harness(boom, append=read_only_history())
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Transcription failed"])
+        message = h.status_ui.errors[0][1]
+        self.assertNotIn("is in History", message)
+        self.assertIn("dictate again", message)
+        self.assertFalse(any("kept in History" in line for line in h.logs), h.logs)
+
+    def test_n10_read_only_history_never_says_held_text_was_kept(self):
+        h = Harness(says(LOOP), append=read_only_history())
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual((h.injected, h.copied), ([], []))
+        self.assertFalse(any("kept in history" in line.lower() for line in h.logs), h.logs)
+        self.assertTrue(any("not pasted" in line for line in h.logs), h.logs)
+        # The startup alert already said History is unreadable; an empty or
+        # garbled capture is not worth a second one each time.
+        self.assertEqual(h.status_ui.errors, [])
+
     def test_n16_the_paste_knows_whether_history_saved_the_text(self):
         def disk_full(*args, **kwargs):
             raise OSError(28, "No space left on device")

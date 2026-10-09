@@ -352,11 +352,10 @@ class TranscriptionWorker:
                 self.adaptive_runtime.fail_comparator_publication(publication_meta)
                 raise RuntimeError("comparator publication adoption unavailable")
             if reason:
-                self.log(f"! not pasted ({reason}) — kept in history")
                 preprocessing["outcome"] = "suspect"
                 try:
                     appended_row = finalize_primary_live_delivery(
-                        append=lambda: self.coordinator.append_live(
+                        append=lambda: self._append_live(
                             text, prepared, prepared_seconds, actual_model,
                             ts=captured_ts, raw_samples=raw,
                             raw_sample_rate=native_rate, provenance="live_suspect",
@@ -369,7 +368,12 @@ class TranscriptionWorker:
                     if self.adaptive_runtime is not None:
                         discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
                         raise
+                    self.log(f"! not pasted ({reason})")
                     self._history_append_failed(exc)  # F16(a): held text; nothing to deliver
+                else:
+                    # N10: read-only History (F16b) keeps nothing; never claim it did.
+                    self.log(f"! not pasted ({reason}) — "
+                             + ("kept in history" if self._in_history() else "not kept (History is read-only)"))
             else:
                 if self.shutdown.requested():
                     return
@@ -428,7 +432,7 @@ class TranscriptionWorker:
         if self.shutdown.requested():
             return
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
-        self.log(f"! transcription failed ({error}) — audio kept in History for Retry")
+        self.log(f"! transcription failed ({error})")
         if prepared is None:  # the stream failed before any canonical audio existed
             from audio_codec import prepare_canonical
             prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
@@ -441,7 +445,7 @@ class TranscriptionWorker:
         })
         try:
             finalize_primary_live_delivery(
-                append=lambda: self.coordinator.append_live(
+                append=lambda: self._append_live(
                     TRANSCRIPTION_FAILED_TEXT, prepared, seconds, self.model, ts=captured_ts,
                     raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
                     adaptive=False, **attempt_metadata),
@@ -452,6 +456,13 @@ class TranscriptionWorker:
                              f"{error}\n\nThe recording could not be saved to History either; please dictate again.")
             return
         self.refresh_history()
+        if not self._in_history():  # N10: read-only History (F16b) kept nothing
+            self.log("! failed capture not saved (History is read-only)")
+            self._show_error("Transcription failed",
+                             f"{error}\n\nHistory is read-only right now, so the recording was not "
+                             "kept; please dictate again.")
+            return
+        self.log("  audio kept in History for Retry")
         self._show_error("Transcription failed", f"The audio is in History; use Retry.\n\n{error}")
 
     def _history_append_failed(self, exc: Exception, deliver=None) -> None:
