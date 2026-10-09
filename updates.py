@@ -51,14 +51,20 @@ def check(root: Path, *, offline: bool, run=subprocess.run, which=shutil.which) 
         if fetched.returncode != 0:
             reason = _last_line(fetched.stderr) or "no network?"
             return UpdateCheck("failed", f"Could not reach GitHub ({reason}).", version=version)
-        counts = _git(root, "rev-list", "--left-right", "--count", "HEAD...@{u}", run=run).stdout.split()
-        ahead, behind = (int(counts[0]), int(counts[1])) if len(counts) == 2 else (0, 0)
+        compared = _git(root, "rev-list", "--left-right", "--count", "HEAD...@{u}", run=run)
+        counts = compared.stdout.split()
+        if compared.returncode != 0 or len(counts) != 2 or not all(count.isdigit() for count in counts):
+            return UpdateCheck("failed", "Could not compare this copy with GitHub.", version=version)
+        ahead, behind = int(counts[0]), int(counts[1])
         if behind == 0:
             return UpdateCheck("current", version=version)
         if ahead:
             return UpdateCheck("diverged", "This copy has its own commits, so Sotto will not update it "
                                            "automatically.", behind=behind, version=version)
-        if _git(root, "status", "--porcelain", "--untracked-files=no", run=run).stdout.strip():
+        status = _git(root, "status", "--porcelain", "--untracked-files=no", run=run)
+        if status.returncode != 0:
+            return UpdateCheck("failed", "Could not read this copy's git status.", version=version)
+        if status.stdout.strip():
             return UpdateCheck("local-changes", "This copy has local changes, so Sotto will not update "
                                                 "it automatically.", behind=behind, version=version)
         subjects = _git(root, "log", "--format=%s", f"-n{MAX_LISTED_CHANGES}", "HEAD..@{u}",
@@ -69,18 +75,34 @@ def check(root: Path, *, offline: bool, run=subprocess.run, which=shutil.which) 
         return UpdateCheck("failed", f"Could not check for updates ({str(exc)[:120]}).")
 
 
-def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run) -> tuple[bool, str]:
-    """Run the installer's own update path (git pull, pinned packages, model
-    check, Sotto.app) while Sotto keeps running; the caller restarts on success."""
+def _head(root: Path, run) -> str:
+    try:
+        return _git(root, "rev-parse", "HEAD", run=run).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run) -> tuple[bool, str, bool]:
+    """Run the installer's own update path (fetch, the new version's pinned
+    packages, then the source switch, model check and Sotto.app) while Sotto
+    keeps running.
+
+    Returns (finished, last log line, source_changed). The installer switches
+    the source only after the packages installed, so a failure with
+    source_changed False left this copy's code untouched.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    before = _head(root, run)
     try:
         with open(log_path, "w", encoding="utf-8") as log:
             result = run(["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update", "--python", python],
                          cwd=str(root), stdout=log, stderr=subprocess.STDOUT, timeout=1800)
+        finished = result.returncode == 0
+        tail = _last_line(log_path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"The update did not finish ({str(exc)[:120]})."
-    tail = _last_line(log_path.read_text(encoding="utf-8", errors="replace"))
-    return result.returncode == 0, tail
+        finished, tail = False, f"The update did not finish ({str(exc)[:120]})."
+    after = _head(root, run)
+    return finished, tail, bool(before and after and before != after)
 
 
 def describe(result: UpdateCheck, manual_update: str) -> tuple[str, str]:
