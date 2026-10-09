@@ -1949,6 +1949,30 @@ class RoundTwoRunTest(unittest.TestCase):
                        "you typed since", "window in front is unknown"):
             self.assertTrue(any(reason in line for line in app["logs"]), (reason, app["logs"]))
 
+    def test_retry_runs_the_same_cleanup_as_live_dictation(self):
+        # [F19w] Windows Retry skipped the English cleanup (fillers, voice
+        # commands) that live dictation and the Mac's Retry apply.
+        from history import HistoryStore
+        fakes = self.fakes([_voiced()], ["first", "Hello, um, world", "scratch that"])
+
+        def drive(results, app):
+            controller = app["controllers"][0]
+            self.dictate(app)
+            entry_id = HistoryStore(data).entries(1)[0]["id"]
+            for count in (1, 2):
+                controller.retry(entry_id)
+                _wait_for(lambda count=count: len(app["copied"]) == count, "the retry")
+            results["row"] = HistoryStore(data).get(entry_id)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-retry-") as temporary:
+            data = Path(temporary)
+            results, app = self.run_app(fakes, drive, data, settings=self.ENGLISH)
+        # Retry never undoes anything: "scratch that" keeps its words.
+        self.assertEqual(app["copied"], ["Hello world", "scratch that"])
+        cleaned = results["row"]["attempts"][-2]["preprocessing"]
+        self.assertEqual(cleaned["voice"], {"asr_text": "Hello, um, world"})
+        self.assertNotIn("voice", results["row"]["attempts"][-1]["preprocessing"])
+
 
 if __name__ == "__main__":
     unittest.main()

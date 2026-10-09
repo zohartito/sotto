@@ -45,6 +45,7 @@ if sys.platform != "win32":
     raise ImportError("sotto_win is Windows-only")
 
 import dictionary
+import pipeline
 import progress
 import settings as user_settings
 import sotto
@@ -1083,12 +1084,18 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             return
         preprocessing: dict = {"retry_canonical": True}
         move_detected_language(attempt_metadata, preprocessing)
-        # No VAD verdict for a retry: only the text-based guards apply.
-        text, reason = screen_transcript(text, prepared_seconds, 1.0, preprocessing)
+        # The same guards and cleanup as live dictation (pipeline.screen, like
+        # the Mac's Retry).  No VAD verdict for a retry (speech_fraction 1.0),
+        # and Retry never undoes anything: a "scratch that" result keeps its words.
+        screened = pipeline.screen(
+            text, seconds=prepared_seconds, speech_fraction=1.0,
+            language=preprocessing.get("detected_language") or job_config.language, log=log)
+        preprocessing.update(screened.receipts)
+        text = (preprocessing.pop("voice")["asr_text"] if screened.voice_action == "scratch"
+                else screened.text)
+        reason = screened.held
         if reason:
             preprocessing["outcome"] = "suspect"
-        else:
-            text = sotto.apply_personal_dictionary(text, preprocessing)
         attempt_metadata.update({
             "vad": {"available": None, "speech_fraction": None, "span_count": None},
             "preprocessing": preprocessing,
