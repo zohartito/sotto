@@ -1857,6 +1857,7 @@ class GestureEngine:
 # -- clipboard injection (main thread only) ---------------------------------
 
 _restore_generation = 0
+_pending_restore: dict | None = None  # {"own_count", "snapshot"} of the restore not yet run
 
 
 _NO_SPACE_AFTER = "([{\"'“‘/-\n\t"
@@ -1945,7 +1946,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
     """Insert at the cursor. "paste": full-pasteboard snapshot, synthetic
     cmd-V, then a changeCount-guarded restore so a user copy in the window
     always wins. "type": synthetic Unicode typing, clipboard untouched."""
-    global _restore_generation
+    global _restore_generation, _pending_restore
     if secure_input_active():
         log("! secure input active — not inserting; transcript kept in history")
         return
@@ -1956,9 +1957,16 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
         return
 
     pasteboard = NSPasteboard.generalPasteboard()
-    snapshot = []
-    for item in (pasteboard.pasteboardItems() or []):
-        snapshot.append([(t, item.dataForType_(t)) for t in item.types()])
+    pending = _pending_restore
+    if pending is not None and pasteboard.changeCount() == pending["own_count"]:
+        # The pasteboard still holds Sotto's previous dictation and its restore
+        # has not run yet: carry the user's original forward instead of
+        # snapshotting our own text (two pastes inside the restore window).
+        snapshot = pending["snapshot"]
+    else:
+        snapshot = []
+        for item in (pasteboard.pasteboardItems() or []):
+            snapshot.append([(t, item.dataForType_(t)) for t in item.types()])
     pasteboard.clearContents()
     pasteboard.setString_forType_(text, NSPasteboardTypeString)
     own_count = pasteboard.changeCount()
@@ -1970,6 +1978,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
 
     _restore_generation += 1
     generation = _restore_generation
+    _pending_restore = {"own_count": own_count, "snapshot": snapshot}
 
     def queue_restore() -> None:
         from PyObjCTools import AppHelper
@@ -1981,8 +1990,12 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
 
 
 def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
+    """Runs on the main thread (AppHelper.callAfter), like inject() itself, so
+    the pending-restore bookkeeping needs no lock."""
+    global _pending_restore
     if generation != _restore_generation:
-        return  # a newer injection owns the pasteboard now
+        return  # a newer injection owns the pasteboard now (and carried this snapshot if it was still ours)
+    _pending_restore = None
     pasteboard = NSPasteboard.generalPasteboard()
     if pasteboard.changeCount() != own_count:
         return  # the user copied something meanwhile — their copy wins
