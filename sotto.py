@@ -273,8 +273,13 @@ def parse_hotkey(spec: str) -> tuple[int, int] | None:
 
 
 def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
-    keep_app_log_small()
+    """Never raises: the transcription worker logs from inside its own error
+    handler, so a full disk or a rotation race must not end the thread (N35)."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+        keep_app_log_small()
+    except (OSError, ValueError):
+        pass
 
 
 LAUNCHD_LABEL = "com.zohartito.sotto.app"  # must match launchd/ and scripts/rollout.sh
@@ -286,6 +291,7 @@ def app_mode() -> bool:
 
 
 _app_log: dict = {"path": None, "max_bytes": 0}  # set once logs are routed to a file
+_app_log_lock = threading.Lock()  # every thread logs; one of them rotates at a time
 
 
 def route_app_logs(data_dir: Path, max_bytes: int = 2_000_000) -> Path:
@@ -320,8 +326,11 @@ def keep_app_log_small() -> None:
     """Rotate a routed log that grew past its limit while Sotto runs; the old
     file keeps the open descriptors, so point output at a fresh one."""
     path = _app_log["path"]
-    if path is not None and _rotate_if_large(path, _app_log["max_bytes"]):
-        _point_output_at(path)
+    if path is None:
+        return
+    with _app_log_lock:
+        if _rotate_if_large(path, _app_log["max_bytes"]):
+            _point_output_at(path)
 
 
 def sotto_icon_path() -> Path | None:

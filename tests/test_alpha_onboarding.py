@@ -513,6 +513,57 @@ class AppLogRotationTests(unittest.TestCase):
             sotto.keep_app_log_small()
         reopen.assert_not_called()
 
+    def test_n35_two_threads_rotating_at_once_neither_raises(self):
+        real_replace, errors, reopened, callers = os.replace, [], [], []
+
+        def slow_replace(source, target):
+            # Both threads saw the oversized log before either moved it; the
+            # second mover is slower, so it finds the first one's fresh log.
+            callers.append(1)
+            time.sleep(0.05 * len(callers) ** 2)
+            real_replace(source, target)
+
+        def reopen(path):
+            reopened.append(path)
+            path.touch()  # what _point_output_at's O_CREAT does
+
+        def write_a_line():
+            try:
+                sotto.log("a line")
+            except Exception as exc:  # what ended the transcription worker
+                errors.append(exc)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sotto.log"
+            path.write_text("x" * 150)
+            with patch.object(sotto, "_point_output_at", reopen), \
+                    patch.dict(sotto._app_log, {"path": path, "max_bytes": 100}), \
+                    patch.object(sotto.os, "replace", slow_replace), \
+                    patch("sys.stderr", new=open(os.devnull, "w")):
+                threads = [threading.Thread(target=write_a_line) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+                sys.stderr.close()
+            rotated = path.with_suffix(".log.1").read_text()
+        self.assertEqual(errors, [])
+        self.assertEqual(reopened, [path])                    # rotated once, not twice
+        self.assertEqual(rotated, "x" * 150)                  # the old log was not overwritten
+
+    def test_n35_a_failing_log_write_never_raises_into_the_caller(self):
+        def disk_full(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sotto.log"
+            path.write_text("x" * 150)
+            with patch.object(sotto, "_point_output_at", disk_full), \
+                    patch.dict(sotto._app_log, {"path": path, "max_bytes": 100}), \
+                    patch("sys.stderr", new=open(os.devnull, "w")):
+                sotto.log("a line")                           # must not raise
+                with patch("builtins.print", disk_full):
+                    sotto.log("another line")
+                sys.stderr.close()
+
 
 class SaveAudioNameTests(unittest.TestCase):
     """Save audio to Desktop never overwrites an earlier save."""
