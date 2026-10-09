@@ -7,7 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Places that bootstrap pip before installing the pinned set.
 PIP_BOOTSTRAPS = ["scripts/install-mac.sh", "scripts/install-windows.ps1", "scripts/sotto-win.bat",
-                  "README.md", "docs/windows-alpha.md"]
+                  "README.md", "docs/windows-alpha.md", ".github/workflows/tests.yml"]
+WORKFLOW = ".github/workflows/tests.yml"
 
 # A package pinned in both the Mac and a Windows lock at different versions must
 # be listed here with the reason; anything else is drift and must be aligned.
@@ -36,6 +37,18 @@ class DependencyPinTests(unittest.TestCase):
             self.assertTrue(found, f"{name} no longer installs an exact pip")
             versions.update(found)
         self.assertEqual(len(versions), 1, f"pip versions differ: {sorted(versions)}")
+
+    def test_ci_installs_each_pinned_set_with_the_installers_pip(self):
+        # [N39] CI installed the lock files with whatever pip the runner's Python shipped.
+        text = (ROOT / WORKFLOW).read_text("utf-8")
+        steps = re.split(r"\n\s*- (?:name|uses):", text)
+        installs = [step for step in steps if re.search(r"pip install (?:--[a-z-]+ )*-r requirements", step)]
+        self.assertGreaterEqual(len(installs), 2, "the Mac and Windows jobs both install a pinned set")
+        for step in installs:
+            bootstrap = re.search(r"pip install (?:--[a-z-]+ )*pip==\d", step)
+            pinned = re.search(r"pip install (?:--[a-z-]+ )*-r requirements", step)
+            self.assertTrue(bootstrap and bootstrap.start() < pinned.start(),
+                            f"{WORKFLOW} installs a pinned set before an exact pip:\n{step.strip()}")
 
     def test_mac_and_windows_locks_agree_or_say_why(self):
         mac = _pins(ROOT / "constraints-alpha.txt")
