@@ -53,10 +53,10 @@ class DeadRouteTest(unittest.TestCase):
         self.assertEqual(DEAD_ROUTE_TEXT, "[dead microphone]")
 
     def test_live_and_retry_jobs_call_the_dead_route_guard(self):
-        # Static check (run() cannot be called in a test yet): parse the code,
-        # so a guard that is commented out no longer counts.
+        # Static check of the worker's live and Retry jobs (transcription.py):
+        # parse the code, so a guard that is commented out no longer counts.
         import ast
-        tree = ast.parse((Path(__file__).resolve().parents[1] / "sotto.py").read_text(encoding="utf-8"))
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "transcription.py").read_text(encoding="utf-8"))
         arguments = {ast.unparse(node.args[0]) for node in ast.walk(tree)
                      if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "asr_skip_reason"
                      and node.args}

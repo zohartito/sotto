@@ -112,7 +112,8 @@ def write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
 
 def read_canonical_wav(path: Path) -> tuple[np.ndarray, AudioIdentity]:
     with wave.open(str(path), "rb") as wav:
-        if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getcomptype()) != (1, 2, CANONICAL_RATE, "NONE"):
+        if ((wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getcomptype())
+                != (1, 2, CANONICAL_RATE, "NONE")):
             raise ValueError("not canonical 16 kHz mono PCM16 WAV")
         pcm = wav.readframes(wav.getnframes())
     return decode_canonical(pcm)

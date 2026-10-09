@@ -40,6 +40,7 @@ PUBLIC_TEST_FILES = (
     'tests/fixtures/calibration_v2_expected/part-18.json',
     'tests/fixtures/calibration_v2_expected/part-19.json',
     'tests/gesture_check.py',
+    'tests/test_00_hermetic.py',
     'tests/test_adaptive_learning.py',
     'tests/test_adaptive_runtime.py',
     'tests/test_alpha_onboarding.py',
@@ -53,10 +54,13 @@ PUBLIC_TEST_FILES = (
     'tests/test_progress.py',
     'tests/test_updates.py',
     'tests/test_voice_commands.py',
+    'tests/test_pipeline.py',
+    'tests/test_transcription_worker.py',
     'tests/test_get_installers.py',
     'tests/test_app_install.py',
     'tests/test_parakeet_engine.py',
     'tests/test_dead_route_repair.py',
+    'tests/test_dependency_pins.py',
     'tests/test_evaluation.py',
     'tests/test_gesture_engine.py',
     'tests/test_history_learning.py',
@@ -93,6 +97,7 @@ WINDOWS_FILES = (
     'settings.py',
     'voice_commands.py',
     'updates.py',
+    'pipeline.py',
     'scripts/install-windows.ps1',
     'scripts/update-windows.ps1',
     'scripts/get.ps1',
@@ -118,7 +123,7 @@ WINDOWS_FILES = (
 )
 
 PUBLIC_FILES = sorted(set(RUNTIME_SOURCE_FILES) | set(PUBLIC_TEST_FILES) | set(WINDOWS_FILES) | {
-    'README.md', 'LICENSE', 'AGENTS.md', 'requirements-alpha.txt', 'constraints-alpha.txt',
+    'README.md', 'LICENSE', 'AGENTS.md', 'pyproject.toml', 'requirements-alpha.txt', 'constraints-alpha.txt',
     'scripts/setup_nemotron.py', 'scripts/test_alpha.py', 'scripts/build_alpha_source.py',
     'scripts/install-mac.sh', 'scripts/install_app.py', 'scripts/get.sh',
     'scripts/rollout.sh', 'benchmark.py', 'docs/alpha-release-notes.md',
