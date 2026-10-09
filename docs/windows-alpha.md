@@ -138,8 +138,9 @@ microphone never reaches the model, and empty, no-speech or looping output is
 kept in History instead (a clean prefix before a repetition loop is kept).
 History is written before anything is inserted. Insertions happen one at a
 time, in order, and wait while any Shift, Ctrl, Alt or Windows key is held, so
-the text cannot combine with a modifier; if one stays down for 2 minutes the
-text is kept in History instead.
+the text cannot combine with a modifier; a text not inserted within 2 minutes of
+being ready (counted for each text, however many wait in line) is kept in
+History instead.
 
 If the speech model itself fails on a dictation (for example CUDA runs out of
 memory), the recording is kept in History as **[transcription failed]** and a

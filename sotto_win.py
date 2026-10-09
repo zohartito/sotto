@@ -770,7 +770,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                 **attempt_metadata),
             adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
             inject=None if reason or not (text or voice_action) else lambda: deliveries.put(
-                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only)))
+                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only,
+                 time.monotonic())))
         if appended is not None and text and not reason and voice_action is None:
             sotto.record_totals(text, len(raw) / max(native_rate, 1.0))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
@@ -972,11 +973,13 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     hook = win_hotkey.TriggerHook(engine, trigger=trigger)
     hook.start()
 
-    def insert_one(text: str, prefs: DeliveryPrefs) -> None:
+    def insert_one(text: str, prefs: DeliveryPrefs, ready_at: float) -> None:
         """Never insert while a modifier key is held — synthetic keystrokes or
         Ctrl+V during a hold race the release edge and could combine with it.
-        A key held past INSERT_WAIT_S keeps the text in History instead."""
-        deadline = time.monotonic() + INSERT_WAIT_S
+        A text not inserted within INSERT_WAIT_S of being ready stays in History
+        instead; the wait counts from ready_at, so a queued text never gets a
+        fresh wait after the ones ahead of it used theirs up."""
+        deadline = ready_at + INSERT_WAIT_S
         deferred = False
         while hook.modifiers_held:
             if shutdown.requested():
@@ -1025,14 +1028,14 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     def delivery_worker() -> None:
         while not shutdown.requested():
             try:
-                text, prefs, copy_only = deliveries.get(timeout=0.05)
+                text, prefs, copy_only, ready_at = deliveries.get(timeout=0.05)
             except queue.Empty:
                 continue
             try:
                 if copy_only and text is SCRATCH:
                     pass  # finished from the tray: there is no insertion to undo
                 else:
-                    copy_instead(text) if copy_only else insert_one(text, prefs)
+                    copy_instead(text) if copy_only else insert_one(text, prefs, ready_at)
             except Exception as exc:
                 log(f"! not inserted ({str(exc)[:120]}) — kept in history")
             finally:

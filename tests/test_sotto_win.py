@@ -879,6 +879,58 @@ class FailureAndTeardownTest(unittest.TestCase):
         self.assertTrue(np.allclose(whisper_calls[1][0], whisper_calls[2][0], atol=1e-4),
                         "Retry transcribes the audio the failed attempt had")
 
+    def test_a_queued_insertion_never_outlives_its_own_wait(self):
+        # [F46] Each queued text got a fresh modifier wait after the ones ahead
+        # of it used theirs up, so dictation N could land N waits late.
+        import contextlib
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs, delivered = [], [], [], [], []
+        fakes = _app_fakes(rate, [voiced, voiced.copy()], ["first words", "second words"], hooks, [])
+        ready: list[float] = []
+        wait_s = 2.0
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-held-") as temporary:
+            data = Path(temporary)
+
+            def drive():
+                try:
+                    _wait_for(lambda: controllers and hooks, "listening")
+                    hook = hooks[0]
+                    hook.modifiers_held = True  # e.g. a stuck Shift: nothing may be inserted
+                    for index in range(2):
+                        hook.engine.pressed()
+                        time.sleep(0.45)
+                        hook.engine.released()
+                        _wait_for(lambda: len(HistoryStore(data).entries(10)) > index, "the History row")
+                        ready.append(time.monotonic())
+                    # Past the second text's own wait (with a margin), but well
+                    # before a second full wait after the first one expired.
+                    time.sleep(max(0.0, ready[1] + wait_s + 0.4 - time.monotonic()))
+                    hook.modifiers_held = False
+                    time.sleep(0.6)
+                finally:
+                    boundaries[0].request()
+
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, fakes, logs=logs, boundaries=boundaries, controllers=controllers)
+                stack.enter_context(mock.patch.object(sotto_win, "INSERT_WAIT_S", wait_s))
+                stack.enter_context(mock.patch.object(
+                    sotto_win.win_inject, "deliver", lambda text, **kwargs: delivered.append(text)))
+                driver = threading.Thread(target=drive, daemon=True)
+                driver.start()
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+                driver.join(10)
+            texts = [entry["text"] for entry in HistoryStore(data).entries(10)][::-1]
+
+        self.assertLess(ready[1] - ready[0], wait_s - 0.5, "the test needs both texts ready close together")
+        self.assertEqual(delivered, [], "no text is inserted after its own wait ran out")
+        self.assertEqual(sum(line.startswith("! not inserted (a modifier key held") for line in logs), 2, logs)
+        self.assertEqual(texts, ["first words", "second words"], "both stay in History")
+
 
 if __name__ == "__main__":
     unittest.main()
