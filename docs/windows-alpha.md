@@ -180,6 +180,14 @@ Opening the tray menu takes the focus away from the app you were dictating
 into, so a dictation finished with **Finish dictation** is copied to the
 clipboard (a notification says so) instead of being inserted.
 
+Voice commands work as on the Mac (English dictation, Settings can turn them
+off): "new line", "new paragraph", and **"scratch that"** said on its own,
+which undoes your last dictation with the app's own Ctrl+Z. It only undoes
+Sotto's own insert: within a minute of it, while the same window is still in
+front, and only if you have not typed since; otherwise nothing happens and
+`sotto.log` says why. A "scratch that" finished from the tray undoes nothing
+(the menu has the focus), and a notification says so.
+
 ## Settings
 
 | Setting | Choices | Applies |

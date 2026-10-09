@@ -1246,22 +1246,38 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             undo_last_dictation()
             return
         try:
-            win_inject.deliver(text, mode=prefs.insert_mode, spacing=prefs.spacing, log=log)
-            last_delivery["at"] = time.monotonic()
+            # The insert's target and the user's key-downs so far, read
+            # before it: "scratch that" may undo only this insert, there.
+            target, keydowns = win_inject.foreground_identity(), hook.keydowns
+            if win_inject.deliver(text, mode=prefs.insert_mode, spacing=prefs.spacing, log=log):
+                last_delivery["insert"] = {"at": time.monotonic(), "target": target,
+                                           "keydowns": keydowns}
         except OSError as exc:
             log(f"! not inserted ({str(exc)[:120]}) — kept in history")
 
-    last_delivery = {"at": 0.0}
+    last_delivery: dict = {"insert": None}  # the insert "scratch that" may undo
 
     def undo_last_dictation() -> None:
-        """'scratch that': the app's own Ctrl+Z, only for a dictation Sotto
-        inserted within the last minute."""
+        """'scratch that': the app's own Ctrl+Z, only for Sotto's own insert
+        within the last minute, with the same window still in front and
+        nothing typed by the user since (the Mac's DeliveryQueue._undo)."""
         import voice_commands
-        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
+        last = last_delivery["insert"]
+        if last is None or time.monotonic() - last["at"] > voice_commands.SCRATCH_WINDOW_S:
             log("  scratch that: nothing recent to undo")
             return
+        target = win_inject.foreground_identity()
+        if target is None or last["target"] is None:  # None == None proves nothing
+            log("  scratch that: the window in front is unknown — nothing undone")
+            return
+        if target != last["target"]:
+            log("  scratch that: the dictation went to another window — nothing undone")
+            return
+        if hook.keydowns != last["keydowns"]:
+            log("  scratch that: you typed since the dictation — nothing undone")
+            return
         win_inject.send_inputs(win_inject.chord_inputs(win_inject.VK_CONTROL, VK_Z))
-        last_delivery["at"] = 0.0
+        last_delivery["insert"] = None
         log("↶ scratch that — undid the last dictation")
 
     def copy_instead(text: str) -> None:

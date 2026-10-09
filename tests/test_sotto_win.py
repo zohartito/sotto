@@ -655,6 +655,7 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
         def __init__(self, engine, *, trigger):
             self.engine, self.trigger = engine, trigger
             self.physically_down = self.modifiers_held = self.stopped = False
+            self.keydowns = 0  # the user's own key-downs (TriggerHook.keydowns)
             hooks.append(self)
 
         def start(self): pass
@@ -1812,6 +1813,141 @@ class ConsoleLogTest(unittest.TestCase):
         self.assertEqual("".join(written), "● recording\n○ 0.98s captured\n")
         print("after drain", file=sink)  # written directly once the writer has stopped
         self.assertTrue("".join(written).endswith("after drain\n"), written)
+
+def _fake_tray(notes: list):
+    """A tray that records its notifications (win_ui.TrayApp's surface)."""
+    class FakeTray:
+        def __init__(self, *, quit, log):
+            pass
+
+        def start(self): pass
+        def stop(self): pass
+        def set_phase(self, phase): pass
+        def set_state(self, state): pass
+        def attach(self, controller): pass
+
+        def notify(self, text):
+            notes.append(text)
+
+    return FakeTray
+
+
+def _voiced(seconds: float = 1.0):
+    import numpy as np
+    rate = 16_000
+    return (np.sin(np.arange(int(rate * seconds)) / 3) * 0.2).astype(np.float32)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class RoundTwoRunTest(unittest.TestCase):
+    """Round-2 audit rows against a running ``run`` (fake key, mic, model, tray)."""
+
+    ENGLISH = dict(user_settings.DEFAULTS, languages=["en"]) if sys.platform == "win32" else {}
+
+    def run_app(self, fakes, drive, data, *, settings=None, extra=()):
+        """Run the app until ``drive(results, app)`` returns; returns the
+        results, what was inserted and copied, the tray's notes and the logs."""
+        import contextlib
+        hooks_controllers = {"boundaries": [], "controllers": []}
+        app = {"delivered": [], "copied": [], "notes": [], "logs": [], "hooks": fakes[3],
+               "controllers": hooks_controllers["controllers"]}
+        results: dict = {}
+
+        def guarded():
+            try:
+                _wait_for(lambda: app["controllers"] and app["hooks"], "listening")
+                drive(results, app)
+            except BaseException as exc:
+                results["error"] = exc
+            finally:
+                hooks_controllers["boundaries"][0].request()
+
+        with contextlib.ExitStack() as stack:
+            _patched_run(stack, data, fakes[:3], logs=app["logs"],
+                         boundaries=hooks_controllers["boundaries"],
+                         controllers=app["controllers"], settings=settings)
+            stack.enter_context(mock.patch("win_ui.TrayApp", _fake_tray(app["notes"])))
+            stack.enter_context(mock.patch("win_ui.message_box"))
+            stack.enter_context(mock.patch.object(
+                sotto_win.win_inject, "deliver",
+                lambda text, **kwargs: app["delivered"].append(text) or kwargs["mode"]))
+            stack.enter_context(mock.patch.object(sotto_win.win_inject, "copy_text",
+                                                  app["copied"].append))
+            for patch in extra:
+                stack.enter_context(patch)
+            driver = threading.Thread(target=guarded, daemon=True)
+            driver.start()
+            sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu", tray=True)
+            driver.join(10)
+        self.assertNotIn("error", results, (results, app["logs"]))
+        return results, app
+
+    @staticmethod
+    def fakes(captures, replies, whisper_calls=None):
+        hooks: list = []
+        return (*_app_fakes(16_000, captures, replies, hooks,
+                            [] if whisper_calls is None else whisper_calls), hooks)
+
+    @staticmethod
+    def dictate(app, settle=True):
+        """Hold the trigger 0.45 s (a hold, not a tap), then wait until the
+        capture is transcribed and delivered."""
+        hook, controller = app["hooks"][0], app["controllers"][0]
+        hook.physically_down = True  # or the resync poller may end the hold early
+        hook.engine.pressed()
+        time.sleep(0.45)
+        hook.physically_down = False
+        hook.engine.released()
+        if settle:
+            _wait_for(lambda: not controller.busy(), "the dictation to settle")
+
+    def test_scratch_that_undoes_only_sottos_own_insert_in_the_same_window(self):
+        # [F7w] Windows sent Ctrl+Z within the minute whatever had happened:
+        # to another window, after the user typed, or after an insert that
+        # inserted nothing.  Now it follows the Mac's rules.
+        steps = [  # (reply, what the insert does, window in front, user typed first)
+            ("first words", "", (101, 7), False),     # nothing was inserted
+            ("scratch that", "", (101, 7), False),     # -> nothing to undo
+            ("second words", "type", (101, 7), False),
+            ("scratch that", "type", (202, 9), False),  # another window in front
+            ("scratch that", "type", (101, 7), True),   # the user typed since
+            ("third words", "type", (101, 7), False),
+            ("scratch that", "type", (101, 7), False),  # -> undone
+            ("scratch that", "type", (101, 7), False),  # nothing left to undo
+            ("fourth words", "type", None, False),      # no window to compare
+            ("scratch that", "type", None, False),
+        ]
+        replies = [reply for reply, *_ in steps]
+        fakes = self.fakes([_voiced() for _ in steps], replies)
+        state = {"inserts": "", "window": None}
+        asked, undos = [], []
+
+        def deliver(text, *, mode, spacing, log):
+            asked.append(text)
+            return state["inserts"]
+
+        def drive(results, app):
+            hook = app["hooks"][0]
+            results["undos_after"] = []
+            for _reply, inserts, window, typed in steps:
+                state["inserts"], state["window"] = inserts, window
+                if typed:
+                    hook.keydowns += 1
+                self.dictate(app)
+                results["undos_after"].append(len(undos))
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-scratch-") as temporary:
+            results, app = self.run_app(fakes, drive, Path(temporary), settings=self.ENGLISH, extra=(
+                mock.patch.object(sotto_win.win_inject, "deliver", deliver),
+                mock.patch.object(sotto_win.win_inject, "send_inputs", undos.append),
+                mock.patch.object(sotto_win.win_inject, "foreground_identity",
+                                  lambda: state["window"], create=True)))
+        self.assertEqual(asked, ["first words", "second words", "third words", "fourth words"])
+        self.assertEqual(results["undos_after"], [0, 0, 0, 0, 0, 0, 1, 1, 1, 1], app["logs"])
+        self.assertEqual(len(undos[0]), 4, "one Ctrl+Z chord")
+        for reason in ("nothing recent to undo", "went to another window",
+                       "you typed since", "window in front is unknown"):
+            self.assertTrue(any(reason in line for line in app["logs"]), (reason, app["logs"]))
 
 
 if __name__ == "__main__":
