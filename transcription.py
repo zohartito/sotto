@@ -135,7 +135,11 @@ class TranscriptionWorker:
         Side effects: may append one History row and show one alert; logs."""
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
         if job[0] == "live" and self._live_row is None and not self._live_reported:
-            _, raw, native_rate, captured_ts, queued_at, _capture_id, job_config, _stream = job
+            _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, _stream = job
+            if self.adaptive_runtime is not None:
+                # The capture is kept below as an ordinary row under a new id;
+                # drop any unadopted adaptive staging of it first.
+                discard_staged_adaptive_live_audio(self.adaptive_runtime.history, capture_id)
             self._keep_failed_live_capture(exc, raw=raw, native_rate=native_rate, captured_ts=captured_ts,
                                            queued_at=queued_at, job_config=job_config, preprocessing={})
         elif job[0] == "retry" and not self._retry_committed:

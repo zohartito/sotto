@@ -811,6 +811,23 @@ class RoundTwoWorkerTests(TemporaryUserFiles, unittest.TestCase):
             h.run_jobs(h.live_job(raw))
         FailureHandlingTests.assert_kept_for_retry(self, h, raw, "RuntimeError")
 
+    def test_f4b_an_adaptive_failure_drops_its_staged_audio_before_the_fallback_row(self):
+        # The adaptive lane staged audio/<capture_id>.wav, then a later step
+        # raised: the capture is kept as an ordinary row under a new id, so the
+        # unadopted staging copy must go first (no unindexed duplicate).
+        h, raw = Harness(says("never used")), speech(2.0)
+        history = object()
+        h.worker.adaptive_runtime = types.SimpleNamespace(history=history)
+        order = []
+        h.coordinator._append = lambda text, *a, **k: (order.append("append"), {"id": "row9", "text": text})[1]
+        staged = ("adaptive text", {"repo": "adaptive/model"}, "audio/cap0001.wav")
+        with patch("transcription.adaptive_live_transcribe_prepared", return_value=staged), \
+             patch("transcription.discard_staged_adaptive_live_audio",
+                   side_effect=lambda hist, capture_id: order.append(("discard", hist, capture_id))), \
+             patch("transcription.screen", side_effect=RuntimeError("screen broke")):
+            h.run_jobs(h.live_job(raw))
+        self.assertEqual(order, [("discard", history, "cap0001"), "append"], h.logs)
+
     def test_f4b_a_capture_that_cannot_even_be_prepared_still_tells_the_user(self):
         h = Harness(says("never transcribed"))
         with patch("transcription.prepare_for_whisper", side_effect=ValueError("bad buffer")):
