@@ -188,6 +188,9 @@ class SpeechRuntimeTests(unittest.TestCase):
             handler = signal.getsignal(signal.SIGTERM)
             self.assertIsNot(handler, prior)
             handler(signal.SIGTERM, None)  # deterministic handler invocation, no OS signal
+            self.assertFalse(boundary.requested())  # the first one drains like Quit (F1c)
+            self.assertTrue(boundary.stop_event.is_set())
+            handler(signal.SIGTERM, None)  # a second one stops at once
             self.assertTrue(boundary.requested())
         self.assertIs(signal.getsignal(signal.SIGTERM), prior)
         capture = Capture()

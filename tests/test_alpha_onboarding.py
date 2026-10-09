@@ -375,12 +375,6 @@ class QuitDrainTests(unittest.TestCase):
         self.assertEqual(pasted, ["hello"])
         self.assertFalse(sotto.dictation_in_flight(capture, jobs, deliveries))
 
-    def test_quit_waits_for_deliveries_before_requesting_shutdown(self):
-        quit_source = _closure_source("action_quit")
-        drain = quit_source.index("dictation_in_flight(capture, jobs, pending_deliveries)")
-        self.assertLess(drain, quit_source.index("shutdown.request()"))
-        self.assertIn("deadline_s=QUIT_DRAIN_S", quit_source)
-
     def test_every_delivery_goes_through_the_counted_queue(self):
         # Both deliver_call targets only enqueue; DeliveryQueue finishes each
         # entry (on_done=pending_deliveries.finish) when it delivers, drops or
@@ -392,11 +386,15 @@ class QuitDrainTests(unittest.TestCase):
     def test_update_and_engine_restarts_also_wait_for_the_paste(self):
         # The update restart and the engine switch restart the process too, so
         # they must count a scheduled paste as busy, like Quit: every in-flight
-        # check in run() goes through dictation_in_flight.
+        # check in run() goes through Lifecycle.busy (dictation_in_flight).
+        # Quit, Restart and the signal drain are behaviour-tested in
+        # tests/test_mac_lifecycle.py.
+        self.assertIn("busy=lambda: dictation_in_flight(capture, jobs, pending_deliveries,",
+                      inspect.getsource(sotto.run))
         for name in ("action_apply_update", "action_set_engine"):
             source = _closure_source(name)
             self.assertNotIn("jobs.unfinished_tasks", source, name)
-            self.assertIn("dictation_in_flight(capture, jobs, pending_deliveries)", source, name)
+            self.assertIn("lifecycle.busy()", source, name)
 
     def test_a_finishing_capture_stays_in_flight_until_its_job_is_queued(self):
         # capture.end() makes the capture inactive before the job is queued; the
@@ -440,8 +438,10 @@ class FinishCaptureNowTests(unittest.TestCase):
         on_finish.assert_not_called()
 
     def test_quit_and_finish_now_share_it(self):
-        for name in ("action_quit", "action_finish_now"):
-            self.assertIn("end_capture_now(engine, capture, on_finish)", _closure_source(name), name)
+        # Quit, Restart and the signal drain end it through Lifecycle.end_recording.
+        self.assertIn("end_recording=lambda: end_capture_now(engine, capture, on_finish)",
+                      inspect.getsource(sotto.run))
+        self.assertIn("end_capture_now(engine, capture, on_finish)", _closure_source("action_finish_now"))
 
 
 class EngineInstallerTests(unittest.TestCase):

@@ -76,6 +76,10 @@ HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
 QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
+# launchd SIGKILLs Sotto's job 5 s after SIGTERM (`launchctl print` shows
+# "exit timeout = 5"; logout, kickstart -k and rollout all send SIGTERM), so
+# the SIGTERM drain leaves the teardown time to finish.
+SIGTERM_DRAIN_S = 2.0
 # An installed update restarts once dictation is done: the longest recording
 # (the hands-free watchdog) plus time to transcribe and paste it, then anyway.
 UPDATE_DRAIN_DEADLINE_S = HANDS_FREE_MAX_S + 120.0
@@ -94,12 +98,25 @@ class ShutdownBoundary:
 
     def __init__(self) -> None:
         self.event = threading.Event()
+        # Set by the first SIGINT/SIGTERM: Lifecycle.watch_signals then stops
+        # the way Quit does, finishing the dictation in flight (F1c).
+        self.stop_event = threading.Event()
+        self.stop_signal = None
 
     def requested(self) -> bool:
         return self.event.is_set()
 
     def request(self, *_unused) -> None:
         self.event.set()
+
+    def request_stop(self, signum=None, _frame=None) -> None:
+        """SIGINT/SIGTERM handler, event-only: the first one asks for Quit's
+        drained stop; another one while that drains stops at once."""
+        if self.stop_event.is_set():
+            self.event.set()
+            return
+        self.stop_signal = signum
+        self.stop_event.set()
 
     def enqueue(self, jobs: queue.Queue, job: tuple) -> bool:
         """Queue work only while live; race with shutdown is discarded below."""
@@ -139,12 +156,13 @@ class ShutdownBoundary:
 
 @contextmanager
 def shutdown_signal_handlers(boundary: ShutdownBoundary):
-    """Install event-only SIGTERM/SIGINT handlers and restore embedded callers."""
+    """Install event-only SIGTERM/SIGINT handlers and restore embedded callers.
+    The first signal asks for a drained stop (see ShutdownBoundary.request_stop)."""
     previous: dict[int, object] = {}
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.getsignal(sig)
-            signal.signal(sig, boundary.request)
+            signal.signal(sig, boundary.request_stop)
     try:
         yield boundary
     finally:
@@ -599,10 +617,12 @@ def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep,
     return True
 
 
-def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries) -> bool:
+def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries, *, warming: bool = False) -> bool:
     """Whether a dictation is still recording, transcribing, or waiting to be
-    pasted — the three stages Quit lets finish before shutting down."""
-    return capture.is_active() or jobs.unfinished_tasks > 0 or deliveries.count() > 0
+    pasted — the three stages Quit lets finish before shutting down.
+    ``warming``: the one queued or running model rewarm is not a dictation (N40)."""
+    return (capture.is_active() or jobs.unfinished_tasks > int(warming)
+            or deliveries.count() > 0)
 
 
 def end_capture_now(engine, capture, on_finish) -> str | None:
@@ -693,6 +713,117 @@ class CaptureGate:
     def reopen(self) -> None:
         with self._lock:
             self._open = True
+
+
+class Lifecycle:
+    """Who holds the capture gate closed, and the drained stop.
+
+    Quit, the menu Restart, an installed update and an engine switch close
+    the gate for a reason; ``closed`` names it ("quitting", "restarting",
+    "updating", "switching engines") and is None while Sotto runs normally.
+    A reason reopens the gate only while it still holds it; Quit takes over
+    from any other reason.
+
+    Quit, the menu Restart and the first SIGINT/SIGTERM stop the same way
+    (F1c, N12): refuse new recordings, end the one in progress as a normal
+    finish, wait until it is transcribed and pasted — at most QUIT_DRAIN_S,
+    SIGTERM_DRAIN_S for SIGTERM — then shut down or restart.
+    """
+
+    def __init__(self, shutdown: ShutdownBoundary, capture_gate: CaptureGate, *,
+                 end_recording, busy, clock=time.monotonic, sleep=time.sleep) -> None:
+        self.shutdown = shutdown
+        self.capture_gate = capture_gate
+        self.end_recording = end_recording  # -> "gesture" | "orphan" | None (end_capture_now)
+        self.busy = busy                    # -> whether a dictation is in flight
+        self.clock, self.sleep = clock, sleep
+        self.closed: str | None = None
+        self._lock = threading.Lock()
+
+    def close(self, reason: str) -> bool:
+        """Refuse new recordings for ``reason``. False (and nothing changes)
+        when Sotto is stopping or the gate is already closed for a reason."""
+        with self._lock:
+            if self.shutdown.requested() or self.closed is not None:
+                return False
+            self.closed = reason
+            self.capture_gate.close()
+            return True
+
+    def reopen(self, reason: str) -> None:
+        """Undo close(reason), unless another reason (a Quit) has taken over."""
+        with self._lock:
+            if self.closed == reason and not self.shutdown.requested():
+                self.closed = None
+                self.capture_gate.reopen()
+
+    def run_if_open(self, action) -> str | None:
+        """Run ``action`` unless the gate is closed; returns why it was refused.
+        Checked and run under the lock, so a drain that closes the gate
+        afterwards sees whatever ``action`` queued as in flight."""
+        with self._lock:
+            if self.shutdown.requested():
+                return "stopping"
+            if self.closed is not None:
+                return self.closed
+            action()
+            return None
+
+    def quit(self, deadline_s: float = QUIT_DRAIN_S) -> bool:
+        """Stop once the dictation in flight is done, waiting at most
+        ``deadline_s``. Returns at once; False when already quitting.
+
+        Side effects: closes the gate as "quitting"; ends the recording in
+        progress; requests shutdown from a thread once idle or out of time."""
+        with self._lock:
+            if self.shutdown.requested() or self.closed == "quitting":
+                return False
+            self.closed = "quitting"
+            self.capture_gate.close()
+        self._finish_recording("quitting")
+        self._drain_then("quitting", deadline_s, self.shutdown.request)
+        return True
+
+    def restart(self, request_restart) -> bool:
+        """The menu Restart: drain like Quit, then call
+        ``request_restart(after_failure=...)``, which reopens the gate if the
+        restart does not happen. False when the gate is already closed."""
+        if not self.close("restarting"):
+            return False
+        self._finish_recording("restarting")
+
+        def restart_unless_quitting() -> None:
+            if self.closed == "restarting":
+                request_restart(after_failure=lambda: self.reopen("restarting"))
+        self._drain_then("restarting", QUIT_DRAIN_S, restart_unless_quitting)
+        return True
+
+    def watch_signals(self) -> None:
+        """Thread target: the first SIGINT/SIGTERM quits as the menu's Quit
+        does (the handler itself only sets an event)."""
+        self.shutdown.stop_event.wait()
+        self.quit(SIGTERM_DRAIN_S if self.shutdown.stop_signal == signal.SIGTERM else QUIT_DRAIN_S)
+
+    def _finish_recording(self, verb: str) -> None:
+        try:
+            ended = self.end_recording()
+        except Exception as exc:
+            ended = None
+            log(f"! could not finish the recording before {verb}: {str(exc)[:160]}")
+        if ended:
+            log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} before {verb}")
+
+    def _drain_then(self, verb: str, deadline_s: float, then) -> None:
+        def work() -> None:
+            try:
+                if not wait_until_idle(lambda: self.busy() and not self.shutdown.requested(),
+                                       deadline_s=deadline_s, clock=self.clock, sleep=self.sleep):
+                    log(f"! dictation still running after {deadline_s:.0f}s — {verb} anyway")
+            except Exception as exc:
+                log(f"! {verb} without waiting: {str(exc)[:160]}")
+            finally:
+                then()
+        threading.Thread(target=work, daemon=True, name=f"sotto-{verb}").start()
 
 
 def choose_language(probabilities: dict, allowed) -> str:
@@ -2947,14 +3078,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         with capture_gate.starting() as allowed:
             if shutdown.requested():
                 return
-            if not allowed:
-                log("● an update is restarting Sotto; dictation resumes in a moment")
-                return
-            stream = None
-            if use_nemotron:
-                from streaming_audio import StreamingCapture
-                stream = StreamingCapture(nemotron)
-            cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
+            if allowed:
+                stream = None
+                if use_nemotron:
+                    from streaming_audio import StreamingCapture
+                    stream = StreamingCapture(nemotron)
+                cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
+        if not allowed:
+            # Quit, Restart, an update or an engine switch is draining (N3,
+            # the Mac side of Windows F70): the mic stays closed, and the
+            # gesture ends too, as on_mic_failed does, or it would believe it
+            # is recording and a hands-free orb would stay up with no mic.
+            log(f"○ Sotto is {lifecycle.closed or 'restarting'} — this press is ignored")
+            hands_free = engine.snapshot()[1]  # a menu start: its orb shows next
+            engine.force_finish(finish=hide_refused_start if hands_free else (lambda: None))
+            return
         now = time.monotonic()
         if model_rewarm_due(model_activity["last_finished"], now,
                             rewarming=bool(model_activity["rewarming"]),
@@ -3028,6 +3166,13 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if status_ui:
             ui_call(status_ui.show_hands_free, hands_free_hint(binding["trigger"]))
 
+    def hide_refused_start() -> None:
+        """The finish of a hands-free start the closed gate refused: there is
+        no capture, so only its orb goes away. A refused key press shows no
+        orb, and hiding then would hide a draining dictation's one."""
+        if status_ui:
+            ui_call(status_ui.hide)
+
     def on_mic_failed() -> None:
         """The engine never started under this capture (device busy or gone).
         End the gesture so the key-up finds nothing to finish, and say so
@@ -3045,6 +3190,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     engine = GestureEngine(on_start, on_finish, on_discard, on_hands_free=on_hands_free)
     capture.on_start_failed = on_mic_failed
+    lifecycle = Lifecycle(
+        shutdown, capture_gate, end_recording=lambda: end_capture_now(engine, capture, on_finish),
+        busy=lambda: dictation_in_flight(capture, jobs, pending_deliveries,
+                                         warming=bool(model_activity["rewarming"])))
     hotkey = parse_hotkey(hotkey_spec) if hotkey_spec else None
     hotkey_state: dict = {"pressed_at": None, "skip_up": False}
     if hotkey_spec and hotkey is None:
@@ -3336,6 +3485,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             shutdown.discard_queued(jobs)
 
     threading.Thread(target=shutdown_watcher, daemon=True).start()
+    threading.Thread(target=lifecycle.watch_signals, daemon=True, name="sotto-signals").start()
 
     if status_ui is not None:
         # menu actions + system lifecycle hooks
@@ -3357,8 +3507,15 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             threading.Thread(target=work, daemon=True).start()
 
         def action_retry(entry_id: str) -> None:
-            shutdown.enqueue(jobs, ("retry", entry_id, time.monotonic(), uuid.uuid4().hex,
-                                    current_speech_config()))
+            """Refused while Quit, Restart, an update or an engine switch
+            drains (N18, the Mac side of F73): new work would keep it waiting."""
+            refused = lifecycle.run_if_open(
+                lambda: shutdown.enqueue(jobs, ("retry", entry_id, time.monotonic(), uuid.uuid4().hex,
+                                                current_speech_config())))
+            if refused:
+                log(f"○ Sotto is {refused} — Retry refused")
+                ui_call(status_ui.show_error, "Not retried",
+                        f"Sotto is {refused}. Retry once it is running again.")
 
         def action_set_language(mode: str) -> None:
             if adaptive or use_nemotron or use_parakeet:
@@ -3375,24 +3532,31 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         def action_set_engine(mode: str) -> None:
             if adaptive or not engine_switching or mode == active_engine:
                 return
-            if dictation_in_flight(capture, jobs, pending_deliveries):
+            if lifecycle.busy():
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Switch engines after the current recording and transcription finish.")
                 return
+            # The restart discards a capture in progress: refuse new ones
+            # first, then check again, as the update restart does (N8).
+            if not lifecycle.close("switching engines"):
+                ui_call(status_ui.show_error, "Could not change engine",
+                        f"Sotto is {lifecycle.closed or 'stopping'}.")
+                return
+
+            def failed(message: str) -> None:
+                lifecycle.reopen("switching engines")
+                ui_call(status_ui.show_error, "Could not change engine", message[:160])
             try:
                 if mode == "nemotron":
                     from nemotron_backend import installation
                     installation()  # verify before persisting a restart choice
                 if mode == "parakeet" and not parakeet_cached():
                     raise RuntimeError("Download Parakeet first: Settings → Download Parakeet.")
-                if dictation_in_flight(capture, jobs, pending_deliveries):
+                if lifecycle.busy():
                     raise RuntimeError("Finish the current dictation before switching engines.")
-                persist_engine_and_restart(
-                    mode, restart.request,
-                    on_failure=lambda message: ui_call(
-                        status_ui.show_error, "Could not change engine", message[:160]))
+                persist_engine_and_restart(mode, restart.request, on_failure=failed)
             except Exception as exc:
-                ui_call(status_ui.show_error, "Could not change engine", str(exc)[:160])
+                failed(str(exc))
 
         def action_save(entry_id: str) -> None:
             def work() -> None:
@@ -3552,12 +3716,25 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log("● orphan capture finished via menu")
 
         def action_start_now() -> None:
+            """Hands-free from the menu; refused while the gate is closed (N3).
+            A start that races the gate closing is refused by on_start."""
             if shutdown.requested():
+                return
+            if lifecycle.closed:
+                log(f"○ Sotto is {lifecycle.closed} — dictation not started")
                 return
             if engine.force_start():
                 log("● dictation started via menu (hands-free)")
 
-        def action_restart(after_failure=None) -> None:
+        def action_restart() -> None:
+            """The menu's Restart: finish the dictation in flight like Quit,
+            then restart (N12)."""
+            if lifecycle.restart(restart_now):
+                log("● restart requested from the menu — after the current dictation")
+            else:
+                log(f"○ Sotto is {lifecycle.closed or 'stopping'} — restart not requested")
+
+        def restart_now(after_failure=None) -> None:
             """Restart this foreground process or its own sealed supervisor.
             after_failure runs if the restart does not happen."""
             def failed(message: str) -> None:
@@ -3567,27 +3744,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             try:
                 if not restart.request(on_failure=failed):
                     raise RuntimeError("Sotto is already shutting down")
-                log("● restart requested from the menu")
+                log("● restarting Sotto")
             except Exception as exc:
                 failed(str(exc))
 
         def action_quit() -> None:
             """Quit once the dictation in progress is done, waiting at most
-            QUIT_DRAIN_S. Side effects: refuses new recordings, ends the
-            recording in progress (even one the gesture engine lost), waits
-            until it is pasted, then requests shutdown."""
-            if shutdown.requested():
-                return
-            capture_gate.close()
-            if end_capture_now(engine, capture, on_finish):
-                log("● finishing the recording before quitting")
-
-            def work() -> None:
-                if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
-                                       deadline_s=QUIT_DRAIN_S):
-                    log(f"! dictation still running after {QUIT_DRAIN_S:.0f}s — quitting anyway")
-                shutdown.request()
-            threading.Thread(target=work, daemon=True).start()
+            QUIT_DRAIN_S (Lifecycle.quit; Ctrl-C and SIGTERM stop the same
+            way). Side effects: refuses new recordings, ends the recording in
+            progress (even one the gesture engine lost), waits until it is
+            pasted, then requests shutdown."""
+            lifecycle.quit()
 
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
@@ -3727,7 +3894,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Update this checkout with the installer, then restart into it."""
             if update_state["running"]:
                 return
-            if dictation_in_flight(capture, jobs, pending_deliveries):
+            if lifecycle.busy():
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Update after the current recording and transcription finish.")
                 return
@@ -3745,12 +3912,15 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     # A restart discards any recording or transcription in progress,
                     # and the user may have dictated while the update ran. Refuse new
                     # recordings first, then drain, so none can start in between.
-                    capture_gate.close()
-                    if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                    if not lifecycle.close("updating"):
+                        log(f"○ Sotto is {lifecycle.closed or 'stopping'}; the update applies at the next start")
+                        return
+                    if not wait_until_idle(lambda: lifecycle.busy() and lifecycle.closed == "updating",
                                            deadline_s=UPDATE_DRAIN_DEADLINE_S):
                         log(f"! dictation still running after {UPDATE_DRAIN_DEADLINE_S:.0f}s — "
                             "restarting into the update anyway")
-                    action_restart(after_failure=capture_gate.reopen)
+                    if lifecycle.closed == "updating":  # else a Quit took over
+                        restart_now(after_failure=lambda: lifecycle.reopen("updating"))
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
                     ui_call(status_ui.show_error, "Update not finished",
