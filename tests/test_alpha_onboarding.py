@@ -381,13 +381,13 @@ class QuitDrainTests(unittest.TestCase):
         self.assertLess(drain, quit_source.index("shutdown.request()"))
         self.assertIn("deadline_s=QUIT_DRAIN_S", quit_source)
 
-    def test_every_delivery_reports_done_and_still_refuses_after_shutdown(self):
-        for name in ("inject_when_clear", "undo_when_clear"):
-            source = _closure_source(name)
-            self.assertIn("finally:\n", source, name)
-            self.assertIn("pending_deliveries.finish()", source.split("finally:", 1)[1], name)
-            self.assertLess(source.index("if shutdown.requested():"),
-                            source.index("finally:"), name)
+    def test_every_delivery_goes_through_the_counted_queue(self):
+        # Both deliver_call targets only enqueue; DeliveryQueue finishes each
+        # entry (on_done=pending_deliveries.finish) when it delivers, drops or
+        # clears it, and posts nothing after shutdown — behaviour pinned in
+        # tests/test_delivery.py PendingDeliveriesAccountingTests.
+        self.assertIn("delivery.paste(text)", _closure_source("inject_when_clear"))
+        self.assertIn("delivery.undo()", _closure_source("undo_when_clear"))
 
     def test_update_and_engine_restarts_also_wait_for_the_paste(self):
         # The update restart and the engine switch restart the process too, so

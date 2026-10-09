@@ -2249,11 +2249,16 @@ class DeliveryQueue:
 
     Every method runs on the main thread (deliver_call / AppHelper.callAfter);
     the poll timer only bounces back there, so there is no lock.
+
+    on_done runs exactly once for every item the queue takes — when it is
+    delivered (even if the insert raises), dropped after a long hold, or
+    cleared at shutdown — so run() can count it in PendingDeliveries from the
+    moment deliver_call schedules it until it leaves the queue.
     """
 
     def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
                  secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
-                 clock=time.monotonic, timer=threading.Timer) -> None:
+                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None) -> None:
         self._insert = insert            # (text) -> bool: did the text reach the app?
         self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
         self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
@@ -2267,6 +2272,7 @@ class DeliveryQueue:
         self._shutdown_requested = shutdown_requested
         self._clock = clock
         self._timer = timer
+        self._on_done = on_done          # () -> None: one item left the queue
         self._items: list[tuple] = []
         self._poll_armed = False
         self._waiting = False
@@ -2284,7 +2290,7 @@ class DeliveryQueue:
     def _pump(self) -> None:
         while self._items:
             if self._shutdown_requested():  # checked per item: Quit can land mid-pump
-                self._items.clear()
+                self._discard_all()  # nothing is posted once shutdown is requested
                 return
             if self._keys_held():
                 self._wait_or_drop()
@@ -2302,6 +2308,14 @@ class DeliveryQueue:
                 if item[0] == "paste":
                     self._note("Could not paste the dictation",
                                "It is in History. Open History to copy the text.")
+            finally:
+                self._on_done()
+
+    def _discard_all(self) -> None:
+        """Drop every waiting item; each one still reports done."""
+        items, self._items = self._items, []
+        for _item in items:
+            self._on_done()
 
     def _wait_or_drop(self) -> None:
         now = self._clock()
@@ -2311,7 +2325,7 @@ class DeliveryQueue:
             self._blocked_since = now
         elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
             dropped = sum(1 for item in self._items if item[0] == "paste")
-            self._items.clear()
+            self._discard_all()
             self._blocked_since = None
             self._waiting = False
             self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — "
@@ -3028,8 +3042,12 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         insert=insert_text, undo_keys=lambda: post_command_key(6), keys_held=keys_held,
         recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
         keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
-        call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested)
+        call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested,
+        on_done=pending_deliveries.finish)
 
+    # deliver_call counts each of these in pending_deliveries when it schedules
+    # it; the queue's on_done finishes that entry once the item is delivered,
+    # dropped or cleared, so Quit and the update restart wait for the paste.
     def inject_when_clear(text: str, _attempts: int = 0) -> None:
         """Queue a finished dictation for the cursor (worker call shape kept)."""
         delivery.paste(text)

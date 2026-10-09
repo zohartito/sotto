@@ -313,7 +313,7 @@ class DeliveryQueueHarness:
     """A DeliveryQueue over fakes: a virtual clock, scripted key/recording
     state, and recorders for inserts, undos, notes and log lines."""
 
-    def __init__(self, *, held_until=0.0, recording_while_held=True, pid=4242):
+    def __init__(self, *, held_until=0.0, recording_while_held=True, pid=4242, on_done=None):
         self.timers = VirtualTimers()
         self.held_until = held_until
         self.recording_while_held = recording_while_held
@@ -331,7 +331,7 @@ class DeliveryQueueHarness:
             secure_input=lambda: self.secure, call_after=lambda fn, *args: fn(*args),
             note=lambda title, message: self.notes.append((title, message)), log=self.logs.append,
             shutdown_requested=lambda: self.shutdown, clock=lambda: self.timers.now,
-            timer=self.timers.Timer)
+            timer=self.timers.Timer, **({} if on_done is None else {"on_done": on_done}))
 
     def held(self):
         return self.timers.now < self.held_until
@@ -420,6 +420,102 @@ class DeliveryQueueOrderTests(unittest.TestCase):
         world.shutdown = True
         world.timers.advance_to(3.0)
         self.assertEqual(world.delivered, [])
+
+
+# -- Quit/update drain: every queued item finishes its PendingDeliveries entry --
+
+class PendingDeliveriesAccountingTests(unittest.TestCase):
+    """run() counts a paste or undo in PendingDeliveries from the moment
+    deliver_call schedules it; the queue must finish exactly one entry per
+    item it delivers, drops or clears, or Quit waits its full QUIT_DRAIN_S and
+    the update restart waits for UPDATE_DRAIN_DEADLINE_S."""
+
+    def world(self, **kwargs):
+        self.deliveries = sotto.PendingDeliveries()
+        self.finishes = []
+
+        def on_done():
+            self.finishes.append(1)
+            self.deliveries.finish()
+
+        world = DeliveryQueueHarness(on_done=on_done, **kwargs)
+        self.main_loop = []
+        _ui_call, self.deliver_call = sotto.main_thread_dispatch(
+            has_ui=True, call_after=lambda method, *args: self.main_loop.append((method, args)),
+            deliveries=self.deliveries)
+        return world
+
+    def schedule(self, world, items):
+        """What the worker does: deliver_call(paste/undo) onto the main loop."""
+        for item in items:
+            if item == "undo":
+                self.deliver_call(world.queue.undo)
+            else:
+                self.deliver_call(world.queue.paste, item)
+
+    def run_main_loop(self):
+        while self.main_loop:
+            method, args = self.main_loop.pop(0)
+            method(*args)
+
+    def test_delivered_items_each_finish_one_entry_in_capture_order(self):
+        world = self.world()
+        self.schedule(world, ["one ", "two ", "undo"])
+        self.assertEqual(self.deliveries.count(), 3)          # scheduled, not yet run
+        self.run_main_loop()
+        self.assertEqual([text for text, _t, _held in world.delivered], ["one ", "two "])
+        self.assertEqual(len(world.undos), 1)
+        self.assertEqual(self.deliveries.count(), 0)
+        self.assertEqual(len(self.finishes), 3)               # exactly one each, nothing clamped
+
+    def test_items_dropped_after_a_long_hold_each_finish_one_entry(self):
+        world = self.world(held_until=10_000.0, recording_while_held=False)  # a stuck modifier
+        self.schedule(world, ["one ", "two ", "undo"])
+        self.run_main_loop()
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S - 0.5)
+        self.assertEqual(self.deliveries.count(), 3)          # still waiting inside the bound
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(world.delivered, [])
+        self.assertEqual(world.undos, [])
+        self.assertEqual(len(world.notes), 1)
+        self.assertEqual(self.deliveries.count(), 0)
+        self.assertEqual(len(self.finishes), 3)
+
+    def test_items_cleared_at_shutdown_each_finish_one_entry_and_nothing_is_posted(self):
+        world = self.world(held_until=0.5)                     # waiting behind a held key
+        self.schedule(world, ["one ", "two ", "undo"])
+        self.run_main_loop()
+        self.assertEqual(self.deliveries.count(), 3)
+        world.shutdown = True
+        world.timers.advance_to(3.0)                           # the poll resumes after the key is up
+        self.schedule(world, ["late "])                        # a paste scheduled after shutdown
+        self.run_main_loop()
+        self.assertEqual(world.delivered, [])
+        self.assertEqual(world.undos, [])
+        self.assertEqual(self.deliveries.count(), 0)
+        self.assertEqual(len(self.finishes), 4)
+
+    def test_a_failing_insert_still_finishes_its_entry(self):
+        world = self.world()
+
+        def broken_insert(_text):
+            raise RuntimeError("pasteboard unavailable")
+
+        world.queue._insert = broken_insert
+        self.schedule(world, ["one "])
+        self.run_main_loop()                                  # the queue logs it and moves on
+        self.assertTrue(any("pasteboard unavailable" in line for line in world.logs), world.logs)
+        self.assertEqual(self.deliveries.count(), 0)
+        self.assertEqual(len(self.finishes), 1)
+
+    def test_run_wires_the_queue_to_pending_deliveries(self):
+        tree = ast.parse(open(sotto.__file__, encoding="utf-8").read())
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+        calls = [node for node in ast.walk(run) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "DeliveryQueue"]
+        self.assertEqual(len(calls), 1)
+        on_done = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}.get("on_done")
+        self.assertEqual(on_done, "pending_deliveries.finish")
 
 
 # -- F7: inject() reports whether anything reached the app ----------------------
