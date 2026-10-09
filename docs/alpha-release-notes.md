@@ -13,8 +13,9 @@ computer; there is no account, cloud service or telemetry.
   Parakeet v3 (fastest; 25 European languages) and Nemotron (English,
   streaming while you talk). Windows runs Whisper on an NVIDIA GPU or the CPU.
 - **Your languages.** Automatic picks among the languages you choose (English
-  by default). Speech that is clearly another language is written as spoken
-  rather than translated.
+  by default). With two or more chosen, speech that is clearly another
+  language is written as spoken rather than translated; with one, Sotto skips
+  detection and writes in that language, so add every language you speak.
 - **Fast.** On an M4 Max with synthetic speech: about 0.3 s from release to
   text with Whisper, about 0.13 s at the Fast speed, 50–190 ms with Parakeet and
   about 30 ms with Nemotron.
@@ -55,8 +56,10 @@ PowerShell: `irm https://raw.githubusercontent.com/zohartito/sotto/main/scripts/
 (or clone it and run `scripts\install-windows.ps1`), then start Sotto from the
 Start menu. Details: [windows-alpha.md](windows-alpha.md).
 
-The source archive attached to the release is built deterministically from the
-tagged commit; check it with `shasum -a 256` against the published SHA-256.
+The one-line installers and **Check for Updates** follow the `main` branch,
+which can be ahead of this release. The source archive attached to the release
+is the exact tagged build, made deterministically from the tagged commit; check
+it with `shasum -a 256` against the published SHA-256.
 
 ## Known limitations
 
