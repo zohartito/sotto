@@ -37,9 +37,9 @@ macOS 27.2, M4 Max, CPython 3.12.14 unless noted.
 
 | Check | Result | What it establishes |
 | --- | --- | --- |
-| Source archive built twice from the same commit | Byte-identical, 150 files | Reproducible allowlist; no Git data, environments, models or personal data |
+| Source archive built twice from the same commit | Byte-identical, 170 files (2026-10-09; 150 on 2026-10-01) | Reproducible allowlist; no Git data, environments, models or personal data |
 | Fresh install from that archive | 21 s with a warm pip cache (46 s cold on 2026-09-29), `pip check` clean, installed set == lock (71 packages) | The pinned dependency set is complete |
-| Full suite from the extracted archive | 597 tests OK, 105 skipped (Windows-only, calibration, Python 3.14) | Unit, fixture and mocked-runtime behaviour |
+| Full suite from the extracted archive | 827 tests OK, 156 skipped (Windows-only, calibration, Python 3.14) on 2026-10-09; 597 OK on 2026-10-01 | Unit, fixture and mocked-runtime behaviour |
 | Fresh Python 3.14.7 environment on the production dependency policy (2026-09-29) | 12/12 sealed-release tests, none skipped | The sealed runtime path still verifies and isolates |
 | Gesture acceptance | 8/8 | Hold / double-tap / tap state machine, not real key delivery |
 | First launch download | Pinned Whisper revision fetched once; later launches make no Hub request | Measured against a local fake endpoint: 0 requests when cached |
@@ -52,7 +52,7 @@ macOS 27.2, M4 Max, CPython 3.12.14 unless noted.
 | Silence handling with the pinned Silero VAD | "Thank you."/"you" on silence or noise held back; speech passes | Output-side verdict only; no input gate |
 | Out-of-set language guard | In-set languages unchanged (two-language set); es/fr/de/ja written as spoken, not translated | Detection probabilities: in-set speech ≥ 0.989, other ≤ 0.112 |
 | Nemotron install | Pinned hashes enforced; tampered model, extra library and symlink refused | Checksum gate, synthetic decode only |
-| Windows (i9-11900K, RTX 4070 Ti SUPER) | 333 tests OK from a fresh archive in CPU and CUDA environments; tray start/Quit exit 0 | See windows-alpha.md; no desktop session was used |
+| Windows (i9-11900K, RTX 4070 Ti SUPER) | 527 tests OK, 78 skipped from a fresh clone in the CPU environment (2026-10-09); 333 OK from a fresh archive in CPU and CUDA environments (2026-10-01); tray start/Quit exit 0 | See windows-alpha.md; no desktop session was used |
 
 ## Not yet established
 

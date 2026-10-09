@@ -66,7 +66,7 @@ INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History
 # finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
 RESTART_DRAIN_CAP_S = 300.0
 # Quit finishes the dictation in flight, up to this long: the Mac's
-# sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
+# sotto.QUIT_DRAIN_S, the owner's choice for both.
 QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
 UNREAD_PASTE = "a paste the app has not read yet"  # in_flight()'s words for it
