@@ -438,6 +438,7 @@ class FailedMicStartTest(unittest.TestCase):
                                               enqueue=lambda q, job: q.put(job) or True,
                                               stop_capture=lambda c: None),
             "capture_gate": types.SimpleNamespace(starting=starting),
+            "pending_deliveries": sotto.PendingDeliveries(),
             "use_nemotron": False, "capture": capture, "jobs": jobs,
             "model_rewarm_due": lambda *a, **k: False,
             "model_activity": {"last_finished": 0.0, "rewarming": False},
@@ -445,7 +446,7 @@ class FailedMicStartTest(unittest.TestCase):
             "log": self.logs.append, "time": self.fast_time, "threading": threading,
             "uuid": uuid, "current_speech_config": lambda: None, "np": np,
         }
-        names = ["on_start", "on_finish", "on_discard"]
+        names = ["on_start", "on_finish", "finish_capture", "on_discard"]
         if with_handler:
             names.append("on_mic_failed")
         run_closures(names, namespace)
