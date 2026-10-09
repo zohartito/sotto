@@ -481,7 +481,7 @@ def apply_voice_cleanup(text: str, preprocessing: dict, language: str | None) ->
     import voice_commands
     preferences = settings.load(settings.SETTINGS_PATH)
     commands, fillers = preferences["voice_commands"], preferences["remove_fillers"]
-    if not (commands or fillers) or not voice_commands.is_english(language, preferences["languages"]):
+    if not (commands or fillers) or not voice_commands.is_english(language):
         return text, None
     cleaned, action = voice_commands.clean(text, fillers=fillers, commands=commands)
     if action or cleaned != text:

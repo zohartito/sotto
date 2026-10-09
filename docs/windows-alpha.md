@@ -201,7 +201,9 @@ suggested rule; only the rules you confirm are added.
 ## Languages
 
 **Automatic** chooses among your languages (Settings → Languages, English by
-default): Sotto detects the language once, takes the most likely of
+default). With only one language chosen it skips detection and transcribes in
+that language, so add every language you speak. Otherwise Sotto detects the
+language once, takes the most likely of
 your languages, and transcribes with that language fixed. Speech that is
 clearly another language (your languages score below 25% and another language
 at least 50%) is written in the language spoken, because forcing it into one
