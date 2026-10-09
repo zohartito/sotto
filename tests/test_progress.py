@@ -76,6 +76,31 @@ class LifetimeTotalsTests(unittest.TestCase):
         self.assertEqual(progress.load_totals(self.path), {"dictations": 2, "words": 7, "seconds": 5.0})
         self.assertNotIn("one two", self.path.read_text(encoding="utf-8"))  # counts, never text
 
+    def test_a_failed_read_keeps_the_lifetime_totals(self):
+        """F38: a passing lock or permission error on stats.json is not "no
+        stats yet"; the real totals must not be overwritten with one dictation."""
+        import json
+        from pathlib import Path
+        from unittest import mock
+        lifetime = {"dictations": 812, "words": 24360, "seconds": 5400.0}
+        self.path.write_text(json.dumps(lifetime), encoding="utf-8")
+        real_read = Path.read_text
+
+        def locked(path, *args, **kwargs):
+            if path == self.path:
+                raise PermissionError(13, "The process cannot access the file", str(path))
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", locked):
+            with self.assertRaises(OSError):
+                progress.record(self.path, text="two words", seconds=1.0)
+        self.assertEqual(progress.load_totals(self.path), lifetime)
+        progress.record(self.path, text="two words", seconds=1.0)  # the next one counts again
+        self.assertEqual(progress.load_totals(self.path), {"dictations": 813, "words": 24362, "seconds": 5401.0})
+        self.path.unlink()
+        progress.record(self.path, text="first words", seconds=2.0)  # no file yet: start from zero
+        self.assertEqual(progress.load_totals(self.path), {"dictations": 1, "words": 2, "seconds": 2.0})
+
     def test_time_saved_against_typing_and_the_menu_line(self):
         totals = {"dictations": 300, "words": 12_400, "seconds": 3_600.0}
         self.assertAlmostEqual(progress.saved_minutes(totals), 12_400 / 40 - 60)

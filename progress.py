@@ -85,12 +85,19 @@ def _write(path: Path, totals: dict) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def load_totals(path: Path) -> dict:
+def _parse_totals(text: str) -> dict:
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(text)
         return {"dictations": int(data.get("dictations", 0)), "words": int(data.get("words", 0)),
                 "seconds": float(data.get("seconds", 0.0))}
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError):
+        return _zero()
+
+
+def load_totals(path: Path) -> dict:
+    try:
+        return _parse_totals(Path(path).read_text(encoding="utf-8"))
+    except OSError:
         return _zero()
 
 
@@ -110,8 +117,16 @@ def ensure_totals(path: Path, entries: list[dict]) -> dict:
 
 
 def record(path: Path, *, text: str, seconds: float) -> None:
-    """Add one inserted dictation: its word count and how long it took to say."""
-    totals = load_totals(path)
+    """Add one inserted dictation: its word count and how long it took to say.
+
+    Side effects: rewrites ``path``. Only a missing file starts from zero: any
+    other read error (a passing lock or permission glitch) raises OSError and
+    writes nothing, so it can never replace the lifetime totals with this one
+    dictation (F38)."""
+    try:
+        totals = _parse_totals(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        totals = _zero()
     totals["dictations"] += 1
     totals["words"] += len(text.split())
     totals["seconds"] += max(0.0, float(seconds))
