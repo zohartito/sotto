@@ -510,7 +510,7 @@ def record_totals(text: str, seconds: float) -> None:
     import progress
     try:
         progress.record(totals_path(), text=text, seconds=seconds)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # unreadable or malformed: keep the file, skip this one
         log(f"! progress totals not saved ({type(exc).__name__})")
 
 
@@ -2438,6 +2438,58 @@ def nonadaptive_revoke_learning(dependency_guard, coordinator, entry_id: str):
     return coordinator.revoke_history(entry_id)
 
 
+HISTORY_UNREADABLE_TITLE = "History could not be read"
+
+
+class UnsavedHistory:
+    """Stands in for LearningCoordinator while history.jsonl cannot be read (F16b).
+
+    Dictation keeps working: ``append_live`` hands back an in-memory row so the
+    text is still delivered, but nothing (row, audio, learning state) is
+    written. Every other coordinator operation raises the store's
+    HistoryUnreadable, exactly as the real coordinator would on its re-read,
+    so Retry, Correct, Delete and Clear can never act on a partial view."""
+
+    def __init__(self, store, learning) -> None:
+        self.history, self.learning = store, learning
+        self._lock = threading.RLock()
+
+    def append_live(self, text: str, samples, duration: float, model: str, **metadata) -> dict:
+        """Side effects: none; the row and its audio exist only in memory."""
+        return {"id": metadata.get("entry_id") or uuid.uuid4().hex[:12], "ts": metadata.get("ts"),
+                "text": text, "duration": round(duration, 2), "model": model, "saved": False}
+
+    def __getattr__(self, name: str):
+        from history import HistoryUnreadable
+        raise HistoryUnreadable(f"History is unreadable and was left unchanged ({self.history.unreadable})")
+
+
+def history_coordinator(store, learning_store):
+    """The dictation session's coordinator for ``store``.
+
+    A store opened with ``tolerate_unreadable=True`` over an unreadable
+    history.jsonl (F16b) gets an UnsavedHistory instead of a
+    LearningCoordinator, whose startup re-read would raise before the menu
+    bar exists; the caller tells the user once with
+    ``history_unreadable_message``. Side effects: a LearningCoordinator
+    validates the active learning links against History."""
+    if store.unreadable is not None:
+        return UnsavedHistory(store, learning_store)
+    from learning import LearningCoordinator
+    return LearningCoordinator(store, learning_store)
+
+
+def history_unreadable_message(store) -> str:
+    # Never suggest moving or deleting the file: a launch with no index would
+    # treat every kept recording as an orphan and sweep it.
+    cause, remedy = (("it was written by a newer version of Sotto", "update Sotto again")
+                     if store.unreadable.newer_schema else
+                     ("part of it is damaged", "repair the damaged line"))
+    return (f"Sotto cannot read {store.index} because {cause}. The file and its recordings "
+            "were left exactly as they are. Dictation still works, but new dictations are "
+            f"not saved to History until the file can be read again: {remedy}, then restart Sotto.")
+
+
 def _read_only_json(path: Path) -> dict | None:
     """Read a strict regular JSON record without constructing any store."""
     try:
@@ -2799,11 +2851,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     active_engine = "nemotron" if use_nemotron else "parakeet" if use_parakeet else "whisper"
 
+    # An unreadable history.jsonl must not kill the app before its menu bar
+    # exists (F16b). The adaptive lane's receipts depend on History, so there
+    # it stays fatal.
     from history import HistoryStore
-    from learning import LearningCoordinator, LearningStore
-    store = HistoryStore()
+    from learning import LearningStore
+    store = HistoryStore(tolerate_unreadable=not adaptive)
     learning_store = LearningStore()
-    coordinator = LearningCoordinator(store, learning_store)
+    coordinator = history_coordinator(store, learning_store)
+    if store.unreadable is not None:
+        log(f"! History unreadable ({store.unreadable}): {history_unreadable_message(store)}")
     seed_totals(store)
     # Always available, no-model dependency guard: an earlier adaptive session
     # must remain revocation-safe even when this launch is non-adaptive.
@@ -2837,6 +2894,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     pending_deliveries = PendingDeliveries()
     ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
                                                  pending_deliveries)
+    if status_ui is not None and store.unreadable is not None:
+        ui_call(status_ui.show_error, HISTORY_UNREADABLE_TITLE, history_unreadable_message(store))
 
     def refresh_history() -> None:
         if status_ui is not None:

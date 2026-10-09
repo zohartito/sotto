@@ -90,12 +90,32 @@ def _identity_dict(identity: AudioIdentity, relative_path: str) -> dict[str, Any
     return {"path": relative_path, **identity.as_dict()}
 
 
+class HistoryUnreadable(RuntimeError):
+    """``history.jsonl`` cannot be trusted as the authority for this store: a
+    damaged row, a duplicate id, undecodable bytes, or a row from a newer
+    schema (``newer_schema``).  Every load raises it, so no mutation, prune or
+    orphan sweep can run against a partial view of the user's History."""
+    def __init__(self, message: str, *, newer_schema: bool = False) -> None:
+        super().__init__(message)
+        self.newer_schema = newer_schema
+
+
 class HistoryStore:
     """Versioned JSONL history plus exact canonical inference WAVs.
 
     ``base_dir`` is intentionally injectable for tests and embedded callers.
+
+    An unreadable ``history.jsonl`` raises :class:`HistoryUnreadable`.  The
+    dictation app passes ``tolerate_unreadable=True`` instead, so a damaged or
+    newer-schema file cannot stop it launching (F16b): ``unreadable`` then holds
+    the error, ``entries()`` is empty, and the startup audio tightening and
+    orphan sweep are skipped (with no trusted index, every WAV would look like
+    an orphan).  Nothing is rewritten, moved or deleted: every other method
+    re-reads the index first and so raises the same error until the file can
+    be read again.
     """
-    def __init__(self, base_dir: Path | str | None = None, keep: int = KEEP) -> None:
+    def __init__(self, base_dir: Path | str | None = None, keep: int = KEEP, *,
+                 tolerate_unreadable: bool = False) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else STORE_DIR
         self.audio_dir = self.base_dir / "audio"
         self.raw_audio_dir = self.base_dir / "audio-raw"
@@ -107,13 +127,20 @@ class HistoryStore:
         self.index = self.base_dir / "history.jsonl"
         self.keep = keep
         self._lock = threading.RLock()
+        self.unreadable: HistoryUnreadable | None = None
         with advisory_lock(self.base_dir):
             ensure_private_directory(self.base_dir)
             ensure_private_directory(self.audio_dir)
             ensure_private_directory(self.raw_audio_dir)
             ensure_private_directory(self.silver_evidence_dir)
             ensure_private_file(self.index)
-            self._entries: list[dict[str, Any]] = self._load()
+            try:
+                self._entries: list[dict[str, Any]] = self._load()
+            except HistoryUnreadable as exc:
+                if not tolerate_unreadable:
+                    raise
+                self.unreadable, self._entries = exc, []
+                return
             self._tighten_retained_audio_locked()
             self._sweep_orphans()
 
@@ -187,22 +214,26 @@ class HistoryStore:
         if not self.index.exists():
             return rows
         seen: set[str] = set()
-        for line_number,line in enumerate(self.index.read_text(encoding="utf-8").splitlines(),start=1):
+        try:
+            text = self.index.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise HistoryUnreadable("history metadata is malformed; refusing to sweep artifacts") from exc
+        for line_number,line in enumerate(text.splitlines(),start=1):
             if not line.strip():
                 continue
             try:
                 source = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise RuntimeError("history metadata is malformed; refusing to sweep artifacts") from exc
+                raise HistoryUnreadable("history metadata is malformed; refusing to sweep artifacts") from exc
             if not isinstance(source, dict) or not isinstance(source.get("id"), str) or not source["id"]:
-                raise RuntimeError("history metadata is malformed; refusing to sweep artifacts")
+                raise HistoryUnreadable("history metadata is malformed; refusing to sweep artifacts")
             if source["id"] in seen:
-                raise RuntimeError("history metadata has duplicate ids; refusing to sweep artifacts")
+                raise HistoryUnreadable("history metadata has duplicate ids; refusing to sweep artifacts")
             seen.add(source["id"])
             try:
                 rows.append(self._normalize(source))
             except (TypeError, ValueError, KeyError) as exc:
-                raise RuntimeError("history metadata is malformed; refusing to sweep artifacts") from exc
+                raise HistoryUnreadable("history metadata is malformed; refusing to sweep artifacts") from exc
         return rows
 
     def _reload_locked(self) -> None:
@@ -226,7 +257,7 @@ class HistoryStore:
         # treating it as old data would silently discard those protections.
         version = source.get("schema_version")
         if version not in {None, 1}:
-            raise RuntimeError("unknown future history schema; refusing to operate")
+            raise HistoryUnreadable("unknown future history schema; refusing to operate", newer_schema=True)
         text, model, duration = source.get("text", ""), source.get("model"), source.get("duration")
         return {
             "schema_version": SCHEMA_VERSION, "id": source["id"], "ts": source.get("ts"),

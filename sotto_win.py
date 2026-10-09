@@ -609,8 +609,16 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("stopped before listening")
         return False
 
-    store = HistoryStore()
-    coordinator = LearningCoordinator(store, LearningStore())
+    # An unreadable history.jsonl must not stop the app at every login (F16b):
+    # dictation keeps working, History is left untouched, the user is told once.
+    store = HistoryStore(tolerate_unreadable=True)
+    coordinator = sotto.history_coordinator(store, LearningStore())
+    if store.unreadable is not None:
+        message = sotto.history_unreadable_message(store)
+        log(f"! History unreadable ({store.unreadable}): {message}")
+        if ui is not None:  # a toast truncates this long a message; the box blocks only its thread
+            threading.Thread(target=win_ui.message_box, args=(sotto.HISTORY_UNREADABLE_TITLE, message),
+                             kwargs={"error": True}, daemon=True).start()
     sotto.seed_totals(store)
     from adaptive_learning import AdaptiveLearning
     # The same always-on revocation guard the Mac menu passes.

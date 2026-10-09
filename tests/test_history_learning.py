@@ -533,6 +533,67 @@ class HistoryLearningTests(unittest.TestCase):
             HistoryStore(self.root)
         self.assertTrue(wav.exists())
 
+    def _unreadable_index(self, root: Path, bad_line: str) -> tuple[Path, Path, bytes]:
+        """One real dictation (row + WAV), then an unreadable line after it."""
+        coordinator = LearningCoordinator(HistoryStore(root), LearningStore(root))
+        row = coordinator.append_live("kept words", np.array([-1.0, 0, 1.0], np.float32), .5, "model")
+        index = coordinator.history.index
+        index.write_text(index.read_text(encoding="utf-8") + bad_line + "\n", encoding="utf-8")
+        return index, coordinator.history.audio_path(row["id"]), index.read_bytes()
+
+    def test_unreadable_history_opens_read_only_and_keeps_every_byte(self):
+        """F16b: a damaged or newer-schema history.jsonl must not stop the app
+        launching, and nothing may rewrite, move or sweep the user's data."""
+        from history import HistoryUnreadable
+        cases = {"truncated row": ('{"id": "abc123", "text": "hi"', False),
+                 "newer schema": (json.dumps({"id": "abc123", "schema_version": 99, "text": "hi"}), True)}
+        for name, (bad_line, newer) in cases.items():
+            with self.subTest(name):
+                root = self.root / name.replace(" ", "-")
+                index, wav, before = self._unreadable_index(root, bad_line)
+                store = HistoryStore(root, tolerate_unreadable=True)
+                self.assertIsInstance(store.unreadable, HistoryUnreadable)
+                self.assertEqual(store.unreadable.newer_schema, newer)
+                self.assertEqual(store.entries(), [])
+                # Every mutation still re-reads the index first, so all of them refuse.
+                with self.assertRaises(HistoryUnreadable):
+                    store.append("new", np.zeros(8, np.float32), .5, "model")
+                with self.assertRaises(HistoryUnreadable):
+                    LearningCoordinator(store, LearningStore(root))
+                self.assertEqual(index.read_bytes(), before)
+                self.assertEqual([path.name for path in store.audio_dir.iterdir()], [wav.name])
+                # Without the opt-in (worker, CLI, adaptive lane) it stays fatal.
+                with self.assertRaises(HistoryUnreadable):
+                    HistoryStore(root)
+
+    def test_app_coordinator_keeps_dictation_working_without_saving(self):
+        """F16b: the app gets a stand-in coordinator that hands dictation back
+        unsaved and refuses every History action, never touching the file."""
+        import sotto
+        from history import HistoryUnreadable
+        root = self.root / "app"
+        index, wav, before = self._unreadable_index(root, '{"id": "abc123", "text": "hi"')
+        store = HistoryStore(root, tolerate_unreadable=True)
+        coordinator = sotto.history_coordinator(store, LearningStore(root))
+        self.assertIsInstance(coordinator, sotto.UnsavedHistory)
+        row = coordinator.append_live("please call me back", prepare_canonical(np.zeros(1600, np.float32)),
+                                      .1, "model", ts=5.0, provenance="live", adaptive=False)
+        self.assertEqual((row["text"], row["saved"]), ("please call me back", False))
+        self.assertEqual(sotto._active_learning_history_ids(coordinator), set())
+        for action in (lambda: coordinator.clear(), lambda: coordinator.snapshot_for_retry(row["id"])):
+            with self.assertRaises(HistoryUnreadable):
+                action()
+        self.assertEqual(index.read_bytes(), before)
+        self.assertEqual([path.name for path in store.audio_dir.iterdir()], [wav.name])
+        message = sotto.history_unreadable_message(store)
+        self.assertIn(str(index), message)
+        self.assertIn("not saved to History", message)
+        # Once the file reads again, the next launch gets the real coordinator.
+        index.write_text(before.decode("utf-8").splitlines()[0] + "\n", encoding="utf-8")
+        store = HistoryStore(root, tolerate_unreadable=True)
+        self.assertIsNone(store.unreadable)
+        self.assertEqual([entry["text"] for entry in store.entries()], ["kept words"])
+        self.assertNotIsInstance(sotto.history_coordinator(store, LearningStore(root)), sotto.UnsavedHistory)
 
 if __name__ == "__main__":
     unittest.main()
