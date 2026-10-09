@@ -239,6 +239,57 @@ class RestartTest(unittest.TestCase):
             self.assertTrue(controller.shutdown.requested(), f"{start}: restarts once idle")
             self.assertTrue(controller.restart_requested)
 
+    @staticmethod
+    def virtual_clock(controller, on_sleep=lambda now: None) -> dict:
+        """Drive the controller's drains on a virtual clock: every poll's
+        sleep advances it at once, then runs ``on_sleep(now)``."""
+        clock = {"now": 0.0}
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            on_sleep(clock["now"])
+
+        controller.clock, controller.sleep = (lambda: clock["now"]), sleep
+        return clock
+
+    def test_restart_waits_minutes_for_a_slow_dictation(self):
+        # A long dictation on the CPU can take minutes: it still finishes first.
+        controller, jobs = self.controller(busy=True)
+        slow_s = 4 * 60.0
+        stopped_while_busy = []
+
+        def on_sleep(now):
+            stopped_while_busy.append(controller.shutdown.requested())
+            if now >= slow_s and jobs.unfinished_tasks:
+                jobs.get_nowait()
+                jobs.task_done()
+
+        clock, logs = self.virtual_clock(controller, on_sleep), []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            self.assertIn("after the current dictation", controller.restart())
+            self.assertTrue(controller.shutdown.event.wait(5), "restarts once the dictation is done")
+        self.assertTrue(stopped_while_busy, "the drain polls on the controller's clock")
+        self.assertFalse(any(stopped_while_busy), "a slow dictation is never abandoned")
+        self.assertGreaterEqual(clock["now"], slow_s)
+        self.assertIn("● restarting after the current dictation", logs)
+        self.assertFalse([line for line in logs if "abandoned" in line], logs)
+
+    def test_a_wedged_dictation_cannot_hold_a_restart_forever(self):
+        # [F30 follow-up] A hung CUDA/CT2 call left Restart refusing every
+        # capture until the user quit: past the cap, the restart goes ahead.
+        controller, jobs = self.controller(busy=True)
+        clock, logs = self.virtual_clock(controller), []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.restart()
+            self.assertTrue(controller.shutdown.event.wait(5), "a wedged dictation still restarts")
+        self.assertTrue(controller.restart_requested)
+        self.assertEqual(jobs.unfinished_tasks, 1, "the dictation never finished")
+        self.assertAlmostEqual(clock["now"], sotto_win.RESTART_DRAIN_CAP_S, delta=1.0)
+        self.assertGreaterEqual(sotto_win.RESTART_DRAIN_CAP_S, 2 * 60, "minutes, not seconds")
+        abandoned = [line for line in logs if "abandoned" in line]
+        self.assertEqual(len(abandoned), 1, logs)
+        self.assertIn("1 transcription job(s)", abandoned[0])
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class ConsoleCloseHandlerTest(unittest.TestCase):

@@ -62,6 +62,10 @@ from history import HistoryStore
 from learning import LearningCoordinator, LearningStore
 
 INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History only
+# Restart waits this long for the dictation in flight: a long CPU dictation
+# finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
+RESTART_DRAIN_CAP_S = 300.0
+DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
@@ -263,6 +267,20 @@ def restart_command() -> list[str]:
     return [str(win_startup.gui_python()), script, *sys.argv[1:]]
 
 
+def drain_until_idle(busy, *, deadline_s: float, clock=time.monotonic,
+                     sleep=time.sleep) -> bool:
+    """Poll until busy() is False (True) or deadline_s has passed (False).
+
+    Side effects: sleeps on the calling thread.
+    """
+    give_up = clock() + deadline_s
+    while busy():
+        if clock() >= give_up:
+            return False
+        sleep(DRAIN_POLL_S)
+    return True
+
+
 def spawn_restart() -> None:
     flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     subprocess.Popen(restart_command(), close_fds=True, creationflags=flags,
@@ -421,6 +439,10 @@ def history_command(command: str, *, limit: int, entry_id: str | None,
 class Controller:
     """Tray/Settings actions on the running app (win_ui calls these off its menu thread)."""
 
+    # The drains' time source; tests drive them on a virtual clock.
+    clock = staticmethod(time.monotonic)
+    sleep = staticmethod(time.sleep)
+
     def __init__(self, **parts) -> None:
         self.__dict__.update(parts)
         self.restart_requested = False
@@ -448,10 +470,20 @@ class Controller:
     def recording(self) -> bool:
         return self.engine.snapshot()[0]
 
+    def in_flight(self) -> list[str]:
+        """The captures, transcriptions and insertions still in flight, in words."""
+        work = []
+        if self.capture.is_active() or self.finishing():
+            work.append("a recording")
+        if self.jobs.unfinished_tasks:
+            work.append(f"{self.jobs.unfinished_tasks} transcription job(s)")
+        if self.deliveries.unfinished_tasks:
+            work.append(f"{self.deliveries.unfinished_tasks} insertion(s)")
+        return work
+
     def busy(self) -> bool:
         """A capture, a transcription or an insertion is still in flight."""
-        return (self.capture.is_active() or self.finishing() or bool(self.jobs.unfinished_tasks)
-                or bool(self.deliveries.unfinished_tasks))
+        return bool(self.in_flight())
 
     # history
     def entries(self, limit: int = 10) -> list[dict]:
@@ -554,8 +586,10 @@ class Controller:
     # lifecycle
     def restart(self) -> str:
         """Restart once nothing is in flight.  A dictation being recorded,
-        transcribed or inserted always finishes first, however long the model
-        takes (a long dictation on the CPU can take well over 20 s); Quit still
+        transcribed or inserted finishes first, however slowly the model runs
+        (a long dictation on the CPU can take well over 20 s), up to
+        RESTART_DRAIN_CAP_S: past that the model call is taken to be wedged,
+        and the restart goes ahead and logs what it abandoned.  Quit still
         stops at once.
 
         Side effects: refuses new captures from now on; requests shutdown once idle.
@@ -572,11 +606,17 @@ class Controller:
             return "Restarting…"
 
         def when_idle() -> None:
-            while self.busy() and not self.shutdown.requested():
-                time.sleep(0.1)
-            if self.restart_requested:
+            idle = drain_until_idle(lambda: self.busy() and not self.shutdown.requested(),
+                                    deadline_s=RESTART_DRAIN_CAP_S,
+                                    clock=self.clock, sleep=self.sleep)
+            if not self.restart_requested:
+                return  # Quit won
+            if idle:
                 log("● restarting after the current dictation")
-                self.shutdown.request()
+            else:
+                log(f"! restarting anyway after {RESTART_DRAIN_CAP_S / 60:.0f} minutes; "
+                    f"abandoned: {', '.join(self.in_flight())}")
+            self.shutdown.request()
 
         threading.Thread(target=when_idle, daemon=True).start()
         return "Restarting after the current dictation…"
