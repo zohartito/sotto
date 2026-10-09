@@ -386,7 +386,7 @@ class QuitDrainTests(unittest.TestCase):
         # entry (on_done=pending_deliveries.finish) when it delivers, drops or
         # clears it, and posts nothing after shutdown — behaviour pinned in
         # tests/test_delivery.py PendingDeliveriesAccountingTests.
-        self.assertIn("delivery.paste(text)", _closure_source("inject_when_clear"))
+        self.assertIn("delivery.paste(text, in_history)", _closure_source("inject_when_clear"))
         self.assertIn("delivery.undo()", _closure_source("undo_when_clear"))
 
     def test_update_and_engine_restarts_also_wait_for_the_paste(self):
