@@ -20,6 +20,9 @@
   -Uninstall removes only what
   this script recorded creating (and the login entry the Settings window may
   have added); your data folder stays unless you add -RemoveData.
+  -CheckOnly runs only the running-Sotto and shortcut checks, for the copy in -SourceDir
+  (default: this one), and changes nothing; get.ps1 asks the update's
+  installer this before it moves an existing copy's source.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
@@ -39,6 +42,8 @@ param(
   [switch]$SkipSetup,
   [switch]$Uninstall,
   [switch]$RemoveData,
+  [switch]$CheckOnly,
+  [string]$SourceDir = '',
   # Tests point this at a throwaway key; the default is the per-user login list.
   [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 )
@@ -47,6 +52,10 @@ Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
+if ($SourceDir) {
+  if (-not $CheckOnly) { Write-Host 'X -SourceDir goes with -CheckOnly.' -ForegroundColor Red; exit 1 }
+  $Root = [IO.Path]::GetFullPath($SourceDir)
+}
 $Launcher = Join-Path $Root 'win_launch.py'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'sotto-alpha' }
 if (-not $VenvDir) { $VenvDir = Join-Path $Root 'venv-alpha' }
@@ -168,6 +177,7 @@ if (Test-Path -LiteralPath $Shortcut -PathType Leaf) {
     Say "! $Shortcut started a copy of Sotto that no longer exists; it will start this one"
   }
 }
+if ($CheckOnly) { Say "OK nothing stops installing Sotto in $Root"; exit 0 }
 $arch = $env:PROCESSOR_ARCHITEW6432
 if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
 if (-not [Environment]::Is64BitOperatingSystem -or $arch -ne 'AMD64') {
