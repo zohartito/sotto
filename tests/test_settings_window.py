@@ -95,7 +95,8 @@ class SettingsWindowTests(unittest.TestCase):
         self.assertIn("command-line flag", controller.controls["locked_note"].stringValue())
         self.assertFalse(controller.controls["install_nemotron"].isHidden())
         self.assertFalse(controller.controls["install_parakeet"].isHidden())
-        parakeet = [controller.controls["engine"].itemAtIndex_(i) for i in range(controller.controls["engine"].numberOfItems())
+        parakeet = [controller.controls["engine"].itemAtIndex_(i)
+                    for i in range(controller.controls["engine"].numberOfItems())
                     if controller.controls["engine"].itemAtIndex_(i).representedObject() == "parakeet"]
         self.assertTrue(parakeet and not parakeet[0].isEnabled())
         controller.installParakeet_(None)

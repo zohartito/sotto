@@ -390,15 +390,13 @@ class Controller:
         being dictated into, so this dictation is copied, not inserted."""
         if self.shutdown.requested():
             return
-        self.finish_from_menu.set()  # on_finish runs synchronously below
-        try:
-            if self.engine.force_finish():
-                log("● finished from the tray (the text is copied)")
-            elif self.capture.is_active():
-                self.on_finish()  # gesture engine desynced; end the capture anyway
-                log("● orphan capture finished from the tray")
-        finally:
-            self.finish_from_menu.clear()
+        # The finish may run later on whichever thread is draining gesture
+        # actions, so "copy" travels with it.
+        if self.engine.force_finish(finish=lambda: self.on_finish(copy_only=True)):
+            log("● finished from the tray (the text is copied)")
+        elif self.capture.is_active():
+            self.on_finish(copy_only=True)  # gesture engine desynced; end the capture anyway
+            log("● orphan capture finished from the tray")
 
     def recording(self) -> bool:
         return self.engine.snapshot()[0]
@@ -611,8 +609,16 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("stopped before listening")
         return False
 
-    store = HistoryStore()
-    coordinator = LearningCoordinator(store, LearningStore())
+    # An unreadable history.jsonl must not stop the app at every login (F16b):
+    # dictation keeps working, History is left untouched, the user is told once.
+    store = HistoryStore(tolerate_unreadable=True)
+    coordinator = sotto.history_coordinator(store, LearningStore())
+    if store.unreadable is not None:
+        message = sotto.history_unreadable_message(store)
+        log(f"! History unreadable ({store.unreadable}): {message}")
+        if ui is not None:  # a toast truncates this long a message; the box blocks only its thread
+            threading.Thread(target=win_ui.message_box, args=(sotto.HISTORY_UNREADABLE_TITLE, message),
+                             kwargs={"error": True}, daemon=True).start()
     sotto.seed_totals(store)
     from adaptive_learning import AdaptiveLearning
     # The same always-on revocation guard the Mac menu passes.
@@ -631,7 +637,6 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
     vad_warnings: set[str] = set()
     lifecycle = {"restarting": False}
-    finish_from_menu = threading.Event()
     # Captures between capture.end() and their enqueue still count as busy.
     finishing_lock = threading.Lock()
     finishing_count = [0]
@@ -901,9 +906,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
 
         threading.Thread(target=announce_live, daemon=True).start()
 
-    def on_finish() -> None:
+    def on_finish(copy_only: bool = False) -> None:
         released_at = time.monotonic()
-        copy_only = finish_from_menu.is_set()
         if shutdown.requested():
             shutdown.stop_capture(capture)
             return
@@ -1028,7 +1032,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         on_finish=on_finish, current_speech_config=current_speech_config,
         language_lock=language_lock, language_state=language_state, speed=speed,
         trigger_locked=trigger_locked, model_repo=model_repo, whisper=whisper,
-        lifecycle=lifecycle, finish_from_menu=finish_from_menu, finishing=finishing)
+        lifecycle=lifecycle, finishing=finishing)
 
     transcription_thread.start()
     delivery_thread = threading.Thread(target=delivery_worker, daemon=True)

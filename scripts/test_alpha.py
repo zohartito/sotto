@@ -32,5 +32,6 @@ with tempfile.TemporaryDirectory(prefix='sotto-alpha-tests-') as temporary:
                HF_HOME=str(state/'huggingface'), HF_HUB_CACHE=str(state/'huggingface/hub'),
                XDG_CACHE_HOME=str(state/'cache'), NUMBA_CACHE_DIR=str(state/'numba'),
                SOTTO_OFFLINE='1', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
-    result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', *sys.argv[1:]], cwd=root, env=env)
+    result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', *sys.argv[1:]],
+                            cwd=root, env=env)
     raise SystemExit(result.returncode)

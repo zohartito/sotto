@@ -9,12 +9,14 @@
 # Everything sits inside main(), so a partly downloaded script never runs.
 set -euo pipefail
 
-# Same repository? Ignores https vs ssh form, a trailing .git and a trailing slash.
+# Same repository? Ignores https vs either ssh form (git@github.com:… and
+# ssh://git@github.com/…), a trailing .git and a trailing slash.
 same_repo() {
     local normalized=()
     local url
     for url in "$1" "$2"; do
         url="${url/#git@github.com:/https://github.com/}"
+        url="${url/#ssh:\/\/git@github.com\//https://github.com/}"
         url="${url%/}"
         normalized+=("${url%.git}")
     done
