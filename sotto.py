@@ -1756,9 +1756,11 @@ class GestureEngine:
     never act on stale state. The hands-free watchdog is the exception: it
     belongs to the capture, not the key epoch, so a stop tap whose release is
     lost cannot disarm it — only ending or re-arming hands-free does.
-    Callbacks are invoked OUTSIDE the lock. The second press of a double-tap
-    is classified on its RELEASE: held short = arm hands-free, held long = it
-    was a deliberate push-to-talk.
+    Callbacks run OUTSIDE the lock, one at a time, in the order their
+    decisions were made: a decision queues its actions while it still holds
+    the lock, and whichever thread finds nobody draining runs the queue (see
+    _drain). The second press of a double-tap is classified on its RELEASE:
+    held short = arm hands-free, held long = it was a deliberate push-to-talk.
     """
 
     def __init__(self, on_start, on_finish, on_discard, on_hands_free=None) -> None:
@@ -1775,14 +1777,38 @@ class GestureEngine:
         self._second_candidate = False
         self._pressed_at = 0.0
         self._last_tap_at = -1e9
+        self._pending: list = []       # actions decided, not yet run (in order)
+        self._draining = False
 
     def snapshot(self) -> tuple[bool, bool]:
         """(recording, hands_free) — for the lost-release resync poller."""
         with self._lock:
             return self._recording, self._hands_free
 
-    def _fire(self, callbacks) -> None:
-        for callback in callbacks:
+    def _queue(self, callbacks) -> None:
+        """Caller holds the lock: actions join the queue in decision order."""
+        self._pending.extend(callbacks)
+
+    def _drain(self) -> None:
+        """Run queued actions one at a time, in order, outside the lock.
+
+        The thread that finds nobody draining becomes the drainer and runs
+        everything queued, including what other threads add meanwhile; a
+        thread that arrives while another is draining has already queued its
+        actions under the lock and returns at once. So the event tap never
+        waits on a timer thread's callback, and a discard decided before a
+        start (the tap-expiry timer racing the next press) can never run
+        after it and kill the new capture."""
+        with self._lock:
+            if self._draining:
+                return
+            self._draining = True
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._draining = False
+                    return
+                callback = self._pending.pop(0)
             try:
                 callback()
             except Exception as exc:
@@ -1808,7 +1834,8 @@ class GestureEngine:
                 self._recording = True
                 fires.append(self._on_start)
             self._pressed_at = now
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def released(self) -> None:
         fires = []
@@ -1837,7 +1864,8 @@ class GestureEngine:
                 self._epoch += 1
                 self._schedule(DOUBLE_TAP_WINDOW_S, self._expire_tap)
             self._second_candidate = False
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_start(self) -> bool:
         """Menu-driven start: arm a hands-free recording without any key
@@ -1852,7 +1880,11 @@ class GestureEngine:
             self._recording = True
             self._hands_free = True
             self._arm_hands_free_watchdog()
-        self._fire([self._on_start] + ([self._on_hands_free] if self._on_hands_free is not None else []))
+            fires.append(self._on_start)
+            if self._on_hands_free is not None:
+                fires.append(self._on_hands_free)
+            self._queue(fires)
+        self._drain()
         return True
 
     def force_finish(self) -> bool:
@@ -1866,7 +1898,8 @@ class GestureEngine:
                 self._recording = False
                 self._hands_free = False
                 fires.append(self._on_finish)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
         return was_recording
 
     def chorded(self) -> None:
@@ -1882,7 +1915,8 @@ class GestureEngine:
             self._second_candidate = False
             self._recording = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_reset(self) -> None:
         """Sleep/lock/tap-disable recovery: drop any in-flight recording."""
@@ -1895,7 +1929,8 @@ class GestureEngine:
                 self._recording = False
                 self._hands_free = False
                 fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def _schedule(self, delay: float, handler, token: int | None = None) -> None:
         timer = threading.Timer(delay, handler,
@@ -1920,7 +1955,8 @@ class GestureEngine:
             self._recording = False
             self._tap_pending = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def _hands_free_timeout(self, token: int) -> None:
         fires = []
@@ -1931,7 +1967,8 @@ class GestureEngine:
             self._recording = False
             log(f"! hands-free watchdog ({HANDS_FREE_MAX_S:.0f}s) — finishing")
             fires.append(self._on_finish)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
 
 # -- clipboard injection (main thread only) ---------------------------------

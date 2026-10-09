@@ -9,6 +9,7 @@ capture, not the key epoch; F6 start / finish / discard run in decision order
 and never interleave across threads.
 """
 
+import threading
 import unittest
 from unittest import mock
 
@@ -104,6 +105,81 @@ class HandsFreeWatchdogTests(EngineHarness):
         self.assertEqual(self.engine.snapshot(), (True, True))
         fire_second()
         self.assertEqual(self.events, ["start", "finish"])
+
+
+# -- F6: actions run in decision order and never interleave across threads ----
+
+class OrderedActionTests(EngineHarness):
+    def test_stale_tap_expiry_cannot_discard_a_newer_capture(self):
+        capture = sotto.CaptureService()
+        capture._engine = mock.Mock()        # engine already live: begin() does not cold-start
+        capture.idle_release_s = -1
+        order = []
+        discard_entered = threading.Event()
+        resume_discard = threading.Event()
+        second_start_ran = threading.Event()
+        self.addCleanup(resume_discard.set)
+
+        def on_start():
+            order.append("start")
+            capture.begin()
+            if order.count("start") == 2:
+                second_start_ran.set()
+
+        def on_discard():
+            discard_entered.set()
+            resume_discard.wait(5)           # the timer thread is preempted right here
+            order.append("discard")
+            capture.abort()
+
+        def on_finish():
+            order.append("finish")
+            capture.end()
+
+        engine = sotto.GestureEngine(on_start, on_finish, on_discard)
+        engine.pressed(); engine.released()  # a lone short tap arms the expiry timer
+        self.assertTrue(capture.is_active())
+        timer_thread = threading.Thread(target=self.timers.only(sotto.DOUBLE_TAP_WINDOW_S),
+                                        daemon=True)
+        timer_thread.start()                 # the window closes: discard decided, lock released
+        self.assertTrue(discard_entered.wait(5))
+        # The timer thread sits inside on_discard. The user presses again for a
+        # real push-to-talk dictation: the decision is immediate, the action
+        # must wait its turn, and the tap thread must not be held up.
+        engine.pressed()
+        self.assertEqual(engine.snapshot(), (True, False))
+        self.assertEqual(order.count("start"), 1,
+                         "start ran on the tap thread while the stale discard was mid-flight")
+        resume_discard.set()
+        self.assertTrue(second_start_ran.wait(5))
+        timer_thread.join(5)
+        self.assertFalse(timer_thread.is_alive())
+        self.assertEqual(order, ["start", "discard", "start"])
+        self.assertTrue(capture.is_active(), "the stale discard killed the new capture")
+
+    def test_a_release_decided_while_start_is_blocked_is_queued_not_run_concurrently(self):
+        order = []
+        start_entered = threading.Event()
+        resume_start = threading.Event()
+        self.addCleanup(resume_start.set)
+
+        def on_start():
+            start_entered.set()
+            resume_start.wait(5)             # e.g. the capture gate is busy
+            order.append("start")
+
+        engine = sotto.GestureEngine(on_start, lambda: order.append("finish"),
+                                     lambda: order.append("discard"))
+        tap_thread = threading.Thread(target=engine.pressed, daemon=True)
+        tap_thread.start()
+        self.assertTrue(start_entered.wait(5))
+        with mock.patch.object(sotto, "HOLD_THRESHOLD_S", 0.0):
+            engine.released()                # the resync poller's synthesized release
+        self.assertEqual(engine.snapshot(), (False, False))   # decided at once ...
+        self.assertEqual(order, [], "finish ran while start was still in flight")
+        resume_start.set()
+        tap_thread.join(5)
+        self.assertEqual(order, ["start", "finish"])        # ... acted on in order
 
 
 if __name__ == "__main__":
