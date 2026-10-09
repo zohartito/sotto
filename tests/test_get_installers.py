@@ -60,6 +60,29 @@ class MacInstallerTests(unittest.TestCase):
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn("is not a copy of Sotto", refused.stderr)
 
+    def test_a_git_copy_of_another_project_is_never_pulled_or_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            other_remote = folder / "other.git"
+            subprocess.run(["git", "init", "--quiet", "--bare", str(other_remote)], check=True)
+            dest = folder / "sotto"
+            subprocess.run(["git", "clone", "--quiet", str(other_remote), str(dest)], check=True,
+                           capture_output=True)
+            env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)), SOTTO_SOURCE=str(dest),
+                       SOTTO_PYTHON=sys.executable, SOTTO_GET_DRY_RUN="1")
+            refused = self.run_piped(env)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("not Sotto", refused.stderr)
+            self.assertNotIn("would run", refused.stdout)
+
+    def test_the_same_repository_matches_in_https_and_ssh_form(self):
+        script = (ROOT / "scripts" / "get.sh").read_text(encoding="utf-8")
+        check = script + '\nsame_repo "git@github.com:zohartito/sotto.git" "https://github.com/zohartito/sotto.git" ' \
+                         '&& same_repo "https://github.com/zohartito/sotto/" "https://github.com/zohartito/sotto.git" ' \
+                         '&& ! same_repo "https://github.com/someone/sotto.git" "https://github.com/zohartito/sotto.git"'
+        result = subprocess.run(["/bin/bash", "-c", check.replace('\nmain "$@"', '')], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 @unittest.skipUnless(sys.platform == "win32" and (ROOT / ".git").exists() and shutil.which("git"),
                      "Windows git checkout")
@@ -77,6 +100,22 @@ class WindowsInstallerTests(unittest.TestCase):
             self.assertTrue((dest / "scripts" / "install-windows.ps1").is_file())
             again = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
             self.assertIn("Updating Sotto", again.stdout, again.stderr)
+
+    def test_a_git_copy_of_another_project_is_never_pulled_or_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            other_remote = folder / "other.git"
+            subprocess.run(["git", "init", "--quiet", "--bare", str(other_remote)], check=True)
+            dest = folder / "sotto"
+            subprocess.run(["git", "clone", "--quiet", str(other_remote), str(dest)], check=True,
+                           capture_output=True)
+            env = dict(os.environ, SOTTO_REPO=str(bare_copy_of_this_checkout(folder)), SOTTO_SOURCE=str(dest),
+                       SOTTO_GET_DRY_RUN="1")
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                       str(ROOT / "scripts" / "get.ps1")]
+            refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn("not Sotto", refused.stdout, refused.stderr)
+            self.assertNotIn("would run", refused.stdout)
 
 
 if __name__ == "__main__":
