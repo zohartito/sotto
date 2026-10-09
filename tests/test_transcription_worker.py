@@ -9,13 +9,11 @@ reproduce them exactly.
 """
 from __future__ import annotations
 
-import ast
 import os
 import queue
 import re
 import sys
 import tempfile
-import textwrap
 import threading
 import time
 import types
@@ -30,33 +28,13 @@ import settings
 import sotto
 from audio_codec import prepare_canonical
 from speech_config import resolve_speech_config
+from transcription import TranscriptionWorker
 
 WHISPER = resolve_speech_config("auto", language="en")
 NEMOTRON = resolve_speech_config("nemotron-en")
 LOOP = "difference " * 40
 PREFIX = "That is part of the plan we agreed on last week."
 RECORD = os.environ.get("SOTTO_GOLDEN_RECORD") == "1"
-
-
-# --- the worker under test ---------------------------------------------------
-
-def _closure_source() -> str:
-    """Verbatim source of ``run().transcribe_worker`` from the module on disk."""
-    source = Path(sotto.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "run":
-            for child in ast.walk(node):
-                if isinstance(child, ast.FunctionDef) and child.name == "transcribe_worker":
-                    return textwrap.dedent(ast.get_source_segment(source, child))
-    raise LookupError("run.transcribe_worker not found")
-
-
-def load_closure(namespace: dict):
-    """Compile the closure as a top-level function whose free variables
-    resolve from ``namespace`` (the sotto module plus the fakes)."""
-    exec(compile(_closure_source(), "<sotto.run.transcribe_worker>", "exec"), namespace)
-    return namespace["transcribe_worker"]
 
 
 # --- fakes -------------------------------------------------------------------
@@ -196,14 +174,10 @@ class Harness:
             inject_when_clear=inject_when_clear, undo_when_clear=undo_when_clear,
             record_totals=record_totals,
             model_activity={"last_finished": time.monotonic(), "rewarming": False},
-            vad_warnings=set(), glossary_terms=(),
+            glossary_terms=(),
         )
-        self.run = self._build_worker(copy_text)
-
-    def _build_worker(self, copy_text):
-        namespace = dict(vars(sotto))
-        namespace.update(self.collaborators, _copy_text=copy_text)
-        return load_closure(namespace)
+        self.worker = TranscriptionWorker(**self.collaborators, copy_text=copy_text)
+        self.run = self.worker.run
 
     def _ui_call(self, method, *args):
         self.ui_calls.append((getattr(method, "__name__", str(method)), args))
@@ -609,8 +583,8 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                        'undone': 0}}
 
 
-class TranscriptionWorkerGoldenMaster(unittest.TestCase):
-    """Scenarios a-j from the step-2 spec, recorded from the original closure."""
+class TemporaryUserFiles:
+    """Point the dictionary and settings at a temp folder for each test."""
 
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
@@ -619,6 +593,10 @@ class TranscriptionWorkerGoldenMaster(unittest.TestCase):
             patcher = patch.object(target, name, Path(folder.name) / f"{name.lower()}.txt")
             patcher.start()
             self.addCleanup(patcher.stop)
+
+
+class TranscriptionWorkerGoldenMaster(TemporaryUserFiles, unittest.TestCase):
+    """Scenarios a-j from the step-2 spec, recorded from the original closure."""
 
     def check(self, key: str, harness: Harness):
         observed = harness.observed()

@@ -53,6 +53,6 @@ class DeadRouteTest(unittest.TestCase):
         self.assertEqual(DEAD_ROUTE_TEXT, "[dead microphone]")
 
     def test_live_and_retry_jobs_consult_the_dead_route_guard(self):
-        source = Path("sotto.py").read_text(encoding="utf-8")
+        source = Path("transcription.py").read_text(encoding="utf-8")  # the worker's live/retry jobs
         self.assertIn("asr_skip_reason(samples)", source)
         self.assertIn("asr_skip_reason(snapshot.samples)", source)
