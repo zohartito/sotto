@@ -84,7 +84,7 @@ To run Sotto from a terminal instead of the app:
 git clone https://github.com/zohartito/sotto.git
 cd sotto
 python3.12 -m venv venv-alpha
-venv-alpha/bin/python -m pip install --upgrade pip
+venv-alpha/bin/python -m pip install pip==26.2.1
 venv-alpha/bin/python -m pip install -r requirements-alpha.txt
 venv-alpha/bin/python -m pip check
 
@@ -129,8 +129,9 @@ you chose in Settings) for at least
 0.35 seconds, speak a short sentence, then release. Wait for final text before
 changing fields. Compare it with what you said. Sotto uses the clipboard to
 paste and attempts to restore its previous contents; clipboard managers and
-apps may retain what was pasted. In **Settings** you can switch to **Type** (the
-clipboard is never touched) and choose the spacing: **Smart** (default) adds a
+apps may retain what was pasted. In **Settings** you can switch to **Type**
+(dictation never touches the clipboard; History's Copy and Retry put text on it
+on purpose) and choose the spacing: **Smart** (default) adds a
 space before the text only where it would touch the previous word, in apps
 that expose the cursor; elsewhere it adds a space after, like before. Password
 fields are never typed or pasted into.
@@ -166,7 +167,9 @@ before restarting or switching engines.
 
 Recent items in the menu offer Copy, Retry, Save audio to Desktop, Delete,
 Correct Transcript and Clear history. Copy lets you recover text when an app
-refuses paste. A correction can explicitly enroll paired audio/reference in a
+refuses paste. Retry transcribes the saved audio again with the same checks as
+live dictation and copies the new text; text that fails a check stays in
+History only. A correction can explicitly enroll paired audio/reference in a
 local learning corpus; this does not start a worker or enable adaptive routing.
 **Your progress** opens with your all-time total, for example "All time: 12,400
 words · about 4.2 hours saved vs typing at 40 wpm" (counts only, kept in
@@ -176,8 +179,10 @@ words · about 4.2 hours saved vs typing at 40 wpm" (counts only, kept in
 
 Say **"new line"** or **"new paragraph"** as its own phrase for a line break or a
 blank line ("a new line of products" stays as words). Say **"scratch that"** on
-its own to undo your last dictation with the app's own ⌘Z, within a minute of
-Sotto inserting it. Filler words (um, uh) are removed with the comma around them.
+its own to undo your last dictation with the app's own ⌘Z. It only undoes
+Sotto's own insert: within a minute of the paste, while the same app is still
+in front, and only if you have not typed since; otherwise nothing happens and
+the log says why. Filler words (um, uh) are removed with the comma around them.
 Both apply only to dictation the engine reports as English (Whisper and
 Nemotron; Parakeet does not report a language, so its text stays as spoken)
 and can be switched off under **Settings… → Cleanup**; History keeps what the

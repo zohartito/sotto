@@ -272,9 +272,12 @@ class SpeechRuntimeTests(unittest.TestCase):
         self.assertIn("if shutdown.requested():\n            shutdown.stop_capture(capture)", source)
         self.assertIn("shutdown.enqueue(jobs, (\"live\"", source)
         self.assertIn("shutdown.enqueue(jobs, (\"retry\"", source)
-        self.assertIn("# A backend may ignore cancellation.", source)
         self.assertIn("transcription_thread.join(APP_DRAIN_TIMEOUT)", source)
-        self.assertIn("finalize_primary_live_delivery(", source)
+        # The post-inference fences live in the worker (transcription.py).
+        from transcription import TranscriptionWorker
+        worker = inspect.getsource(TranscriptionWorker._live)
+        self.assertIn("# A backend may ignore cancellation.", worker)
+        self.assertIn("finalize_primary_live_delivery(", worker)
 
     def test_learning_remove_dependency_revoke_precedes_artifact(self):
         calls = []
@@ -593,8 +596,9 @@ class SpeechRuntimeTests(unittest.TestCase):
             self.assertIn("threading.Thread(target=work, daemon=True).start()", source)
             self.assertLess(worker, source.index("store.get"))
         self.assertIn("ui_call(_copy_text, entry[\"text\"])", copy_source)
-        self.assertIn("shutil.copy(store.audio_path(entry_id)", save_source)
-        self.assertIn('Path.home() / "Desktop" / f"sotto-{stamp}.wav"', save_source)
+        self.assertIn('save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",',
+                      save_source)
+        self.assertNotIn("shutil.copy", save_source)
 
     def test_concurrent_export_same_destination_has_one_clean_winner(self):
         _, _ = self._enrolled()

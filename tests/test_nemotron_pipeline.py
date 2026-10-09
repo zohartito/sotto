@@ -19,7 +19,9 @@ from tests.test_nemotron import FakeRuntime
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Nemotron pipeline drives the AppKit runtime; macOS-only')
 class PipelineTests(unittest.TestCase):
-    def test_streaming_capture_reaches_history_and_delivery_once_then_shuts_down(self):
+    def _run_one_dictation(self, directory: Path, make_store):
+        """sotto.run with one streamed dictation, then Quit; History comes from
+        ``make_store(**kwargs)``. Returns (status UI mock, pasted, captures, runtime)."""
         callbacks, captures, pasted = {}, [], []
         delivered = threading.Event()
         runtime = FakeRuntime()
@@ -77,14 +79,13 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(delivered.wait(5))
             callbacks["quit"]()
 
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory, ExitStack() as stack:
-            store = history.HistoryStore(Path(directory))
-            learning_store = learning.LearningStore(Path(directory))
+        with ExitStack() as stack:
+            learning_store = learning.LearningStore(directory)
             replacements = {
                 "sotto.CaptureService": Capture,
                 "sotto.inject": inject,
                 "nemotron_backend.NemotronRuntime": lambda: runtime,
-                "history.HistoryStore": lambda: store,
+                "history.HistoryStore": make_store,
                 "learning.LearningStore": lambda: learning_store,
                 "ui.init_app": lambda: status,
                 "ui.run_loop": run_loop,
@@ -105,6 +106,12 @@ class PipelineTests(unittest.TestCase):
             # Let the event-only shutdown watchers observe their fence before
             # removing mocked OS boundaries. No real event tap or mic exists.
             time.sleep(.15)
+        return status, pasted, captures, runtime
+
+    def test_streaming_capture_reaches_history_and_delivery_once_then_shuts_down(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = history.HistoryStore(Path(directory))
+            status, pasted, captures, runtime = self._run_one_dictation(Path(directory), lambda **kwargs: store)
             rows = store.entries()
             self.assertEqual(len(rows), 1)
             self.assertEqual(pasted, ["Complete final transcript."])
@@ -115,3 +122,19 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(captures[0].is_active())
             self.assertIsNone(captures[0]._engine)
             runtime.close.assert_called()
+
+    def test_an_unreadable_history_still_launches_pastes_and_alerts_once(self):
+        """F16b: a damaged history.jsonl used to raise before the menu bar
+        existed, so the LaunchAgent relaunched into the same crash forever."""
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            index = Path(directory) / "history.jsonl"
+            index.write_text('{"id": "abc123", "text": "kept"}\n{"id": "def456", "text": "cut of', encoding="utf-8")
+            before = index.read_bytes()
+            real_store = history.HistoryStore  # run() sees the patched name
+            status, pasted, _captures, _runtime = self._run_one_dictation(
+                Path(directory), lambda **kwargs: real_store(Path(directory), **kwargs))
+            self.assertEqual(pasted, ["Complete final transcript."])
+            self.assertEqual(index.read_bytes(), before)
+            alerts = [call.args for call in status.show_error.call_args_list]
+            self.assertEqual([title for title, _ in alerts], [sotto.HISTORY_UNREADABLE_TITLE])
+            self.assertIn(str(index), alerts[0][1])

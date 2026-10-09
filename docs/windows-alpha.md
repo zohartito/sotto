@@ -13,7 +13,9 @@ a plain **console program** for tests and headless use. Audio and inference
 stay on your PC; installing dependencies and the first model download need
 internet access. No speech-upload service or telemetry is configured.
 Nemotron, adaptive/"silver" learning, sealed releases and LaunchAgents are
-macOS-only and unreachable here. [MIT license](../LICENSE); models and
+macOS-only and never run here. History actions create no silver ledger; one
+left in the data folder by an earlier alpha is still consulted, so a deleted
+recording cannot leave silver records behind. [MIT license](../LICENSE); models and
 dependencies have their own licenses.
 
 ## Requirements
@@ -78,7 +80,7 @@ weights or personal data.
 
 ```powershell
 py -3.13 -m venv venv-alpha
-venv-alpha\Scripts\python -m pip install --upgrade pip
+venv-alpha\Scripts\python -m pip install pip==26.2.1
 # CPU only:
 venv-alpha\Scripts\python -m pip install -r requirements-alpha-windows.txt
 # ...or, with an NVIDIA GPU (includes the CPU set plus cuBLAS):

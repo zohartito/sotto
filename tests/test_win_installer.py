@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -254,7 +255,8 @@ class UpdateScriptTest(unittest.TestCase):
 
     REQUIREMENTS = {
         "requirements-alpha-windows.txt": "-c constraints-alpha-windows.txt\n",
-        "requirements-alpha-windows-cuda.txt": "-r requirements-alpha-windows.txt\n-c constraints-alpha-windows-cuda.txt\n",
+        "requirements-alpha-windows-cuda.txt":
+            "-r requirements-alpha-windows.txt\n-c constraints-alpha-windows-cuda.txt\n",
         "constraints-alpha-windows.txt": "# none\n",
         "constraints-alpha-windows-cuda.txt": "# none\n",
     }
@@ -275,6 +277,14 @@ class UpdateScriptTest(unittest.TestCase):
             text = text.replace("[Environment]::GetFolderPath('Programs')", f"'{self.menu}'")
             if "GetFolderPath" in text or f"'{self.menu}'" not in text:
                 self.fail(f"refusing to run {name}: its Start Menu folder could not be redirected")
+            if name == "install-windows.ps1":
+                # pip is offline here (PIP_NO_INDEX), so the exact-pip bootstrap
+                # (pinned in tests/test_dependency_pins.py) asks only for "pip",
+                # which the venv's own pip satisfies; the step still runs.
+                pinned = re.search(r"pip install --disable-pip-version-check pip==[\d.]+", text)
+                if pinned is None:
+                    self.fail("refusing to run install-windows.ps1: its pip bootstrap line moved")
+                text = text.replace(pinned.group(0), "pip install --disable-pip-version-check pip")
             (self.copy / "scripts" / name).write_text(text, encoding="utf-8")
         for name, text in self.REQUIREMENTS.items():
             (self.copy / name).write_text(text, encoding="utf-8")
@@ -374,12 +384,41 @@ class UpdateScriptTest(unittest.TestCase):
         self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), before)
         self.assertIn("previous packages are back", self.status())
 
+    def test_packages_a_failed_update_added_are_removed_again(self) -> None:
+        # [PR15 review] pip install -r only adds: a package the update brought
+        # in (with its dependency) stayed installed after the rollback, while
+        # the status said the previous packages were back.
+        wheels = Path(self._tmp.name) / "wheels"
+        wheels.mkdir()
+        for name, version, requires in (("sotto_test_core", "1.0", ()), ("sotto_test_core", "2.0", ()),
+                                        ("sotto_test_app", "1.0", ("sotto-test-core<2",)),
+                                        ("sotto_test_new", "1.0", ("sotto-test-extra",)),
+                                        ("sotto_test_extra", "1.0", ())):
+            _wheel(wheels, name, version, requires)
+        python = self.venv / "Scripts" / "python.exe"
+        subprocess.run([str(python), "-m", "pip", "install", "--quiet", "--no-index", "--find-links",
+                        str(wheels), "sotto-test-app==1.0"], check=True, capture_output=True, timeout=300)
+        before = self.git(self.copy, "rev-parse", "HEAD")
+        self.publish("requirements-alpha-windows.txt",
+                     self.REQUIREMENTS["requirements-alpha-windows.txt"]
+                     + "sotto-test-new==1.0\nsotto-test-core==2.0\n")
+        result = self.update(PIP_FIND_LINKS=str(wheels))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        log = self.log_bytes().decode("utf-8", "replace")
+        self.assertRegex(log, r"Successfully installed .*sotto-test-new-1\.0", "pip did add it first")
+        installed = subprocess.run([str(python), "-m", "pip", "freeze"], capture_output=True, text=True,
+                                   timeout=120).stdout.split()
+        self.assertEqual(sorted(installed), ["sotto-test-app==1.0", "sotto-test-core==1.0"], log)
+        self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), before)
+        self.assertIn("previous packages are back", self.status())
+
     def test_an_update_installs_packages_then_switches_and_keeps_the_recorded_set(self) -> None:
         # [F2w][F34] Packages first, then the source; the CPU set recorded at
         # install stays CPU even on a PC with an NVIDIA GPU.
         upstream = self.publish("CHANGES.txt", "new version\n")
         result = self.update()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + self.log_bytes().decode("utf-8", "replace"))
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr + self.log_bytes().decode("utf-8", "replace"))
         self.assertEqual(self.git(self.copy, "rev-parse", "HEAD"), upstream)
         status = self.status()
         self.assertTrue(status.startswith("ok ") and upstream.startswith(status[3:]), status)

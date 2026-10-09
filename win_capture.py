@@ -17,12 +17,15 @@ dead route that occurs mid-capture.
 Stopping a stream can take a while (Bluetooth, slow drivers), and end() and
 abort() are called on the keyboard-hook thread, which must return at once: the
 finished stream is stopped and closed on its own thread, and the next open
-waits for that.
+(on its own thread too) waits for that.  If that close is still running after
+CLOSE_WAIT_S, the new capture fails like a failed open rather than put a
+second stream on the microphone.
 """
 from __future__ import annotations
 
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -32,6 +35,7 @@ if sys.platform != "win32":
 import sounddevice as sd
 
 SAMPLE_RATE = 16_000
+CLOSE_WAIT_S = 2.0  # how long an open waits for the previous stream to close
 
 
 def _log(msg: str) -> None:
@@ -58,6 +62,7 @@ class WinCapture:
         # already-ended capture must never attach to (or feed) a newer one.
         self._generation = 0
         self._closing: list[threading.Thread] = []
+        self._close_wait_s = CLOSE_WAIT_S
         self._lock = threading.Lock()
 
     def begin(self) -> bool:
@@ -95,15 +100,29 @@ class WinCapture:
             self._closing.append(thread)
             thread.start()
 
-    def _wait_closed(self, timeout: float = 2.0) -> None:
-        """Wait for streams still closing, so two never hold the mic at once."""
+    def _wait_closed(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` in all for streams still closing; True once none is."""
         with self._lock:
             closing = list(self._closing)
+        deadline = time.monotonic() + timeout
         for thread in closing:
-            thread.join(timeout)
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in closing)
+
+    def _fail_start(self, generation: int, reason: str) -> None:
+        with self._lock:
+            if self._current(generation):
+                self._active = False
+                self._waking = False
+        self._log(f"! mic open failed: {reason[:120]}")
 
     def _open_stream(self, generation: int) -> None:
-        self._wait_closed()
+        # Runs on the thread begin() started, never on the keyboard hook.
+        if not self._wait_closed(self._close_wait_s):
+            # Two streams must never hold the mic: this press fails instead.
+            self._fail_start(generation, "the previous stream is still closing (slow audio driver); "
+                                         "press again in a moment")
+            return
 
         def _callback(indata, frame_count, time_info, status) -> None:
             block = indata[:, 0].copy()
@@ -123,13 +142,9 @@ class WinCapture:
             )
             stream.start()
         except Exception as exc:
-            with self._lock:
-                if self._current(generation):
-                    self._active = False
-                    self._waking = False
+            self._fail_start(generation, str(exc))
             if stream is not None:
                 stream.close()
-            self._log(f"! mic open failed: {str(exc)[:120]}")
             return
         with self._lock:
             keep = self._current(generation) and self._stream is None
@@ -191,4 +206,4 @@ class WinCapture:
                 stream.close()
             except Exception:
                 pass
-        self._wait_closed()  # the mic is closed when Sotto stops
+        self._wait_closed(self._close_wait_s)  # the mic is closed when Sotto stops
