@@ -153,7 +153,8 @@ class RestartTests(unittest.TestCase):
 
     def test_dead_route_uses_its_own_runtime_restart_callback(self):
         service = sotto.CaptureService()
-        service._process_started_at = 0
+        # Old enough to restart, whatever the machine's uptime (CI runners boot minutes before).
+        service._process_started_at = time.monotonic() - sotto.SILENCE_RESTART_AFTER_S - 1
         service.restart_callback = Mock(return_value=True)
         with patch('subprocess.run') as external:
             self.assertTrue(service._restart_app())
@@ -162,7 +163,7 @@ class RestartTests(unittest.TestCase):
 
     def test_dead_route_restart_refusal_keeps_the_rung_armed(self):
         service = sotto.CaptureService()
-        service._process_started_at = 0
+        service._process_started_at = time.monotonic() - sotto.SILENCE_RESTART_AFTER_S - 1
         service.restart_callback = controller(sealed=True).request
         self.assertFalse(service._restart_app())
 
@@ -459,14 +460,15 @@ class ModelAndTemplateTests(unittest.TestCase):
         self.assertTrue(snapshot.call_args.kwargs['local_files_only'])
 
     @unittest.skipUnless(sys.platform == 'darwin', 'LaunchAgent templates use POSIX paths')
-    def test_every_test_module_and_top_level_source_ships_in_the_archive(self):
+    def test_every_test_module_source_and_workflow_ships_in_the_archive(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('build_alpha_source', ROOT / 'scripts/build_alpha_source.py')
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
         shipped = set(builder.PUBLIC_FILES)
         missing = [path.relative_to(ROOT).as_posix()
-                   for path in [*ROOT.glob('tests/*.py'), *ROOT.glob('*.py')]
+                   for path in [*ROOT.glob('tests/*.py'), *ROOT.glob('*.py'),
+                                *ROOT.glob('.github/workflows/*.yml')]
                    if path.relative_to(ROOT).as_posix() not in shipped]
         self.assertEqual(missing, [])
 
