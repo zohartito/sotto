@@ -83,7 +83,8 @@ class MacInstallerTests(unittest.TestCase):
     def test_the_same_repository_matches_in_https_and_ssh_form(self):
         script = (ROOT / "scripts" / "get.sh").read_text(encoding="utf-8")
         check = script + '\nsame_repo "git@github.com:zohartito/sotto.git" "https://github.com/zohartito/sotto.git" ' \
-                         '&& same_repo "https://github.com/zohartito/sotto/" "https://github.com/zohartito/sotto.git" ' \
+                         '&& same_repo "https://github.com/zohartito/sotto/" ' \
+                         '"https://github.com/zohartito/sotto.git" ' \
                          '&& ! same_repo "https://github.com/someone/sotto.git" "https://github.com/zohartito/sotto.git"'
         result = subprocess.run(["/bin/bash", "-c", check.replace('\nmain "$@"', '')], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

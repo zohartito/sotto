@@ -1,0 +1,46 @@
+# Lint configuration only; Sotto is not an installable package. CI runs
+# `ruff check` with the exact version pinned in .github/workflows/tests.yml.
+
+[tool.ruff]
+# 120 is the 99th-percentile line length of the alpha modules today.
+line-length = 120
+target-version = "py312"
+# The sealed adaptive lane (maintainer-only, gate-heavy, receipts sealed to its
+# source digest) and its tests are not linted yet.
+extend-exclude = [
+    "adaptive_learning.py", "adaptive_runtime.py", "adaptive_worker.py", "benchmark.py",
+    "calibration_manifest_builder.py", "calibration_worker.py", "comparator_spool.py",
+    "deployment_controller.py", "evaluation.py", "history.py", "inference_scheduler.py", "learning.py",
+    "offline_backup.py", "runtime_source_manifest.py", "sealed_release.py", "sealed_release_bootstrap.py",
+    "silver_experiment.py", "silver_store.py", "speech_backends.py", "teacher_backends.py",
+    "teacher_consensus.py", "teacher_provision.py", "teachers/",
+    "tests/test_adaptive_learning.py", "tests/test_adaptive_runtime.py", "tests/test_comparator_spool.py",
+    "tests/test_evaluation.py", "tests/test_history_learning.py", "tests/test_inference_scheduler.py",
+    "tests/test_offline_backup.py", "tests/test_runtime_source_manifest.py", "tests/test_sealed_release.py",
+    "tests/test_silver_lane.py", "tests/test_speech_backends.py", "tests/test_speech_runtime.py",
+    "tests/test_teacher_backends.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+# House style keeps short compound statements on one line (`if x: return`, `a; b`).
+ignore = ["E701", "E702"]
+
+[tool.ruff.lint.per-file-ignores]
+# Being restructured elsewhere; only unused imports were removed here. Review
+# B023 (closures over loop variables) and B905 as part of that work.
+"sotto.py" = ["E402", "E501", "E703", "F841", "B023", "B905"]
+# Being restructured elsewhere. B018: `ctypes.windll.user32.SendInput` is a
+# deliberate availability probe inside `doctor`.
+"sotto_win.py" = ["B018", "B904"]
+# Long PyObjC menu-item calls.
+"ui.py" = ["E501"]
+# `from sotto_paths import DATA_DIR` sits next to the path constant it feeds.
+"nemotron_backend.py" = ["E402"]
+"speech_config.py" = ["E402"]
+# Imports the manifest after putting the repo root on sys.path.
+"scripts/build_alpha_source.py" = ["E402"]
+# One-line default downloader.
+"vad.py" = ["E731"]
+# The patched lambda runs inside its own loop iteration.
+"tests/test_win_hotkey.py" = ["B023"]

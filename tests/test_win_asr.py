@@ -93,7 +93,8 @@ class ResolveModelDirTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.cache = Path(self._tmp.name) / "hf"
-        self.snapshot = self.cache / "hub" / "models--deepdml--faster-whisper-large-v3-turbo-ct2" / "snapshots" / TURBO_SHA
+        self.snapshot = (self.cache / "hub" / "models--deepdml--faster-whisper-large-v3-turbo-ct2"
+                         / "snapshots" / TURBO_SHA)
         self.logs: list[str] = []
 
     def tearDown(self) -> None:
