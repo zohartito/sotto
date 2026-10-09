@@ -322,6 +322,7 @@ class DeliveryQueueHarness:
         self.secure = False
         self.inserts_ok = True
         self.shutdown = False
+        self.on_insert = lambda text: None  # runs inside the insert: may raise or request shutdown
         self.delivered, self.undos, self.notes, self.logs = [], [], [], []
         self.queue = sotto.DeliveryQueue(
             insert=self._insert, undo_keys=lambda: self.undos.append(round(self.timers.now, 2)),
@@ -336,11 +337,34 @@ class DeliveryQueueHarness:
         return self.timers.now < self.held_until
 
     def _insert(self, text):
+        self.on_insert(text)
         self.delivered.append((text, round(self.timers.now, 2), self.held()))
         return self.inserts_ok
 
 
 class DeliveryQueueOrderTests(unittest.TestCase):
+    def test_a_failing_insert_does_not_strand_the_dictations_behind_it(self):
+        world = DeliveryQueueHarness(held_until=0.5)
+
+        def first_insert_raises(text):
+            if text == "result-1 ":
+                raise RuntimeError("pasteboard busy")
+        world.on_insert = first_insert_raises
+        for text in ("result-1 ", "result-2 ", "result-3 "):
+            world.queue.paste(text)                           # all three wait behind the held key
+        world.timers.advance_to(3.0)
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-2 ", "result-3 "])
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertTrue(any("pasteboard busy" in line for line in world.logs), world.logs)
+
+    def test_shutdown_during_one_paste_stops_the_next(self):
+        world = DeliveryQueueHarness(held_until=0.5)
+        world.on_insert = lambda text: setattr(world, "shutdown", True)  # Quit lands mid-delivery
+        world.queue.paste("result-1 ")
+        world.queue.paste("result-2 ")
+        world.timers.advance_to(3.0)
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-1 "])
+
     def test_results_behind_a_held_key_paste_in_capture_order(self):
         # The key is held for dictation 3 from t=0 to t=0.5; results 1 and 2 of
         # the serial worker land while it is held.

@@ -2103,20 +2103,26 @@ class DeliveryQueue:
         self._pump()
 
     def _pump(self) -> None:
-        if self._shutdown_requested():
-            self._items.clear()
-            return
         while self._items:
+            if self._shutdown_requested():  # checked per item: Quit can land mid-pump
+                self._items.clear()
+                return
             if self._keys_held():
                 self._wait_or_drop()
                 return
             self._blocked_since = None
             self._waiting = False
             item = self._items.pop(0)
-            if item[0] == "paste":
-                self._deliver(item[1])
-            else:
-                self._undo()
+            try:
+                if item[0] == "paste":
+                    self._deliver(item[1])
+                else:
+                    self._undo()
+            except Exception as exc:  # one failed insert must not strand the items behind it
+                self._log(f"! {item[0]} failed ({type(exc).__name__}: {str(exc)[:160]})")
+                if item[0] == "paste":
+                    self._note("Could not paste the dictation",
+                               "It is in History. Open History to copy the text.")
 
     def _wait_or_drop(self) -> None:
         now = self._clock()
