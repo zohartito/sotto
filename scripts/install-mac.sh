@@ -55,9 +55,21 @@ MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
 [ "$MACOS_MAJOR" -ge 14 ] || fail "Sotto needs macOS 14 or later (this Mac runs $(sw_vers -productVersion))."
 xcrun --find clang >/dev/null 2>&1 || fail "Install Apple's command line tools first: xcode-select --install"
 
+UPSTREAM=""
+REQUIREMENTS="$ROOT/requirements-alpha.txt"
 if [ "$MODE" = update ]; then
     if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git -C "$ROOT" pull --ff-only || fail "git pull failed; resolve it and run again."
+        # Fetch first and install the new version's packages before switching the
+        # source, so a failed download leaves this copy's code exactly as it was.
+        git -C "$ROOT" fetch --quiet || fail "Could not download the update (git fetch failed); nothing was changed."
+        UPSTREAM="$(git -C "$ROOT" rev-parse '@{u}')" || fail "This copy does not follow a GitHub branch."
+        NEXT_REQUIREMENTS="$(mktemp -d)"
+        trap 'rm -rf "$NEXT_REQUIREMENTS"' EXIT
+        for name in requirements-alpha.txt requirements.txt constraints-alpha.txt; do
+            git -C "$ROOT" show "$UPSTREAM:$name" > "$NEXT_REQUIREMENTS/$name" \
+                || fail "The update has no $name; nothing was changed."
+        done
+        REQUIREMENTS="$NEXT_REQUIREMENTS/requirements-alpha.txt"
     else
         echo "This folder is not a git clone: extract the new source archive, then run this script from it."
     fi
@@ -75,8 +87,15 @@ fi
 echo "== Python environment ($VENV)"
 [ -x "$VENV/bin/python" ] || "$PYTHON" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet -r "$ROOT/requirements-alpha.txt"
+"$VENV/bin/python" -m pip install --quiet -r "$REQUIREMENTS" \
+    || fail "Installing packages failed, so the source was not switched. Run this script again to retry."
 "$VENV/bin/python" -m pip check
+
+if [ -n "$UPSTREAM" ]; then
+    echo "== Source"
+    git -C "$ROOT" merge --ff-only --quiet "$UPSTREAM" \
+        || fail "git could not move this copy forward (local changes?); the source was not switched."
+fi
 
 export SOTTO_DATA_DIR="$DATA_DIR"
 export SOTTO_HF_HOME="$DATA_DIR/huggingface"

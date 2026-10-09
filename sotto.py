@@ -517,6 +517,33 @@ def live_preview(text: str) -> str:
         return text
 
 
+def main_thread_dispatch(has_ui: bool, call_after):
+    """Return (ui_call, deliver_call), both scheduling work on the main thread.
+
+    ui_call updates the menu bar and pill, so it does nothing under
+    --no-overlay. deliver_call (pasting, voice undo) always runs: hiding the
+    UI must never stop text from reaching the cursor.
+    """
+    def deliver_call(method, *call_args) -> None:
+        call_after(method, *call_args)
+
+    def ui_call(method, *call_args) -> None:
+        if has_ui:
+            call_after(method, *call_args)
+
+    return ui_call, deliver_call
+
+
+def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep) -> None:
+    """Block the calling worker thread until busy() is False.
+
+    Side effects: sleeps. Used before an update restart, because a restart
+    discards any recording or transcription still in progress.
+    """
+    while busy():
+        sleep(poll_s)
+
+
 def choose_language(probabilities: dict, allowed) -> str:
     """Automatic's pick. Prefer the user's languages, but speech that is
     clearly another language (the allowed ones score < 0.25 while it scores
@@ -2401,9 +2428,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         status_ui.set_language_mode(language_state["mode"],
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
-    def ui_call(method, *call_args) -> None:
-        if status_ui is not None:
-            AppHelper.callAfter(method, *call_args)
+    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter)
 
     def refresh_history() -> None:
         if status_ui is not None:
@@ -2695,8 +2720,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                         entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
                                     adaptive_runtime=adaptive_runtime,appended_publication=publication_meta,
                                     shutdown=shutdown,
-                                    inject=(lambda: ui_call(undo_when_clear, 0)) if voice_action == "scratch"
-                                    else (lambda: ui_call(inject_when_clear, text, 0)) if text else None)
+                                    inject=(lambda: deliver_call(undo_when_clear, 0)) if voice_action == "scratch"
+                                    else (lambda: deliver_call(inject_when_clear, text, 0)) if text else None)
                                 publication_committed = appended_row is not None
                             except Exception:
                                 if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
@@ -3554,17 +3579,26 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             def work() -> None:
                 import updates
                 from sotto_paths import DATA_DIR
-                ok, tail = updates.apply_mac(Path(__file__).resolve().parent, sys.executable,
-                                             DATA_DIR / "logs" / "update.log")
+                finished, tail, source_changed = updates.apply_mac(
+                    Path(__file__).resolve().parent, sys.executable, DATA_DIR / "logs" / "update.log")
                 update_state["running"] = False
-                if ok:
-                    log("✓ update installed — restarting")
+                if finished:
+                    log("✓ update installed — restarting once dictation is done")
+                    # A restart discards any recording or transcription in progress,
+                    # and the user may have dictated while the update ran.
+                    wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0)
                     action_restart()
+                elif source_changed:
+                    log("! update installed but its setup did not finish (see logs/update.log)")
+                    ui_call(status_ui.show_error, "Update not finished",
+                            f"{tail}\n\nThe new version is in place but its setup did not finish. "
+                            "Run scripts/install-mac.sh --update in Terminal to finish it, then "
+                            "choose Restart Sotto. Details are in logs/update.log in the data folder.")
                 else:
                     log("! update failed (see logs/update.log)")
                     ui_call(status_ui.show_error, "Update failed",
-                            f"{tail}\n\nSotto keeps running the current version. "
-                            "Details are in logs/update.log in the data folder.")
+                            f"{tail}\n\nNothing was switched, so Sotto keeps running the current "
+                            "version. Details are in logs/update.log in the data folder.")
             threading.Thread(target=work, daemon=True).start()
 
         def action_check_updates() -> None:

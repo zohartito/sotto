@@ -82,6 +82,11 @@ class LauncherBehaviourTests(unittest.TestCase):
         before = (app / "Contents/MacOS/Sotto").stat().st_mtime_ns
         install_app.build(**options)
         self.assertEqual((app / "Contents/MacOS/Sotto").stat().st_mtime_ns, before)
+        # An older build of ours is replaced whole, with no staging folders left behind.
+        (app / "Contents/Resources/old.txt").write_text("from an older build")
+        install_app.build(**options)
+        self.assertFalse((app / "Contents/Resources/old.txt").exists())
+        self.assertEqual([path.name for path in options["applications"].iterdir()], ["Sotto.app"])
 
 
 class InstallLocationTests(unittest.TestCase):
@@ -97,6 +102,18 @@ class InstallLocationTests(unittest.TestCase):
             self.assertEqual(install_app.default_applications(home), Path("/Applications"))
         with unittest.mock.patch.object(install_app.os, "access", return_value=False):
             self.assertEqual(install_app.default_applications(home), home / "Applications")
+
+    def test_build_leaves_an_app_it_did_not_make_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            applications = Path(temporary)
+            other = self.make_app(applications, "com.someone.else.sotto")
+            theirs = other / "Contents" / "theirs.txt"
+            theirs.write_text("keep me")
+            with self.assertRaises(SystemExit):
+                install_app.build(applications=applications, data_dir=applications / "data",
+                                  hf_home=applications / "hf", python=Path(sys.executable).absolute(),
+                                  compiler="/nonexistent/clang")
+            self.assertEqual(theirs.read_text(), "keep me")
 
     def test_only_our_bundle_is_removed_and_the_kept_copy_survives(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,6 +193,76 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertTrue(os.access(script, os.X_OK))
         usage = subprocess.run(["/bin/bash", str(script), "--help"], capture_output=True, text=True)
         self.assertIn("--uninstall", usage.stdout)
+
+
+FAKE_PYTHON = """#!/bin/bash
+# Stands in for Python 3.12 and the venv: answers the installer's checks and
+# records each pip install; the package install fails when PIP_FAILS=1.
+case "$1 $2" in
+    "-c import platform"*) echo arm64; exit 0 ;;
+    "-c import sys"*) echo 3.12; exit 0 ;;
+esac
+if [ "$1 $2 $3 $4" = "-m pip install --quiet" ] && [ "$5" = "-r" ]; then
+    cat "$6" "$(dirname "$6")/constraints-alpha.txt" >> "$FAKE_LOG"
+    [ "${PIP_FAILS:-0}" = 1 ] && exit 1
+fi
+exit 0
+"""
+
+
+@unittest.skipUnless(HAVE_CLANG and shutil.which("git"), "macOS installer with git and Apple's command line tools")
+class UpdateOrderTests(unittest.TestCase):
+    """--update installs the new version's packages before it switches the source."""
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                               "-c", "init.defaultBranch=main", *args],
+                              cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base)
+        remote, publisher, self.user = base / "remote.git", base / "publisher", base / "user"
+        self.git(base, "init", "--bare", str(remote))
+        self.git(base, "clone", str(remote), str(publisher))
+        (publisher / "scripts").mkdir()
+        shutil.copy2(ROOT / "scripts/install-mac.sh", publisher / "scripts/install-mac.sh")
+        (publisher / "requirements-alpha.txt").write_text("-r requirements.txt\n-c constraints-alpha.txt\n")
+        (publisher / "requirements.txt").write_text("numpy\n")
+        (publisher / "constraints-alpha.txt").write_text("numpy==1.0\n")
+        (publisher / ".gitignore").write_text("venv-alpha/\n")
+        self.git(publisher, "add", ".")
+        self.git(publisher, "commit", "-m", "First")
+        self.git(publisher, "push", "origin", "HEAD:main")
+        self.git(base, "clone", "--branch", "main", str(remote), str(self.user))
+        self.old = self.git(self.user, "rev-parse", "HEAD")
+        (publisher / "constraints-alpha.txt").write_text("numpy==2.0\n")
+        self.git(publisher, "commit", "-am", "Newer numpy")
+        self.git(publisher, "push", "origin", "HEAD:main")
+        self.new = self.git(publisher, "rev-parse", "HEAD")
+        fake = self.user / "venv-alpha" / "bin" / "python"
+        fake.parent.mkdir(parents=True)
+        fake.write_text(FAKE_PYTHON)
+        fake.chmod(0o755)
+        self.log = base / "pip.log"
+        self.env = dict(os.environ, FAKE_LOG=str(self.log), SOTTO_DATA_DIR=str(base / "data"))
+
+    def update(self, **env):
+        return subprocess.run(["/bin/bash", str(self.user / "scripts/install-mac.sh"), "--update",
+                               "--python", str(self.user / "venv-alpha/bin/python")],
+                              env=dict(self.env, **env), capture_output=True, text=True)
+
+    def test_failed_package_install_leaves_the_source_alone(self):
+        result = self.update(PIP_FAILS="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source was not switched", result.stderr)
+        self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.old)
+
+    def test_new_packages_are_installed_then_the_source_moves(self):
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("numpy==2.0", self.log.read_text())
+        self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.new)
 
 
 if __name__ == "__main__":
