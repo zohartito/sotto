@@ -565,6 +565,19 @@ class AppLogRotationTests(unittest.TestCase):
                 sys.stderr.close()
 
 
+class TelemetryTests(unittest.TestCase):
+    def test_n37_importing_sotto_turns_hub_telemetry_off(self):
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {"HF_HUB_DISABLE_TELEMETRY", "DISABLE_TELEMETRY"}}
+        with tempfile.TemporaryDirectory(dir=ROOT.parent) as data:
+            environment["SOTTO_DATA_DIR"] = data
+            result = subprocess.run(
+                [sys.executable, "-c", "import sotto, huggingface_hub.constants as c; "
+                                       "print(c.HF_HUB_DISABLE_TELEMETRY)"],
+                cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.stdout.strip().splitlines()[-1:], ["True"], result.stderr[-800:])
+
+
 class SaveAudioNameTests(unittest.TestCase):
     """Save audio to Desktop never overwrites an earlier save."""
 

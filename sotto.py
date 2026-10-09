@@ -192,6 +192,9 @@ from sotto_paths import MODEL_CACHE_DIR
 SOTTO_HF_HOME = MODEL_CACHE_DIR
 os.environ["HF_HOME"] = str(SOTTO_HF_HOME)
 os.environ["HF_HUB_CACHE"] = str(SOTTO_HF_HOME / "hub")
+# No telemetry (README): the Hub client otherwise adds the torch version and
+# the calling agent to the user agent of every model download.
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 # trigger name -> (modifier flag mask, virtual keycode, per-side device bit).
 # The NX_DEVICE*KEYMASK bits identify WHICH side of a paired modifier is down —
