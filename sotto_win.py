@@ -394,13 +394,26 @@ def doctor(profile: str, model: str | None, device: str, speed: str = "accurate"
 
 
 @contextmanager
-def console_close_handler(shutdown: sotto.ShutdownBoundary):
-    """Ctrl-Break and closing the console window arrive as SIGBREAK on Windows."""
-    previous = signal.signal(signal.SIGBREAK, shutdown.request)
+def console_signal_handlers(stop):
+    """Ctrl-C (SIGINT), Ctrl-Break (SIGBREAK) and SIGTERM call ``stop``; the
+    previous handlers come back afterwards.  Only the main thread installs
+    them (an embedded caller keeps its own).
+
+    Closing the console window also raises SIGBREAK, but Windows ends the
+    process as soon as the C runtime's console handler returns, before any
+    Python handler runs (measured: gone within 0.01 s), so a console close
+    never reaches ``stop`` or the teardown.
+    """
+    previous: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGBREAK):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, stop)
     try:
         yield
     finally:
-        signal.signal(signal.SIGBREAK, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def history_command(command: str, *, limit: int, entry_id: str | None,
@@ -738,6 +751,15 @@ class Controller:
                 self.shutdown.request()
 
         threading.Thread(target=finish_then_stop, daemon=True, name="sotto-quit").start()
+
+    def console_stop(self, *_signal) -> None:
+        """Ctrl-C, Ctrl-Break or SIGTERM in a console run: stop, and never
+        restart — a restart waiting for the dictation in flight is cancelled.
+        Runs as a signal handler on the main thread, which never holds
+        _lifecycle_lock."""
+        with self._lifecycle_lock:
+            self.restart_requested = False
+            self.shutdown.request()
 
     def _close_gate(self, reason: str) -> None:
         """Refuse new recordings; on_start logs ``reason``.  Caller holds _lifecycle_lock."""
@@ -1291,14 +1313,14 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         ui.attach(controller)
     # The handlers stay installed through teardown, so a second Ctrl-C during
     # the drain only re-requests shutdown instead of interrupting it.
-    with sotto.shutdown_signal_handlers(shutdown), console_close_handler(shutdown):
+    with console_signal_handlers(controller.console_stop):
         try:
             # Short waits keep the main thread returning to the interpreter,
             # which is where Windows delivers Ctrl-C and Ctrl-Break.
             while not shutdown.event.wait(0.2):
                 pass
         except KeyboardInterrupt:
-            shutdown.request()
+            controller.console_stop()
         finally:
             log("shutting down")
             shutdown.stop_capture(capture)

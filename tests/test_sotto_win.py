@@ -532,14 +532,15 @@ class QuitAndUpdateTest(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class ConsoleCloseHandlerTest(unittest.TestCase):
-    def test_ctrl_break_requests_shutdown_and_handler_is_restored(self):
-        previous = signal.getsignal(signal.SIGBREAK)
-        boundary = sotto.ShutdownBoundary()
-        with sotto_win.console_close_handler(boundary):
-            handler = signal.getsignal(signal.SIGBREAK)
-            handler(signal.SIGBREAK, None)
-        self.assertTrue(boundary.requested())
-        self.assertEqual(signal.getsignal(signal.SIGBREAK), previous)
+    def test_ctrl_c_ctrl_break_and_sigterm_stop_and_handlers_are_restored(self):
+        signals = (signal.SIGINT, signal.SIGBREAK, signal.SIGTERM)
+        previous = {sig: signal.getsignal(sig) for sig in signals}
+        stops = []
+        with sotto_win.console_signal_handlers(lambda *args: stops.append(args[0])):
+            for sig in signals:
+                signal.getsignal(sig)(sig, None)
+        self.assertEqual(stops, list(signals))
+        self.assertEqual({sig: signal.getsignal(sig) for sig in signals}, previous)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
@@ -1490,6 +1491,48 @@ class QuitRunTest(unittest.TestCase):
         self.assertEqual(delivered, [], "no text is inserted after its own wait ran out")
         self.assertEqual(sum(line.startswith("! not inserted (a modifier key held") for line in logs), 2, logs)
         self.assertEqual(texts, ["first words", "second words"], "both stay in History")
+
+    def console_signal_during_a_restart(self, signum):
+        """A hands-free recording is in progress and a Restart waits for it;
+        then ``signum`` arrives, as Ctrl-C or Ctrl-Break in the console.
+        Returns (run's results, copied texts, History texts, logs)."""
+        import numpy as np
+        from history import HistoryStore
+
+        rate = 16_000
+        voiced = (np.sin(np.arange(rate) / 3) * 0.2).astype(np.float32)
+        hooks, boundaries, controllers, logs = [], [], [], []
+        fakes = _app_fakes(rate, [voiced], ["said before the signal"], hooks, [])
+        default = signal.getsignal(signum)
+
+        def drive(results):
+            _wait_for(lambda: controllers and hooks, "listening")
+            _wait_for(lambda: signal.getsignal(signum) != default, "the console handlers")
+            controller = controllers[0]
+            controller.start_now()
+            time.sleep(0.3)
+            results["restart message"] = controller.restart()
+            signal.raise_signal(signum)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-signal-") as temporary:
+            data = Path(temporary)
+            results, _delivered, copied = self.run_app(fakes, drive, data, logs=logs,
+                                                       boundaries=boundaries,
+                                                       controllers=controllers)
+            texts = [entry["text"] for entry in HistoryStore(data).entries(10)]
+        self.assertEqual(signal.getsignal(signum), default, "the handler is restored")
+        self.assertIn("after the current dictation", results["restart message"])
+        return results, copied, texts, logs
+
+    def test_a_console_signal_during_a_restart_stops_instead(self):
+        # Ctrl-C or Ctrl-Break while a Restart waited for the dictation in
+        # flight requested shutdown but left the restart requested: run()
+        # returned True and main() started Sotto again.
+        for signum in (signal.SIGINT, signal.SIGBREAK):
+            with self.subTest(signal=signum.name):
+                results, _copied, _texts, logs = self.console_signal_during_a_restart(signum)
+                self.assertFalse(results["restart"], f"{signum!r} stops Sotto, never restarts it")
+                self.assertIn("✓ stopped", logs)
 
     def test_a_start_refused_by_the_closed_gate_leaves_the_gesture_idle(self):
         # The engine marked itself recording before on_start met the closed
