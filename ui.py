@@ -289,6 +289,7 @@ class StatusUI:
         self.refresh_history([])
 
         self._display_level = 0.0
+        self._tap_healthy = True  # False shows ⚠ in the menu bar while idle
         self._mode = "idle"  # idle | recording | transcribing
         self._indicator_state = "idle"  # idle | waking | recording | transcribing
         self._visibility_generation = 0
@@ -349,9 +350,14 @@ class StatusUI:
 
     def set_tap_health(self, healthy: bool) -> None:
         """Make a deaf hotkey visible: ⚠ in the menu bar while the event tap
-        cannot be re-enabled, restored to the idle glyph once it recovers."""
+        cannot be re-enabled, restored to the idle glyph once it recovers.
+        Side effects: remembered, so hiding the pill does not erase the ⚠."""
+        self._tap_healthy = healthy
         if self._mode == "idle":
-            self._status.button().setTitle_("◦" if healthy else "⚠")
+            self._status.button().setTitle_(self._idle_glyph())
+
+    def _idle_glyph(self) -> str:
+        return "◦" if getattr(self, "_tap_healthy", True) else "⚠"
 
     def set_adaptive_stage(self, stage: str) -> None:
         """A compact idle indicator; it deliberately contains no user text."""
@@ -739,7 +745,7 @@ class StatusUI:
         self._indicator_state = "idle"
         self._visibility_generation += 1
         self._stop_level_timer()
-        self._status.button().setTitle_("◦")
+        self._status.button().setTitle_(self._idle_glyph())
         self._orb.removeAnimationForKey_("pulse")
         self._panel.orderOut_(None)
 

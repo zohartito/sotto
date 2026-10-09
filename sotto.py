@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +35,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+import pipeline
+# The output guards live in pipeline.py (shared with Windows); these names stay
+# importable from sotto for existing callers.
+from pipeline import (LOOP_MAX_UNIT_WORDS, LOOP_MIN_PREFIX_CHARS, LOOP_MIN_REPEATS,  # noqa: F401
+                      NO_SPEECH_TEXT, _find_repetition_loop, apply_voice_cleanup,
+                      looks_hallucinated, reads_as_no_speech, salvage_repetition_loop, screen)
 try:  # Keep content-free CLI/admin helpers importable on non-macOS test hosts.
     import Quartz
     from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
@@ -51,11 +59,26 @@ SILENCE_RESTART_AFTER_S = 600.0  # min process age before a dead-mic restart
 HOLD_THRESHOLD_S = 0.35
 DOUBLE_TAP_WINDOW_S = 0.40
 HANDS_FREE_MAX_S = 600.0        # watchdog: force-finish a forgotten open mic
-RESTORE_DELAY_S = 0.6
+# Clipboard restore after the synthetic ⌘V. Reading the pasteboard does not
+# change its changeCount and there is no public "the app has read it" signal,
+# so the restore is a bounded wait: long enough for an app that is briefly busy
+# at paste time (Electron hitches, a tab mid-layout) to still read Sotto's text
+# — the old 0.6 s handed such apps the user's OLD clipboard — and short enough
+# that a user ⌘V a few seconds later gets their own clipboard back. The restore
+# still runs only if changeCount is unchanged (a user ⌘C in the window wins),
+# and overlapping pastes carry the original forward (see inject()).
+RESTORE_DELAY_S = 3.0
+DELIVERY_POLL_S = 0.15           # re-check a held key this often before pasting
+DELIVERY_WAIT_MAX_S = 30.0       # key held, no recording: give up, the text stays in History
+SOTTO_EVENT_TAG = 0x534F5454     # "SOTT" in kCGEventSourceUserData on every key event Sotto posts
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
+QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
+# An installed update restarts once dictation is done: the longest recording
+# (the hands-free watchdog) plus time to transcribe and paste it, then anyway.
+UPDATE_DRAIN_DEADLINE_S = HANDS_FREE_MAX_S + 120.0
 RESTART_RELEASE_WAIT_S = 2.0     # bounded wait for the async mic teardown before exec
 FAST_MARGIN_FRAMES = 500         # Fast: encode the speech plus 5 s, not a padded 30 s
 MODEL_REWARM_AFTER_S = 240.0
@@ -251,6 +274,7 @@ def parse_hotkey(spec: str) -> tuple[int, int] | None:
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+    keep_app_log_small()
 
 
 LAUNCHD_LABEL = "com.zohartito.sotto.app"  # must match launchd/ and scripts/rollout.sh
@@ -261,19 +285,43 @@ def app_mode() -> bool:
     return os.environ.get("SOTTO_LAUNCHER") == "app"
 
 
+_app_log: dict = {"path": None, "max_bytes": 0}  # set once logs are routed to a file
+
+
 def route_app_logs(data_dir: Path, max_bytes: int = 2_000_000) -> Path:
     """Sotto.app has no terminal: send stdout/stderr to a small rotating log.
     Logs hold counts and timings only, never what was said."""
     folder = data_dir / "logs"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = folder / "sotto.log"
+    _rotate_if_large(path, max_bytes)
+    _point_output_at(path)
+    _app_log.update(path=path, max_bytes=max_bytes)
+    return path
+
+
+def _rotate_if_large(path: Path, max_bytes: int) -> bool:
+    """Move a log past max_bytes to sotto.log.1 (replacing the older one)."""
     if path.exists() and path.stat().st_size > max_bytes:
         os.replace(path, path.with_suffix(".log.1"))
+        return True
+    return False
+
+
+def _point_output_at(path: Path) -> None:
+    """Send this process's stdout and stderr to the log file at path."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     for stream in (1, 2):
         os.dup2(descriptor, stream)
     os.close(descriptor)
-    return path
+
+
+def keep_app_log_small() -> None:
+    """Rotate a routed log that grew past its limit while Sotto runs; the old
+    file keeps the open descriptors, so point output at a fresh one."""
+    path = _app_log["path"]
+    if path is not None and _rotate_if_large(path, _app_log["max_bytes"]):
+        _point_output_at(path)
 
 
 def sotto_icon_path() -> Path | None:
@@ -462,7 +510,7 @@ def record_totals(text: str, seconds: float) -> None:
     import progress
     try:
         progress.record(totals_path(), text=text, seconds=seconds)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # unreadable or malformed: keep the file, skip this one
         log(f"! progress totals not saved ({type(exc).__name__})")
 
 
@@ -474,36 +522,9 @@ def seed_totals(store) -> None:
         log(f"! progress totals not started ({type(exc).__name__})")
 
 
-def apply_voice_cleanup(text: str, preprocessing: dict, language: str | None) -> tuple[str, str | None]:
-    """English voice commands and filler removal, after the dictionary. Returns
-    the text to deliver and an action ("scratch" undoes the last dictation)."""
-    import settings
-    import voice_commands
-    preferences = settings.load(settings.SETTINGS_PATH)
-    commands, fillers = preferences["voice_commands"], preferences["remove_fillers"]
-    if not (commands or fillers) or not voice_commands.is_english(language):
-        return text, None
-    cleaned, action = voice_commands.clean(text, fillers=fillers, commands=commands)
-    if action or cleaned != text:
-        preprocessing["voice"] = {"asr_text": text, **({"action": action} if action else {})}
-    return cleaned, action
-
-
 def apply_personal_dictionary(text: str, preprocessing: dict) -> str:
-    """The user's own spellings for text that is about to be delivered.
-
-    Runs after every hallucination/no-speech guard; the recognizer's original
-    output stays in the History row's preprocessing receipt."""
-    import dictionary
-    try:
-        updated, receipt = dictionary.apply(text, dictionary.load(dictionary.DICTIONARY_PATH))
-    except Exception as exc:  # a broken dictionary must never cost a dictation
-        log(f"! dictionary skipped ({type(exc).__name__})")
-        return text
-    if receipt:
-        preprocessing["dictionary"] = {"rules": receipt, "asr_text": text}
-        log(f"  dictionary: {sum(item['count'] for item in receipt)} replacement(s)")
-    return updated
+    """pipeline.apply_personal_dictionary, logging to Sotto's log."""
+    return pipeline.apply_personal_dictionary(text, preprocessing, log)
 
 
 def live_preview(text: str) -> str:
@@ -517,14 +538,42 @@ def live_preview(text: str) -> str:
         return text
 
 
-def main_thread_dispatch(has_ui: bool, call_after):
+class PendingDeliveries:
+    """Pastes and undos handed to the main thread but not yet delivered.
+
+    The transcription queue counts a job done once its paste is scheduled,
+    before the main loop runs it, so Quit also waits for this to reach zero.
+    add() runs on the worker, finish() on the main thread; hence the lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def add(self) -> None:
+        with self._lock:
+            self._count += 1
+
+    def finish(self) -> None:
+        with self._lock:
+            self._count = max(0, self._count - 1)
+
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+
+def main_thread_dispatch(has_ui: bool, call_after, deliveries: PendingDeliveries | None = None):
     """Return (ui_call, deliver_call), both scheduling work on the main thread.
 
     ui_call updates the menu bar and pill, so it does nothing under
     --no-overlay. deliver_call (pasting, voice undo) always runs: hiding the
-    UI must never stop text from reaching the cursor.
+    UI must never stop text from reaching the cursor. Each delivery is counted
+    in deliveries until the scheduled method calls deliveries.finish().
     """
     def deliver_call(method, *call_args) -> None:
+        if deliveries is not None:
+            deliveries.add()
         call_after(method, *call_args)
 
     def ui_call(method, *call_args) -> None:
@@ -534,14 +583,88 @@ def main_thread_dispatch(has_ui: bool, call_after):
     return ui_call, deliver_call
 
 
-def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep) -> None:
-    """Block the calling worker thread until busy() is False.
+def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep,
+                    deadline_s: float | None = None, clock=time.monotonic) -> bool:
+    """Block the calling worker thread until busy() is False, or until
+    deadline_s has passed. Returns whether it became idle.
 
-    Side effects: sleeps. Used before an update restart, because a restart
-    discards any recording or transcription still in progress.
+    Side effects: sleeps. Used before an update restart and Quit, because
+    shutdown discards any recording or transcription still in progress.
     """
+    give_up = None if deadline_s is None else clock() + deadline_s
     while busy():
+        if give_up is not None and clock() >= give_up:
+            return False
         sleep(poll_s)
+    return True
+
+
+def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries) -> bool:
+    """Whether a dictation is still recording, transcribing, or waiting to be
+    pasted — the three stages Quit lets finish before shutting down."""
+    return capture.is_active() or jobs.unfinished_tasks > 0 or deliveries.count() > 0
+
+
+def end_capture_now(engine, capture, on_finish) -> str | None:
+    """End the recording in progress so it is transcribed, not dropped.
+
+    Returns "gesture" when the gesture engine ended it, "orphan" when the
+    capture outlived the engine's state (a gesture callback raised after the
+    mic started) and was ended directly, or None when nothing was recording.
+    Side effects: may stop the capture and queue it for transcription.
+    """
+    if engine.force_finish():
+        return "gesture"
+    if capture.is_active():
+        on_finish()
+        return "orphan"
+    return None
+
+
+INSTALL_TIMEOUT_S = 3600.0  # an engine download on a slow link, but never forever
+
+
+def run_installer(argv: list[str], *, run=subprocess.run) -> tuple[bool, str]:
+    """Run an optional-engine installer; (succeeded, its last output). Never
+    raises, so the caller always clears its "installing" state."""
+    try:
+        result = run(argv, capture_output=True, text=True, timeout=INSTALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {INSTALL_TIMEOUT_S / 60:.0f} minutes"
+    except OSError as exc:
+        return False, f"could not start ({exc.strerror or exc})"
+    return result.returncode == 0, (result.stderr or result.stdout).strip()[-200:]
+
+
+def desktop_audio_path(folder: Path, timestamp: float) -> Path:
+    """Where "Save audio to Desktop" writes a recording: named by the second
+    it was captured, with -2, -3, … so an earlier save is never overwritten.
+
+    Side effects: creates the file empty with exclusive create, so two saves
+    running at once can never pick the same name.
+    """
+    import datetime
+    stem = f"sotto-{datetime.datetime.fromtimestamp(timestamp):%Y%m%d-%H%M%S}"
+    candidate, number = folder / f"{stem}.wav", 2
+    while True:
+        try:
+            with open(candidate, "xb"):
+                return candidate
+        except FileExistsError:
+            candidate, number = folder / f"{stem}-{number}.wav", number + 1
+
+
+def save_audio_copy(source: Path, folder: Path, timestamp: float) -> Path:
+    """Copy a recording into folder under a fresh desktop_audio_path name.
+
+    Side effects: writes one new file. The source is opened first, so a
+    missing recording raises FileNotFoundError without leaving a file behind.
+    """
+    with open(source, "rb") as audio:
+        target = desktop_audio_path(folder, timestamp)
+        with open(target, "wb") as saved:
+            shutil.copyfileobj(audio, saved)
+    return target
 
 
 class CaptureGate:
@@ -865,9 +988,15 @@ def _audio_devices() -> list[dict]:
         get_data(dev_id, fourcc("lnam"), fourcc("glob"), ref)
         if not ref.value:
             return ""
-        buf = ctypes.create_string_buffer(256)
-        cf.CFStringGetCString(ref, buf, 256, 0x08000100)
-        return buf.value.decode("utf-8", "replace")
+        try:
+            buf = ctypes.create_string_buffer(256)
+            cf.CFStringGetCString(ref, buf, 256, 0x08000100)
+            return buf.value.decode("utf-8", "replace")
+        finally:
+            # kAudioObjectPropertyName hands out a +1 CFStringRef that the
+            # caller owns; the idle device scan runs every 5 s, so an
+            # unreleased name leaked a string per device per scan.
+            cf.CFRelease(ref)
 
     def terminals(dev_id, scope) -> list[int]:
         arr = (ctypes.c_uint32 * 32)()
@@ -905,7 +1034,6 @@ def _select_input_device() -> tuple[int | None, str]:
     when one is connected — its mic is at your mouth — otherwise the built-in
     MacBook mic. Never the iPhone Continuity mic or a Bluetooth speaker's mic:
     those sit across the room and produced this project's deaf recordings."""
-    import ctypes
 
     def fourcc(code: str) -> int:
         return int.from_bytes(code.encode("ascii"), "big")
@@ -1010,9 +1138,10 @@ class CaptureService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
-        self._ring: list[np.ndarray] = []
+        self._ring: list[tuple[np.ndarray, float]] = []   # (block, its rate)
         self._ring_samples = 0
         self._active: list[np.ndarray] | None = None
+        self._active_rates: list[float] = []   # per-block rates, parallel to _active
         self._stream = None
         self._stream_enqueue = None
         self._next_expected = None
@@ -1030,6 +1159,7 @@ class CaptureService:
         self._process_started_at = time.monotonic()
         self._restart_deferred_at = 0.0
         self.restart_callback = None
+        self.on_start_failed = None   # runtime hook: the mic never came up under a capture
         self._release_thread = None
         self._last_device_scan = 0.0
         self._device_id = None
@@ -1045,13 +1175,17 @@ class CaptureService:
         # overlap. A release racing the next press used to be able to stop the
         # newly started capture.
         with self._lifecycle_lock:
-            self._start_engine_locked()
+            started = self._start_engine_locked()
+        if not started:
+            self._report_start_failure()
 
-    def _start_engine_locked(self) -> None:
+    def _start_engine_locked(self) -> bool:
         """Build, pin, and start the capture engine. NEVER raises — an audio
         error must not kill the daemon (a stale tap format threw straight out
         of installTapOnBus and took the whole process down, which launchd then
         restarted in a loop while dictations silently captured nothing).
+        Returns whether the engine is live afterwards; a False under an
+        in-flight capture is surfaced by _report_start_failure.
 
         The format must be re-read on a FRESH engine AFTER pinning: a device
         switch (AirPods run at 24 kHz, built-in at 48 kHz) briefly leaves the
@@ -1068,11 +1202,11 @@ class CaptureService:
         try:
             with self._lock:
                 if self._closed:
-                    return
+                    return False
             for attempt in range(5):
                 with self._lock:
                     if self._closed:
-                        return
+                        return False
                 # ONE engine for the process lifetime. Allocating a new
                 # AVAudioEngine per wake leaked its CoreAudio threads (43
                 # threads / 10 audio threads observed after ~50 wake cycles,
@@ -1121,18 +1255,37 @@ class CaptureService:
                             engine.stop()
                         except Exception:
                             pass
-                        return
+                        return False
                 self._engine = engine
                 self._node = node
                 self._last_block_at = time.monotonic()
                 self._engine_started_at = time.monotonic()
                 self._zero_since = None
-                return
+                return True
             log("! could not start the mic after 5 tries")
+            return False
         except Exception as exc:
             log(f"! mic engine error: {str(exc)[:150]}")
+            return False
         finally:
             self._starting = False
+
+    def _report_start_failure(self) -> None:
+        """The engine never came up: stop pretending. Clear the waking flag
+        so the overlay cannot flip to "mic live", and if a capture is waiting
+        on this engine hand it to the runtime hook, which ends the gesture
+        and tells the user once. Idle failures (the device scan switching
+        mics) stay quiet: the next press retries and reports then."""
+        with self._lock:
+            self._waking = False
+            pending = (self._active is not None and self._engine is None
+                       and not self._closed)
+        handler = self.on_start_failed
+        if pending and handler is not None:
+            try:
+                handler()
+            except Exception as exc:
+                log(f"! mic failure handler failed: {str(exc)[:120]}")
 
     def _release_engine(self, *, only_if_idle: bool = False) -> bool:
         with self._lifecycle_lock:
@@ -1140,7 +1293,13 @@ class CaptureService:
 
     def _release_engine_locked(self, *, only_if_idle: bool = False) -> bool:
         """Stop capture but KEEP the engine object — see _start_engine: a new
-        AVAudioEngine per wake leaks CoreAudio threads and CPU forever."""
+        AVAudioEngine per wake leaks CoreAudio threads and CPU forever.
+
+        Every teardown step runs even when an earlier one raises: a tap
+        removal that threw used to skip engine.stop(), and with the handle
+        already cleared nothing ever stopped that engine — idle Sotto kept
+        the microphone open. Returns True only when the engine actually
+        stopped; otherwise the handle stays so the next tick retries."""
         with self._lock:
             if only_if_idle and self._active is not None:
                 return False
@@ -1154,9 +1313,16 @@ class CaptureService:
         try:
             if node is not None:
                 node.removeTapOnBus_(0)
+        except Exception as exc:
+            log(f"! mic tap not removed: {str(exc)[:120]}")
+        try:
             engine.stop()
         except Exception as exc:
-            log(f"! mic release failed: {str(exc)[:120]}")
+            log(f"! mic engine not stopped: {str(exc)[:120]}")
+            with self._lock:
+                if not self._closed:
+                    self._engine, self._node = engine, node
+            return False
         return True
 
     def _observe_config_changes(self, engine) -> None:
@@ -1237,9 +1403,13 @@ class CaptureService:
                     self._release_engine()
                     self._start_engine()
                     return
-            if not active and idle_for > self.idle_release_s:
-                self._release_engine()
-                log("○ mic released (idle) — wakes on next press")
+            # Negative = never, exactly as release_soon reads it. only_if_idle:
+            # "idle" was decided under the lock a moment ago, and a press that
+            # lands in between must keep the engine it is about to record on.
+            if (not active and self.idle_release_s >= 0
+                    and idle_for > self.idle_release_s):
+                if self._release_engine(only_if_idle=True):
+                    log("○ mic released (idle) — wakes on next press")
         except Exception as exc:
             log(f"! mic health check failed: {str(exc)[:120]}")
 
@@ -1355,6 +1525,7 @@ class CaptureService:
                 return
             if all(not block.any() for block in self._active):
                 self._active = []
+                self._active_rates = []
 
     def _tap(self, buffer, when) -> None:
         n = int(buffer.frameLength())
@@ -1391,19 +1562,25 @@ class CaptureService:
             self.native_rate = float(buffer.format().sampleRate())
         except Exception:
             pass
+        rate = self.native_rate
         with self._lock:
             if self._active is not None:
+                # Each block keeps its own rate: a route change mid-recording
+                # (built-in 48 kHz -> AirPods 24 kHz) rebuilds the engine
+                # under a live capture, and end() must not read the earlier
+                # blocks at the later device's rate.
                 self._active.append(block)
+                self._active_rates.append(rate)
                 if self._stream is not None:
                     # Only queue references on the tap. Resampling and ASR run
                     # on the existing serialized transcription worker.
-                    self._stream_enqueue(("stream-audio", self._stream, block, self.native_rate))
+                    self._stream_enqueue(("stream-audio", self._stream, block, rate))
             else:
-                self._ring.append(block)
+                self._ring.append((block, rate))
                 self._ring_samples += len(block)
-                limit = int(RING_S * self.native_rate)
+                limit = int(RING_S * rate)
                 while self._ring_samples > limit and len(self._ring) > 1:
-                    self._ring_samples -= len(self._ring.pop(0))
+                    self._ring_samples -= len(self._ring.pop(0)[0])
 
     def begin(self, *, stream=None, enqueue=None) -> None:
         cold_start = False
@@ -1414,18 +1591,21 @@ class CaptureService:
                 self._stream.cancelled.set()
                 self._stream_enqueue(("stream-close", self._stream))
             preroll: list[np.ndarray] = []
+            preroll_rates: list[float] = []
             needed = int(PREROLL_S * self.native_rate)
             collected = 0
-            for block in reversed(self._ring):
+            for block, rate in reversed(self._ring):
                 preroll.insert(0, block)
+                preroll_rates.insert(0, rate)
                 collected += len(block)
                 if collected >= needed:
                     break
             self._active = preroll
+            self._active_rates = preroll_rates
             self._stream, self._stream_enqueue = stream, enqueue
             if stream is not None:
-                for block in preroll:
-                    enqueue(("stream-audio", stream, block, self.native_rate))
+                for block, rate in zip(preroll, preroll_rates):
+                    enqueue(("stream-audio", stream, block, rate))
             self._last_use = time.monotonic()
             # A start that never completed must not block every future wake —
             # treat a stale "starting" flag as dead and try again.
@@ -1446,16 +1626,25 @@ class CaptureService:
         """True until audio actually flows after a cold start (up to ~5s)."""
         return self._waking
 
+    def is_live(self) -> bool:
+        """An engine is up; False after a start that failed every try."""
+        with self._lock:
+            return self._engine is not None
+
     def end(self, *, include_stream=False):
         with self._lock:
             frames, self._active = self._active or [], None
+            rates, self._active_rates = self._active_rates, []
             stream, self._stream = self._stream, None
             self._stream_enqueue = None
             self._last_use = time.monotonic()
         if not frames:
             empty = np.zeros(0, dtype=np.float32)
             return (empty, stream) if include_stream else empty
-        samples = np.concatenate(frames).reshape(-1)
+        # Blocks placed directly (tests, old callers) carry no rate: they are
+        # at the current one, which is also what the caller reads next.
+        rates = rates + [self.native_rate] * (len(frames) - len(rates))
+        samples = join_capture_blocks(frames, rates, self.native_rate)
         # A hold shorter than the in-capture silence watch (3s) ends before
         # tick() can react, so short presses would keep landing on the same
         # wedged input unit forever (2026-09-20: 1.37s and 1.88s holds, peak
@@ -1474,6 +1663,7 @@ class CaptureService:
                 self._stream_enqueue(("stream-close", self._stream))
             self._stream = self._stream_enqueue = None
             self._active = None
+            self._active_rates = []
             self._last_use = time.monotonic()
 
     def is_active(self) -> bool:
@@ -1521,6 +1711,33 @@ class CaptureService:
             thread.join(timeout)
         return thread is None or not thread.is_alive()
 
+
+def join_capture_blocks(frames: list, rates: list, target_rate: float) -> np.ndarray:
+    """Join tap blocks into one signal at target_rate.
+
+    A route change mid-recording (built-in mic at 48 kHz, then AirPods at
+    24 kHz) leaves blocks of both rates in one capture. Reading them all at
+    the last device's rate stretched the earlier speech to twice its length
+    and halved its pitch; instead every run of same-rate blocks is resampled
+    on its own before the runs are concatenated."""
+    runs: list[tuple[list, float]] = []
+    for block, rate in zip(frames, rates):
+        if runs and runs[-1][1] == rate:
+            runs[-1][0].append(block)
+        else:
+            runs.append(([block], rate))
+    pieces = []
+    for blocks, rate in runs:
+        samples = np.concatenate(blocks).reshape(-1)
+        if rate != target_rate and rate > 0 and target_rate > 0:
+            from fractions import Fraction
+
+            from scipy.signal import resample_poly
+            ratio = Fraction(int(target_rate), int(rate)).limit_denominator(1000)
+            samples = resample_poly(samples, ratio.numerator,
+                                    ratio.denominator).astype(np.float32)
+        pieces.append(samples)
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
 
 
 def prepare_for_whisper(raw: np.ndarray, native_rate: float) -> np.ndarray:
@@ -1573,89 +1790,6 @@ def asr_skip_reason(samples: np.ndarray) -> str | None:
     return None
 
 
-def looks_hallucinated(text: str, seconds: float) -> str | None:
-    """Whisper can turn a second of breath into a thousand characters of
-    looped phrases. Speech is ~15 chars/sec; loops compress absurdly well.
-    Returns the reason if the transcript can't be real speech, else None."""
-    import zlib
-    chars_per_sec = len(text) / max(seconds, 0.1)
-    if chars_per_sec > 40:
-        return f"{chars_per_sec:.0f} chars/sec"
-    if len(text) > 120:
-        ratio = len(zlib.compress(text.encode())) / len(text.encode())
-        if ratio < 0.25:
-            return f"compression ratio {ratio:.2f}"
-    return None
-
-
-LOOP_MIN_REPEATS = 6       # far past what real speech repeats verbatim
-LOOP_MAX_UNIT_WORDS = 6    # loops cycle a word or a short phrase, not a clause
-LOOP_MIN_PREFIX_CHARS = 40  # below this there is no dictation worth rescuing
-
-
-def _find_repetition_loop(text: str) -> tuple[int, str, int] | None:
-    """Earliest degenerate repeated run in `text`, as (char offset where the
-    run starts, the repeated unit, repeat count). Words are matched
-    case-insensitively and without trailing punctuation, so whisper's
-    "Okay. Okay. Okay." loops count as repeats of one unit."""
-    import re
-    spans = [match.span() for match in re.finditer(r"\S+", text)]
-    words = [text[start:end].strip(".,!?;:-").casefold() for start, end in spans]
-    best: tuple[int, str, int] | None = None
-    for unit in range(1, LOOP_MAX_UNIT_WORDS + 1):
-        index = 0
-        while index + unit * LOOP_MIN_REPEATS <= len(words):
-            first = words[index:index + unit]
-            repeats, cursor = 1, index + unit
-            while cursor + unit <= len(words) and words[cursor:cursor + unit] == first:
-                repeats += 1
-                cursor += unit
-            if repeats >= LOOP_MIN_REPEATS:
-                if best is None or spans[index][0] < best[0]:
-                    unit_text = text[spans[index][0]:spans[index + unit - 1][1]]
-                    best = (spans[index][0], unit_text, repeats)
-                index = cursor
-            else:
-                index += 1
-    return best
-
-
-def salvage_repetition_loop(text: str, seconds: float) -> tuple[str, dict] | None:
-    """Whisper can transcribe real dictation and only then fall into a
-    repetition loop ("...that's part of the plan." + "difference" x223,
-    observed 2026-08-15). Blocking the whole transcript costs the user
-    everything they said, so cut at the loop and keep the clean prefix.
-
-    Returns (prefix, receipt) only when the prefix stands on its own as real
-    speech by the same measures that condemned the whole; otherwise None and
-    the caller quarantines as before."""
-    found = _find_repetition_loop(text)
-    if found is None:
-        return None
-    offset, unit_text, repeats = found
-    prefix = text[:offset].strip()
-    if len(prefix) < LOOP_MIN_PREFIX_CHARS:
-        return None
-    if looks_hallucinated(prefix, seconds) is not None:
-        return None
-    return prefix, {"unit": unit_text[:40], "repeats": repeats,
-                    "dropped_chars": len(text) - len(prefix)}
-
-
-def reads_as_no_speech(text: str, speech_fraction: float) -> str | None:
-    """Output-side no-speech verdict, judged AFTER transcription. Whisper
-    turns silence and dead-mic captures into short stock phrases ("you",
-    "Thank you."), so a tiny transcript from a capture the VAD scored as
-    speechless is silence, not dictation. A substantial transcript wins over
-    the VAD score — Silero scores real whispered dictation at 0% speech
-    (whispers on this machine: 240+ chars at VAD 0%; silence: <=15 chars)."""
-    if not text.strip():
-        return "empty transcript"
-    if speech_fraction < 0.06 and len(text.strip()) <= 20:
-        return f"tiny transcript, VAD {speech_fraction*100:.0f}% speech"
-    return None
-
-
 def collapse_silence(samples: np.ndarray) -> np.ndarray:
     """Shorten long silent stretches in a capture. Dead air is what whisper
     hallucinates on during long dictations ("Okay. Okay. Okay."), and it
@@ -1685,11 +1819,16 @@ def collapse_silence(samples: np.ndarray) -> np.ndarray:
 class GestureEngine:
     """Press/release edges -> hold / double-tap / discard decisions.
 
-    Every deadline carries an epoch token: any newer event invalidates it, so
-    a Timer callback that already fired but is waiting on the lock can never
-    act on stale state. Callbacks are invoked OUTSIDE the lock. The second
-    press of a double-tap is classified on its RELEASE: held short = arm
-    hands-free, held long = it was a deliberate push-to-talk.
+    Every key deadline carries an epoch token: any newer key event invalidates
+    it, so a Timer callback that already fired but is waiting on the lock can
+    never act on stale state. The hands-free watchdog is the exception: it
+    belongs to the capture, not the key epoch, so a stop tap whose release is
+    lost cannot disarm it — only ending or re-arming hands-free does.
+    Callbacks run OUTSIDE the lock, one at a time, in the order their
+    decisions were made: a decision queues its actions while it still holds
+    the lock, and whichever thread finds nobody draining runs the queue (see
+    _drain). The second press of a double-tap is classified on its RELEASE:
+    held short = arm hands-free, held long = it was a deliberate push-to-talk.
     """
 
     def __init__(self, on_start, on_finish, on_discard, on_hands_free=None) -> None:
@@ -1699,20 +1838,45 @@ class GestureEngine:
         self._on_hands_free = on_hands_free
         self._lock = threading.Lock()
         self._epoch = 0
+        self._hands_free_token = 0
         self._recording = False
         self._hands_free = False
         self._tap_pending = False      # a lone short tap awaits its verdict
         self._second_candidate = False
         self._pressed_at = 0.0
         self._last_tap_at = -1e9
+        self._pending: list = []       # actions decided, not yet run (in order)
+        self._draining = False
 
     def snapshot(self) -> tuple[bool, bool]:
         """(recording, hands_free) — for the lost-release resync poller."""
         with self._lock:
             return self._recording, self._hands_free
 
-    def _fire(self, callbacks) -> None:
-        for callback in callbacks:
+    def _queue(self, callbacks) -> None:
+        """Caller holds the lock: actions join the queue in decision order."""
+        self._pending.extend(callbacks)
+
+    def _drain(self) -> None:
+        """Run queued actions one at a time, in order, outside the lock.
+
+        The thread that finds nobody draining becomes the drainer and runs
+        everything queued, including what other threads add meanwhile; a
+        thread that arrives while another is draining has already queued its
+        actions under the lock and returns at once. So the event tap never
+        waits on a timer thread's callback, and a discard decided before a
+        start (the tap-expiry timer racing the next press) can never run
+        after it and kill the new capture."""
+        with self._lock:
+            if self._draining:
+                return
+            self._draining = True
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._draining = False
+                    return
+                callback = self._pending.pop(0)
             try:
                 callback()
             except Exception as exc:
@@ -1738,7 +1902,8 @@ class GestureEngine:
                 self._recording = True
                 fires.append(self._on_start)
             self._pressed_at = now
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def released(self) -> None:
         fires = []
@@ -1757,7 +1922,7 @@ class GestureEngine:
             elif self._second_candidate:
                 self._hands_free = True
                 self._epoch += 1
-                self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
+                self._arm_hands_free_watchdog()
                 log("● hands-free (tap again to stop)")
                 if self._on_hands_free is not None:
                     fires.append(self._on_hands_free)
@@ -1767,7 +1932,8 @@ class GestureEngine:
                 self._epoch += 1
                 self._schedule(DOUBLE_TAP_WINDOW_S, self._expire_tap)
             self._second_candidate = False
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_start(self) -> bool:
         """Menu-driven start: arm a hands-free recording without any key
@@ -1781,12 +1947,21 @@ class GestureEngine:
             self._tap_pending = False
             self._recording = True
             self._hands_free = True
-            self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
-        self._fire([self._on_start] + ([self._on_hands_free] if self._on_hands_free is not None else []))
+            self._arm_hands_free_watchdog()
+            fires.append(self._on_start)
+            if self._on_hands_free is not None:
+                fires.append(self._on_hands_free)
+            self._queue(fires)
+        self._drain()
         return True
 
-    def force_finish(self) -> bool:
-        """Menu escape hatch: end any in-flight recording as a normal finish."""
+    def force_finish(self, finish=None) -> bool:
+        """Menu escape hatch: end any in-flight recording as a normal finish.
+
+        `finish` replaces on_finish for this one decision. It may run after
+        this returns (another thread is draining), so anything the caller
+        wants that finish to know must travel inside it — never in state the
+        caller sets around this call."""
         fires = []
         with self._lock:
             self._epoch += 1
@@ -1795,8 +1970,9 @@ class GestureEngine:
             if self._recording:
                 self._recording = False
                 self._hands_free = False
-                fires.append(self._on_finish)
-        self._fire(fires)
+                fires.append(finish or self._on_finish)
+            self._queue(fires)
+        self._drain()
         return was_recording
 
     def chorded(self) -> None:
@@ -1812,7 +1988,8 @@ class GestureEngine:
             self._second_candidate = False
             self._recording = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_reset(self) -> None:
         """Sleep/lock/tap-disable recovery: drop any in-flight recording."""
@@ -1825,12 +2002,23 @@ class GestureEngine:
                 self._recording = False
                 self._hands_free = False
                 fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
-    def _schedule(self, delay: float, handler) -> None:
-        timer = threading.Timer(delay, handler, args=(self._epoch,))
+    def _schedule(self, delay: float, handler, token: int | None = None) -> None:
+        timer = threading.Timer(delay, handler,
+                                args=(self._epoch if token is None else token,))
         timer.daemon = True
         timer.start()
+
+    def _arm_hands_free_watchdog(self) -> None:
+        """Caller holds the lock. The watchdog is bound to THIS hands-free
+        capture: pressing the key again must not disarm it (a stop tap whose
+        release is lost used to leave the mic open forever), and a re-armed
+        hands-free gets a fresh token so the old deadline cannot end it."""
+        self._hands_free_token += 1
+        self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout,
+                       self._hands_free_token)
 
     def _expire_tap(self, epoch: int) -> None:
         fires = []
@@ -1840,23 +2028,26 @@ class GestureEngine:
             self._recording = False
             self._tap_pending = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
-    def _hands_free_timeout(self, epoch: int) -> None:
+    def _hands_free_timeout(self, token: int) -> None:
         fires = []
         with self._lock:
-            if epoch != self._epoch or not self._hands_free:
+            if token != self._hands_free_token or not self._hands_free:
                 return
             self._hands_free = False
             self._recording = False
             log(f"! hands-free watchdog ({HANDS_FREE_MAX_S:.0f}s) — finishing")
             fires.append(self._on_finish)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
 
 # -- clipboard injection (main thread only) ---------------------------------
 
 _restore_generation = 0
+_pending_restore: dict | None = None  # {"own_count", "snapshot"} of the restore not yet run
 
 
 _NO_SPACE_AFTER = "([{\"'“‘/-\n\t"
@@ -1908,6 +2099,29 @@ def character_before_caret(timeout: float = 0.15) -> str | None:
         return None
 
 
+def post_own_event(event) -> None:
+    """Tag a synthetic key event as Sotto's own and post it into the session.
+
+    The event tap in run() skips tagged events, so a ⌘V or ⌘Z Sotto posts can
+    never be read as a chord that discards a live dictation, nor as the user
+    typing (which would disarm "scratch that")."""
+    Quartz.CGEventSetIntegerValueField(event, Quartz.kCGEventSourceUserData, SOTTO_EVENT_TAG)
+    Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+
+
+def is_own_event(event) -> bool:
+    """Did Sotto post this key event itself (see post_own_event)?"""
+    return Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData) == SOTTO_EVENT_TAG
+
+
+def post_command_key(keycode: int) -> None:
+    """Press and release ⌘+key (9 = V to paste, 6 = Z to undo) as Sotto's own events."""
+    for key_down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(None, keycode, key_down)
+        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+        post_own_event(event)
+
+
 def type_text(text: str) -> None:
     """Type Unicode text with synthetic key events; the clipboard is untouched."""
     characters = list(text)
@@ -1917,7 +2131,7 @@ def type_text(text: str) -> None:
         for key_down in (True, False):
             event = Quartz.CGEventCreateKeyboardEvent(None, 0, key_down)
             Quartz.CGEventKeyboardSetUnicodeString(event, units, chunk)
-            Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+            post_own_event(event)
         time.sleep(0.004)
 
 
@@ -1941,35 +2155,52 @@ def secure_input_active() -> bool:
         return False
 
 
-def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") -> None:
+def frontmost_pid() -> int | None:
+    """The process a synthetic key event would reach right now (NSWorkspace)."""
+    try:
+        import AppKit
+        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app is not None else None
+    except Exception:
+        return None
+
+
+def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") -> bool:
     """Insert at the cursor. "paste": full-pasteboard snapshot, synthetic
     cmd-V, then a changeCount-guarded restore so a user copy in the window
-    always wins. "type": synthetic Unicode typing, clipboard untouched."""
-    global _restore_generation
+    always wins. "type": synthetic Unicode typing, clipboard untouched.
+
+    Returns True when the text was handed to the app, False when secure input
+    declined it — only a real insert may arm "scratch that"."""
+    global _restore_generation, _pending_restore
     if secure_input_active():
         log("! secure input active — not inserting; transcript kept in history")
-        return
+        return False
 
     text = compose_insertion(text, spacing, character_before_caret() if spacing == "smart" else None)
     if insert_mode == "type":
         type_text(text)
-        return
+        return True
 
     pasteboard = NSPasteboard.generalPasteboard()
-    snapshot = []
-    for item in (pasteboard.pasteboardItems() or []):
-        snapshot.append([(t, item.dataForType_(t)) for t in item.types()])
+    pending = _pending_restore
+    if pending is not None and pasteboard.changeCount() == pending["own_count"]:
+        # The pasteboard still holds Sotto's previous dictation and its restore
+        # has not run yet: carry the user's original forward instead of
+        # snapshotting our own text (two pastes inside the restore window).
+        snapshot = pending["snapshot"]
+    else:
+        snapshot = []
+        for item in (pasteboard.pasteboardItems() or []):
+            snapshot.append([(t, item.dataForType_(t)) for t in item.types()])
     pasteboard.clearContents()
     pasteboard.setString_forType_(text, NSPasteboardTypeString)
     own_count = pasteboard.changeCount()
-
-    for key_down in (True, False):
-        event = Quartz.CGEventCreateKeyboardEvent(None, 9, key_down)  # 9 = V
-        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
-        Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
+    post_command_key(9)  # ⌘V
 
     _restore_generation += 1
     generation = _restore_generation
+    _pending_restore = {"own_count": own_count, "snapshot": snapshot}
 
     def queue_restore() -> None:
         from PyObjCTools import AppHelper
@@ -1978,11 +2209,16 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
     timer = threading.Timer(RESTORE_DELAY_S, queue_restore)
     timer.daemon = True
     timer.start()
+    return True
 
 
 def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
+    """Runs on the main thread (AppHelper.callAfter), like inject() itself, so
+    the pending-restore bookkeeping needs no lock."""
+    global _pending_restore
     if generation != _restore_generation:
-        return  # a newer injection owns the pasteboard now
+        return  # a newer injection owns the pasteboard now (and carried this snapshot if it was still ours)
+    _pending_restore = None
     pasteboard = NSPasteboard.generalPasteboard()
     if pasteboard.changeCount() != own_count:
         return  # the user copied something meanwhile — their copy wins
@@ -1996,6 +2232,148 @@ def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
         items.append(item)
     if items:
         pasteboard.writeObjects_(items)
+
+
+class DeliveryQueue:
+    """One FIFO for everything Sotto hands to the frontmost app — finished
+    dictations and "scratch that" undos — in capture order, so a newer result
+    can never overtake an older one.
+
+    Nothing is posted while the trigger or any modifier is physically held: a
+    synthetic ⌘V under a held modifier is a different shortcut in the app, and
+    during a hold macOS emits phantom flag edges on the trigger keycode that
+    chop the live dictation. The head of the queue waits as long as a
+    recording is active (the release delivers it); with no recording, a key
+    held longer than DELIVERY_WAIT_MAX_S drops the pending text — it is already
+    in History — with one note.
+
+    Every method runs on the main thread (deliver_call / AppHelper.callAfter);
+    the poll timer only bounces back there, so there is no lock.
+
+    on_done runs exactly once for every item the queue takes — when it is
+    delivered (even if the insert raises), dropped after a long hold, or
+    cleared at shutdown — so run() can count it in PendingDeliveries from the
+    moment deliver_call schedules it until it leaves the queue.
+    """
+
+    def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
+                 secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
+                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None) -> None:
+        self._insert = insert            # (text) -> bool: did the text reach the app?
+        self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
+        self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
+        self._recording = recording      # () -> bool: a dictation is being captured
+        self._frontmost_pid = frontmost_pid  # () -> pid of the app a key event reaches
+        self._keydowns = keydowns        # () -> count of the user's real key-downs so far
+        self._secure_input = secure_input
+        self._call_after = call_after
+        self._note = note                # (title, message) -> None: one user-visible note
+        self._log = log
+        self._shutdown_requested = shutdown_requested
+        self._clock = clock
+        self._timer = timer
+        self._on_done = on_done          # () -> None: one item left the queue
+        self._items: list[tuple] = []
+        self._poll_armed = False
+        self._waiting = False
+        self._blocked_since: float | None = None
+        self.last_delivery: dict | None = None  # the insert "scratch that" may undo
+
+    def paste(self, text: str) -> None:
+        self._items.append(("paste", text))
+        self._pump()
+
+    def undo(self) -> None:
+        self._items.append(("undo",))
+        self._pump()
+
+    def _pump(self) -> None:
+        while self._items:
+            if self._shutdown_requested():  # checked per item: Quit can land mid-pump
+                self._discard_all()  # nothing is posted once shutdown is requested
+                return
+            if self._keys_held():
+                self._wait_or_drop()
+                return
+            self._blocked_since = None
+            self._waiting = False
+            item = self._items.pop(0)
+            try:
+                if item[0] == "paste":
+                    self._deliver(item[1])
+                else:
+                    self._undo()
+            except Exception as exc:  # one failed insert must not strand the items behind it
+                self._log(f"! {item[0]} failed ({type(exc).__name__}: {str(exc)[:160]})")
+                if item[0] == "paste":
+                    self._note("Could not paste the dictation",
+                               "It is in History. Open History to copy the text.")
+            finally:
+                self._on_done()
+
+    def _discard_all(self) -> None:
+        """Drop every waiting item; each one still reports done."""
+        items, self._items = self._items, []
+        for _item in items:
+            self._on_done()
+
+    def _wait_or_drop(self) -> None:
+        now = self._clock()
+        if self._recording():
+            self._blocked_since = None  # the user is dictating: the release will deliver
+        elif self._blocked_since is None:
+            self._blocked_since = now
+        elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
+            dropped = sum(1 for item in self._items if item[0] == "paste")
+            self._discard_all()
+            self._blocked_since = None
+            self._waiting = False
+            self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — "
+                      f"{dropped} dictation(s) not pasted, kept in History")
+            self._note("Dictation kept in History",
+                       "A key was held for too long to paste it. Open History to copy the text.")
+            return
+        if not self._waiting:
+            self._waiting = True
+            self._log("  paste deferred — a key is still held")
+        if not self._poll_armed:
+            self._poll_armed = True
+            timer = self._timer(DELIVERY_POLL_S, self._call_after, (self._resume,))
+            timer.daemon = True
+            timer.start()
+
+    def _resume(self) -> None:
+        self._poll_armed = False
+        self._pump()
+
+    def _deliver(self, text: str) -> None:
+        pid, keydowns = self._frontmost_pid(), self._keydowns()  # the paste target, before ⌘V
+        if self._insert(text):  # a secure-input decline inserted nothing: arm no undo
+            self.last_delivery = {"at": self._clock(), "pid": pid, "keydowns": keydowns}
+
+    def _undo(self) -> None:
+        """'scratch that': the app's own ⌘Z, only for Sotto's own recent insert —
+        same app still in front, nothing typed by the user since."""
+        import voice_commands
+        last = self.last_delivery
+        if last is None or self._clock() - last["at"] > voice_commands.SCRATCH_WINDOW_S:
+            self._log("  scratch that: nothing recent to undo")
+            return
+        pid = self._frontmost_pid()
+        if pid is None or last["pid"] is None:  # no identity to compare: None == None proves nothing
+            self._log("  scratch that: the app in front is unknown — nothing undone")
+            return
+        if pid != last["pid"]:
+            self._log("  scratch that: the dictation went to another app — nothing undone")
+            return
+        if self._keydowns() != last["keydowns"]:
+            self._log("  scratch that: you typed since the dictation — nothing undone")
+            return
+        if self._secure_input():
+            return
+        self._undo_keys()
+        self.last_delivery = None
+        self._log("↶ scratch that — undid the last dictation")
 
 
 # -- daemon ------------------------------------------------------------------
@@ -2058,6 +2436,58 @@ def nonadaptive_clear(dependency_guard, coordinator) -> None:
 def nonadaptive_revoke_learning(dependency_guard, coordinator, entry_id: str):
     dependency_guard.revoke(entry_id, reason="learning_revoked")
     return coordinator.revoke_history(entry_id)
+
+
+HISTORY_UNREADABLE_TITLE = "History could not be read"
+
+
+class UnsavedHistory:
+    """Stands in for LearningCoordinator while history.jsonl cannot be read (F16b).
+
+    Dictation keeps working: ``append_live`` hands back an in-memory row so the
+    text is still delivered, but nothing (row, audio, learning state) is
+    written. Every other coordinator operation raises the store's
+    HistoryUnreadable, exactly as the real coordinator would on its re-read,
+    so Retry, Correct, Delete and Clear can never act on a partial view."""
+
+    def __init__(self, store, learning) -> None:
+        self.history, self.learning = store, learning
+        self._lock = threading.RLock()
+
+    def append_live(self, text: str, samples, duration: float, model: str, **metadata) -> dict:
+        """Side effects: none; the row and its audio exist only in memory."""
+        return {"id": metadata.get("entry_id") or uuid.uuid4().hex[:12], "ts": metadata.get("ts"),
+                "text": text, "duration": round(duration, 2), "model": model, "saved": False}
+
+    def __getattr__(self, name: str):
+        from history import HistoryUnreadable
+        raise HistoryUnreadable(f"History is unreadable and was left unchanged ({self.history.unreadable})")
+
+
+def history_coordinator(store, learning_store):
+    """The dictation session's coordinator for ``store``.
+
+    A store opened with ``tolerate_unreadable=True`` over an unreadable
+    history.jsonl (F16b) gets an UnsavedHistory instead of a
+    LearningCoordinator, whose startup re-read would raise before the menu
+    bar exists; the caller tells the user once with
+    ``history_unreadable_message``. Side effects: a LearningCoordinator
+    validates the active learning links against History."""
+    if store.unreadable is not None:
+        return UnsavedHistory(store, learning_store)
+    from learning import LearningCoordinator
+    return LearningCoordinator(store, learning_store)
+
+
+def history_unreadable_message(store) -> str:
+    # Never suggest moving or deleting the file: a launch with no index would
+    # treat every kept recording as an orphan and sweep it.
+    cause, remedy = (("it was written by a newer version of Sotto", "update Sotto again")
+                     if store.unreadable.newer_schema else
+                     ("part of it is damaged", "repair the damaged line"))
+    return (f"Sotto cannot read {store.index} because {cause}. The file and its recordings "
+            "were left exactly as they are. Dictation still works, but new dictations are "
+            f"not saved to History until the file can be read again: {remedy}, then restart Sotto.")
 
 
 def _read_only_json(path: Path) -> dict | None:
@@ -2421,11 +2851,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     active_engine = "nemotron" if use_nemotron else "parakeet" if use_parakeet else "whisper"
 
+    # An unreadable history.jsonl must not kill the app before its menu bar
+    # exists (F16b). The adaptive lane's receipts depend on History, so there
+    # it stays fatal.
     from history import HistoryStore
-    from learning import LearningCoordinator, LearningStore
-    store = HistoryStore()
+    from learning import LearningStore
+    store = HistoryStore(tolerate_unreadable=not adaptive)
     learning_store = LearningStore()
-    coordinator = LearningCoordinator(store, learning_store)
+    coordinator = history_coordinator(store, learning_store)
+    if store.unreadable is not None:
+        log(f"! History unreadable ({store.unreadable}): {history_unreadable_message(store)}")
     seed_totals(store)
     # Always available, no-model dependency guard: an earlier adaptive session
     # must remain revocation-safe even when this launch is non-adaptive.
@@ -2456,7 +2891,11 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         status_ui.set_language_mode(language_state["mode"],
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
-    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter)
+    pending_deliveries = PendingDeliveries()
+    ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
+                                                 pending_deliveries)
+    if status_ui is not None and store.unreadable is not None:
+        ui_call(status_ui.show_error, HISTORY_UNREADABLE_TITLE, history_unreadable_message(store))
 
     def refresh_history() -> None:
         if status_ui is not None:
@@ -2494,382 +2933,6 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     # concurrently, and results arrive in capture order.
     jobs: queue.Queue = queue.Queue()
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
-
-    vad_warnings: set[str] = set()
-
-    def transcribe_worker() -> None:
-        while not shutdown.requested():
-            try:
-                job = jobs.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            publication=None
-            publication_adopted=False
-            publication_committed=False
-            try:
-                if shutdown.requested():
-                    continue
-                if job[0] == "stream-audio":
-                    _, stream, block, rate = job
-                    stream.feed(block, rate)
-                elif job[0] == "stream-close":
-                    job[1].close()
-                elif job[0] == "warmup":
-                    try:
-                        warm_speech_runtime(adaptive=False, model=model,
-                                            speech_config=current_speech_config(),
-                                            mlx_whisper=mlx_whisper)
-                        log("✓ model refreshed after idle")
-                    finally:
-                        model_activity["last_finished"] = time.monotonic()
-                        model_activity["rewarming"] = False
-                elif job[0] == "live":
-                    _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, stream = job
-                    started = time.monotonic()
-                    stream_prepared = None
-                    stream_text = None
-                    if stream is not None and raw.any():
-                        stream_text, stream_prepared = stream.finish()
-                    elif stream is not None:
-                        stream.close()
-                    samples = (stream_prepared.asr_samples if stream_prepared is not None
-                               else prepare_for_whisper(raw, native_rate))
-                    seconds = len(samples) / SAMPLE_RATE
-                    rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
-                    if seconds < 0.2:
-                        log("○ sub-0.2s capture dropped (key-tap artifact)")
-                        continue
-                    skip = asr_skip_reason(samples)
-                    if skip:
-                        # Exact zeros never reach Whisper. This is not an
-                        # energy gate: quiet whispered dictation is non-zero
-                        # and still goes to the ASR (2026-08-13/14).
-                        from audio_codec import prepare_canonical
-                        prepared = prepare_canonical(samples)
-                        if shutdown.requested():
-                            continue
-                        text = DEAD_ROUTE_TEXT
-                        _, attempt_metadata = _transcription_kwargs(
-                            job_config, glossary_terms, seconds)
-                        attempt_metadata.update({
-                            "vad": {"available": False, "speech_fraction": 0.0,
-                                    "span_count": 0},
-                            "preprocessing": {"resampled_normalized": True,
-                                              "vad_trimmed": False,
-                                              "silence_collapsed": False,
-                                              "outcome": "suspect"},
-                            "latency": {"queue_wait_seconds": round(
-                                time.monotonic() - queued_at, 4),
-                                        "asr_seconds": 0.0},
-                        })
-                        log(f"! not pasted ({skip})")
-                        finalize_primary_live_delivery(
-                            append=lambda: coordinator.append_live(
-                                text, prepared, seconds, model,
-                                ts=captured_ts, raw_samples=raw,
-                                raw_sample_rate=native_rate,
-                                provenance="live_suspect",
-                                adaptive=False, **attempt_metadata),
-                            adaptive_runtime=None,
-                            appended_publication=None,
-                            shutdown=shutdown, inject=None)
-                        refresh_history()
-                        log(f"→ 0.00s · {len(text)} chars")
-                        continue
-                    # VAD is advisory only: it trims dead air from long
-                    # captures and feeds the output-side no-speech verdict.
-                    # It must never block transcription — Silero scores real
-                    # whispered dictation at 0% speech, so a deliberate
-                    # capture always reaches the ASR and the transcript
-                    # decides what happens (2026-08-13/14 incidents).
-                    vad_available = True
-                    speech_fraction = 1.0
-                    speech_spans: list = []
-                    try:
-                        import vad
-                        speech_fraction, speech_spans = vad.analyze(samples)
-                    except Exception as exc:
-                        vad_available = False
-                        reason = str(exc)[:80]
-                        if reason not in vad_warnings:  # once per cause, not every dictation
-                            vad_warnings.add(reason)
-                            log(f"○ advisory VAD unavailable ({reason}); transcribing without trimming")
-                    vad_metadata = {"available": vad_available,
-                                    "speech_fraction": round(float(speech_fraction), 4),
-                                    "span_count": len(speech_spans)}
-                    preprocessing = {"resampled_normalized": True,
-                                     "vad_trimmed": False,
-                                     "silence_collapsed": False}
-                    if stream is not None:
-                        preprocessing.update({"streaming": True,
-                                              "streaming_retry": stream.fallback})
-                    if speech_spans and seconds > 10 and not use_nemotron:
-                        before = seconds
-                        samples = vad.trim_to_speech(samples, speech_spans)
-                        trimmed = before - len(samples) / SAMPLE_RATE
-                        preprocessing["vad_trimmed"] = trimmed > 0
-                        if trimmed > 1:
-                            log(f"  trimmed {trimmed:.0f}s of non-speech (VAD)")
-                    if len(samples) / SAMPLE_RATE > LONG_CAPTURE_S and not use_nemotron:
-                        before = len(samples)
-                        samples = collapse_silence(samples)
-                        preprocessing["silence_collapsed"] = len(samples) < before
-                        if len(samples) < before:
-                            log(f"  trimmed {(before - len(samples)) / SAMPLE_RATE:.0f}s of dead air")
-                    from audio_codec import prepare_canonical
-                    prepared = stream_prepared if stream_prepared is not None else prepare_canonical(samples)
-                    if shutdown.requested():
-                        continue
-                    staged_live_path = None
-                    entry_adaptive = adaptive
-                    if adaptive_runtime is not None:
-                        try:
-                            text, adaptive_metadata, staged_live_path = adaptive_live_transcribe_prepared(
-                                adaptive_runtime,prepared,capture_id)
-                            publication=adaptive_metadata.pop("comparator_publication",None)
-                            attempt_metadata = {"profile": "adaptive-en", "language": "en",
-                                                "prompt": {"disabled": "adaptive candidate policy"},
-                                                "candidate": adaptive_metadata}
-                            actual_model = adaptive_metadata["repo"]
-                        except Exception as exc:
-                            discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                            if shutdown.requested():
-                                continue
-                            # An exception can escape after a durable comparator
-                            # intent/spool was created.  That state is owned by
-                            # the store's recovery machinery: guarantee the
-                            # deferred lease-window sweep FIRST (a failed
-                            # immediate reconcile must not prevent it), then
-                            # attempt prompt recovery too.
-                            try:
-                                adaptive_runtime.schedule_orphan_sweep(is_shutdown=shutdown.requested)
-                            except Exception:
-                                pass
-                            try:
-                                adaptive_runtime.reconcile(retry_pending=False)
-                            except Exception:
-                                pass
-                            # Adaptive authority drift (stale receipts, changed
-                            # runtime) must never cost the user their capture:
-                            # degrade to plain baseline dictation.  The result
-                            # enters ordinary non-adaptive history only, so
-                            # nothing reaches the adaptive lane without valid
-                            # receipts and no gate is weakened.
-                            log(f"! adaptive lane unavailable ({str(exc)[:80]}) — baseline dictation only")
-                            import mlx_whisper as mlx_whisper_fallback
-                            text, attempt_metadata = transcribe_prepared(
-                                LocalWhisper(mlx_whisper_fallback, model), prepared, job_config, glossary_terms)
-                            actual_model = model
-                            entry_adaptive = False
-                            publication = None
-                    elif use_nemotron:
-                        from nemotron_backend import metadata
-                        text = stream_text if stream_text is not None else nemotron.transcribe(prepared.asr_samples)
-                        attempt_metadata = metadata()
-                        actual_model = model
-                    else:
-                        text, attempt_metadata = transcribe_prepared(
-                            mlx_whisper, prepared, job_config, glossary_terms)
-                        actual_model = model
-                    # A backend may ignore cancellation.  Its result is never
-                    # pasted, registered, or persisted after shutdown.
-                    if shutdown.requested():
-                        if adaptive_runtime is not None:
-                            discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                        continue
-                    elapsed = time.monotonic() - started
-                    model_activity["last_finished"] = time.monotonic()
-                    detected_language = attempt_metadata.pop("detected_language", None)
-                    if detected_language:
-                        preprocessing["detected_language"] = detected_language
-                    attempt_metadata.update({"vad": vad_metadata,
-                                             "preprocessing": preprocessing,
-                                             "latency": {"queue_wait_seconds": round(started - queued_at, 4),
-                                                         "asr_seconds": round(elapsed, 4)}})
-                    prepared_seconds = len(prepared.asr_samples) / SAMPLE_RATE
-                    no_speech = reads_as_no_speech(text, speech_fraction)
-                    if no_speech == "empty transcript":
-                        text = "[no speech detected]"
-                    if text and not shutdown.requested():
-                        appended_row = None
-                        hallucinated = looks_hallucinated(text, prepared_seconds)
-                        if hallucinated and not no_speech:
-                            # A loop that starts partway through must not cost
-                            # the user the real dictation in front of it.
-                            salvaged = salvage_repetition_loop(text, prepared_seconds)
-                            if salvaged is not None:
-                                text, trim_receipt = salvaged
-                                preprocessing["repetition_trimmed"] = trim_receipt
-                                log(f"  cut a {trim_receipt['repeats']}x repetition loop "
-                                    f"({trim_receipt['dropped_chars']} chars) — "
-                                    "pasting the clean prefix")
-                                hallucinated = None
-                        reason = hallucinated or no_speech
-                        voice_action = None
-                        if not reason and not entry_adaptive:
-                            text = apply_personal_dictionary(text, preprocessing)
-                            text, voice_action = apply_voice_cleanup(
-                                text, preprocessing,
-                                preprocessing.get("detected_language") or job_config.language)
-                        attempt_metadata["latency"]["release_to_text_seconds"] = round(
-                            time.monotonic() - queued_at, 4)
-                        if shutdown.requested():
-                            continue
-                        publication_meta={"comparator_publication":publication} if publication is not None else {}
-                        if publication is not None and not adaptive_runtime.adopt_comparator_publication(
-                                publication_meta,history_id=capture_id,history_revision=0):
-                            adaptive_runtime.cancel_comparator_publication(publication_meta)
-                            adaptive_runtime.fail_comparator_publication(publication_meta)
-                            raise RuntimeError("comparator publication adoption unavailable")
-                        if reason:
-                            log(f"! not pasted ({reason}) — kept in history")
-                            preprocessing["outcome"] = "suspect"
-                            try:
-                                appended_row = finalize_primary_live_delivery(
-                                    append=lambda: coordinator.append_live(
-                                        text, prepared, prepared_seconds, actual_model,
-                                        ts=captured_ts, raw_samples=raw,
-                                        raw_sample_rate=native_rate, provenance="live_suspect",
-                                        adaptive=entry_adaptive, entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
-                                    adaptive_runtime=adaptive_runtime,appended_publication=publication_meta,
-                                    shutdown=shutdown,inject=None)
-                                publication_committed = appended_row is not None
-                            except Exception:
-                                if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                                raise
-                        else:
-                            if shutdown.requested():
-                                continue
-                            try:
-                                appended_row = finalize_primary_live_delivery(
-                                    append=lambda: coordinator.append_live(
-                                        text, prepared, prepared_seconds, actual_model, ts=captured_ts,
-                                        raw_samples=raw, raw_sample_rate=native_rate,
-                                        provenance="live", adaptive=entry_adaptive,
-                                        entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
-                                    adaptive_runtime=adaptive_runtime,appended_publication=publication_meta,
-                                    shutdown=shutdown,
-                                    inject=(lambda: deliver_call(undo_when_clear, 0)) if voice_action == "scratch"
-                                    else (lambda: deliver_call(inject_when_clear, text, 0)) if text else None)
-                                publication_committed = appended_row is not None
-                            except Exception:
-                                if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                                raise
-                        publication_adopted = (appended_row is not None and not shutdown.requested())
-                        if appended_row is not None and text and not reason and voice_action is None:
-                            record_totals(text, len(raw) / max(native_rate, 1.0))
-                        refresh_history()
-                    elif adaptive_runtime is not None:
-                        # No History append adopted this pre-publication WAV.
-                        if publication is not None:
-                            adaptive_runtime.cancel_comparator_publication({"comparator_publication":publication})
-                        discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                    log(f"→ {time.monotonic() - queued_at:.2f}s after release "
-                        f"(speech model {elapsed:.2f}s) · {len(text)} chars")
-                elif job[0] == "retry":
-                    _, entry_id, queued_at, capture_id, job_config = job
-                    snapshot = coordinator.snapshot_for_retry(entry_id)
-                    if snapshot is None:
-                        log("↻ retry skipped — entry deleted")
-                        continue
-                    prepared_seconds = len(snapshot.samples) / SAMPLE_RATE
-                    # Retry uses the immutable canonical decode from its snapshot;
-                    # it must never re-trim or re-collapse persisted inference input.
-                    if asr_skip_reason(snapshot.samples):
-                        text = DEAD_ROUTE_TEXT
-                        _, attempt_metadata = _transcription_kwargs(
-                            job_config, glossary_terms, prepared_seconds)
-                        attempt_metadata.update({
-                            "vad": {"available": None, "speech_fraction": None,
-                                    "span_count": None},
-                            "preprocessing": {"retry_canonical": True,
-                                              "outcome": "suspect"},
-                            "latency": {"queue_wait_seconds": round(
-                                time.monotonic() - queued_at, 4),
-                                        "asr_seconds": 0.0},
-                        })
-                        coordinator.commit_retry(
-                            entry_id, text, snapshot.expected_revision,
-                            model=model, provenance="retry",
-                            **attempt_metadata)
-                        log("↻ retry skipped — dead microphone (all-zero capture)")
-                        refresh_history()
-                        continue
-                    retry_started = time.monotonic()
-                    if shutdown.requested():
-                        continue
-                    if adaptive_runtime is not None:
-                        text, adaptive_metadata = adaptive_runtime.live_transcribe(
-                            snapshot.samples, canonical_path=snapshot.inference_audio_path,
-                            canonical_identity=snapshot.inference_identity, capture_id=capture_id)
-                        publication=adaptive_metadata.pop("comparator_publication",None)
-                        attempt_metadata = {"profile": "adaptive-en", "language": "en",
-                                            "prompt": {"disabled": "adaptive candidate policy"},
-                                            "candidate": adaptive_metadata}
-                        retry_model = adaptive_metadata["repo"]
-                    else:
-                        text, attempt_metadata = transcribe_canonical_samples(
-                            mlx_whisper, snapshot.samples, job_config, glossary_terms, nemotron=nemotron)
-                        retry_model = model
-                    model_activity["last_finished"] = time.monotonic()
-                    if shutdown.requested():
-                        continue
-                    retry_preprocessing = {"retry_canonical": True}
-                    detected_language = attempt_metadata.pop("detected_language", None)
-                    if detected_language:
-                        retry_preprocessing["detected_language"] = detected_language
-                    if (adaptive_runtime is None and text
-                            and not looks_hallucinated(text, len(snapshot.samples) / SAMPLE_RATE)):
-                        text = apply_personal_dictionary(text, retry_preprocessing)
-                    attempt_metadata.update({"vad": {"available": None, "speech_fraction": None,
-                                                       "span_count": None},
-                                             "preprocessing": retry_preprocessing,
-                                             "latency": {"queue_wait_seconds": round(retry_started - queued_at, 4),
-                                                         "asr_seconds": round(time.monotonic() - retry_started, 4)}})
-                    if shutdown.requested():
-                        continue
-                    publication_meta={"comparator_publication":publication} if publication is not None else {}
-                    if publication is not None and not adaptive_runtime.adopt_comparator_publication(
-                            publication_meta,history_id=entry_id,
-                            history_revision=snapshot.expected_revision + 1):
-                        adaptive_runtime.cancel_comparator_publication(publication_meta)
-                        adaptive_runtime.fail_comparator_publication(publication_meta)
-                        raise RuntimeError("comparator publication adoption unavailable")
-                    committed = coordinator.commit_retry(
-                        entry_id, text, snapshot.expected_revision, model=retry_model,
-                        provenance="retry", **attempt_metadata)
-                    publication_committed = committed is not None
-                    if adaptive_runtime is not None and publication is not None:
-                        if committed is None:
-                            adaptive_runtime.cancel_comparator_publication(publication_meta)
-                        elif not shutdown.requested() and not adaptive_runtime.acknowledge_comparator_publication(publication_meta):
-                            # Retry's old revision revoke can have an exact
-                            # scrub marker in flight.  Keep the adopted
-                            # prepared row for restart reconciliation rather
-                            # than falsely cancelling a committed delivery.
-                            if not adaptive_runtime.comparator_publication_recovery_pending(publication_meta):
-                                adaptive_runtime.cancel_comparator_publication(publication_meta)
-                                adaptive_runtime.fail_comparator_publication(publication_meta)
-                                raise RuntimeError("comparator publication unavailable")
-                        publication_adopted = committed is not None and not shutdown.requested()
-                    if text and committed is not None and not shutdown.requested():
-                        ui_call(_copy_text, text)
-                        log(f"↻ retried · {len(text)} chars")
-                    refresh_history()
-                else:
-                    raise RuntimeError("unknown transcription job")
-            except Exception as exc:
-                log(f"! transcription failed: {str(exc)[:160]}")
-            finally:
-                if (adaptive_runtime is not None and publication is not None and not publication_adopted
-                        and not publication_committed):
-                    adaptive_runtime.cancel_comparator_publication({"comparator_publication":publication})
-                if status_ui is not None and job[0] not in {"stream-audio", "stream-close"}:
-                    ui_call(status_ui.hide_if_transcribing)
-                jobs.task_done()
-
-    transcription_thread = threading.Thread(target=transcribe_worker, daemon=True)
-    transcription_thread.start()
 
     def _copy_text(text: str) -> None:
         if shutdown.requested():
@@ -2915,13 +2978,24 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 deadline = time.monotonic() + 10
                 while capture.is_waking() and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if engine.snapshot()[0]:
+                # A start that failed every try also ends the wait: say
+                # "live" only when an engine actually exists.
+                if engine.snapshot()[0] and capture.is_live():
                     ui_call(status_ui.show_recording)
                     log("● recording (mic live)")
 
             threading.Thread(target=announce_live, daemon=True).start()
 
     def on_finish() -> None:
+        # In flight from before the capture ends until its job is queued, so
+        # Quit's drain never sees an idle gap between the two.
+        pending_deliveries.add()
+        try:
+            finish_capture()
+        finally:
+            pending_deliveries.finish()
+
+    def finish_capture() -> None:
         released_at = time.monotonic()  # latency is measured from the key release
         if shutdown.requested():
             shutdown.stop_capture(capture)
@@ -2954,7 +3028,23 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if status_ui:
             ui_call(status_ui.show_hands_free, hands_free_hint(binding["trigger"]))
 
+    def on_mic_failed() -> None:
+        """The engine never started under this capture (device busy or gone).
+        End the gesture so the key-up finds nothing to finish, and say so
+        once — a dead mic used to show "recording" and then lose the dictation
+        without a word. Finishing (not discarding) keeps whatever a
+        mid-capture rebuild had already recorded."""
+        if engine.force_finish():
+            log("✗ could not start the microphone — dictation cancelled")
+        if status_ui:
+            ui_call(status_ui.show_error, "Could not start the microphone",
+                    "Sotto could not open the input device. Check that another app "
+                    "is not holding it and that Sotto may use the microphone "
+                    "(System Settings → Privacy & Security → Microphone), then "
+                    "press the key again.")
+
     engine = GestureEngine(on_start, on_finish, on_discard, on_hands_free=on_hands_free)
+    capture.on_start_failed = on_mic_failed
     hotkey = parse_hotkey(hotkey_spec) if hotkey_spec else None
     hotkey_state: dict = {"pressed_at": None, "skip_up": False}
     if hotkey_spec and hotkey is None:
@@ -2986,50 +3076,61 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             hotkey_state.update(pressed_at=None, skip_up=False)
             log(f"● alternate hotkey {'is now ' + new_hotkey_spec if parsed else 'off'}")
 
-    def inject_when_clear(text: str, attempts: int) -> None:
-        """Never paste while the trigger key is physically held — a synthetic
-        cmd-V during a hold makes macOS emit phantom flag edges on the trigger
-        keycode, which chops the live dictation and can mis-arm hands-free."""
-        if shutdown.requested():
-            return
-        if trigger_physically_down() and attempts < 40:
-            if attempts == 0:
-                log("  paste deferred — trigger key still held")
-            timer = threading.Timer(
-                0.15, lambda: AppHelper.callAfter(inject_when_clear, text,
-                                                  attempts + 1))
-            timer.daemon = True
-            timer.start()
-            return
+    def keys_held() -> bool:
+        """Is the trigger or any modifier physically down right now?"""
+        flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateCombinedSessionState)
+        return bool(flags & ALL_MODIFIERS) or trigger_down_in(
+            flags, binding["mask"], binding["device_bit"])
+
+    def insert_text(text: str) -> bool:
         import settings
         preferences = settings.load(settings.SETTINGS_PATH)
-        inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
-        last_delivery["at"] = time.monotonic()
+        return inject(text, insert_mode=preferences["insert_mode"], spacing=preferences["spacing"])
 
-    last_delivery = {"at": 0.0}
+    def delivery_note(title: str, message: str) -> None:
+        if status_ui is not None:
+            ui_call(status_ui.show_info, title, message)
 
-    def undo_when_clear(attempts: int) -> None:
-        """'scratch that': undo the last dictation with the app's own ⌘Z,
-        only when Sotto pasted something within the last minute."""
-        import voice_commands
-        if shutdown.requested():
-            return
-        if trigger_physically_down() and attempts < 40:
-            timer = threading.Timer(0.15, lambda: AppHelper.callAfter(undo_when_clear, attempts + 1))
-            timer.daemon = True
-            timer.start()
-            return
-        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
-            log("  scratch that: nothing recent to undo")
-            return
-        if secure_input_active():
-            return
-        for key_down in (True, False):
-            event = Quartz.CGEventCreateKeyboardEvent(None, 6, key_down)  # 6 = Z
-            Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
-            Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
-        last_delivery["at"] = 0.0
-        log("↶ scratch that — undid the last dictation")
+    # Real key-downs seen by the tap (Sotto's tagged events excluded): typing
+    # after a paste means "scratch that" must not undo it.
+    user_keydowns = {"count": 0}
+
+    # Finished text and "scratch that" share one FIFO (see DeliveryQueue):
+    # capture order is kept, and nothing is posted while a key is held.
+    delivery = DeliveryQueue(
+        insert=insert_text, undo_keys=lambda: post_command_key(6), keys_held=keys_held,
+        recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
+        keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
+        call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested,
+        on_done=pending_deliveries.finish)
+
+    # deliver_call counts each of these in pending_deliveries when it schedules
+    # it; the queue's on_done finishes that entry once the item is delivered,
+    # dropped or cleared, so Quit and the update restart wait for the paste.
+    def inject_when_clear(text: str, _attempts: int = 0) -> None:
+        """Queue a finished dictation for the cursor (worker call shape kept)."""
+        delivery.paste(text)
+
+    def undo_when_clear(_attempts: int = 0) -> None:
+        """Queue a 'scratch that' behind whatever is still waiting to paste."""
+        delivery.undo()
+
+    # Built here, after inject_when_clear / undo_when_clear exist: the worker
+    # holds its collaborators instead of resolving them late like the closure
+    # did. Imported inside run() so transcription.py can bind sotto's helpers
+    # at import time without a cycle at module load.
+    from transcription import TranscriptionWorker
+    worker = TranscriptionWorker(
+        shutdown=shutdown, jobs=jobs, log=log, model=model, mlx_whisper=mlx_whisper,
+        nemotron=nemotron, current_speech_config=current_speech_config,
+        coordinator=coordinator, refresh_history=refresh_history,
+        adaptive_runtime=adaptive_runtime, adaptive=adaptive, use_nemotron=use_nemotron,
+        status_ui=status_ui, ui_call=ui_call, deliver_call=deliver_call,
+        inject_when_clear=inject_when_clear,
+        undo_when_clear=undo_when_clear, copy_text=_copy_text, record_totals=record_totals,
+        model_activity=model_activity, glossary_terms=glossary_terms)
+    transcription_thread = threading.Thread(target=worker.run, daemon=True)
+    transcription_thread.start()
 
     tap_watch = {"warned_at": 0.0}
 
@@ -3061,11 +3162,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     def callback(_proxy, event_type, event, _refcon):
         if shutdown.requested():
             return event
-        if event_type == Quartz.kCGEventKeyDown and trigger_state["down"]:
-            # Any other key during a trigger hold makes it a shortcut.
+        if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp,
+                          Quartz.kCGEventFlagsChanged) and is_own_event(event):
+            return event  # Sotto's own ⌘V / ⌘Z / typing: never a chord, never the user typing
+        if event_type == Quartz.kCGEventKeyDown:
             code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-            if hotkey is None or code != hotkey[1]:
-                engine.chorded()
+            hotkey_key = hotkey is not None and code == hotkey[1]
+            if not (hotkey_key and (Quartz.CGEventGetFlags(event) & ALL_MODIFIERS) == hotkey[0]):
+                user_keydowns["count"] += 1  # the user typed: "scratch that" is off the table
+            if trigger_state["down"] and not hotkey_key:
+                engine.chorded()  # any other key during a trigger hold makes it a shortcut
         # Hotkey: hold it and release to stop, or tap it and tap again later.
         # Normal keys carry real keycodes AND key-up events through remote
         # desktops, so both gestures survive an AnyDesk session.
@@ -3176,18 +3282,20 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             # every paste/commit, so nothing it produces is kept.
             transcription_thread.join(APP_DRAIN_TIMEOUT)
             drained = not transcription_thread.is_alive()
-        if not drained and restart.foreground_pending:
+        if not drained:
             if restart_drain["deadline"] is None:
                 restart_drain["deadline"] = time.monotonic() + RESTART_DRAIN_DEADLINE_S
             if time.monotonic() < restart_drain["deadline"]:
                 AppHelper.callLater(0.1, stop_runtime_on_main)
                 return
+            if not restart.foreground_pending:
+                # A wedged native call must not hang Quit forever, and freeing
+                # the native engine underneath it could crash: leave directly.
+                log("! transcription did not finish in time — quitting anyway")
+                os._exit(0)
             # exec replaces the whole image, so a wedged native call cannot
             # follow it; waiting forever would strand the user instead.
             log("! transcription did not finish in time — restarting anyway")
-        elif not drained:
-            AppHelper.callLater(0.1, stop_runtime_on_main)
-            return
         if nemotron is not None and drained:
             # Cocoa terminate exits without unwinding run()'s finally block.
             # Free native streams/model before Metal's global destructors run.
@@ -3267,18 +3375,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         def action_set_engine(mode: str) -> None:
             if adaptive or not engine_switching or mode == active_engine:
                 return
-            if capture.is_active() or jobs.unfinished_tasks:
+            if dictation_in_flight(capture, jobs, pending_deliveries):
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Switch engines after the current recording and transcription finish.")
                 return
             try:
-                from speech_config import save_engine_mode
                 if mode == "nemotron":
                     from nemotron_backend import installation
                     installation()  # verify before persisting a restart choice
                 if mode == "parakeet" and not parakeet_cached():
                     raise RuntimeError("Download Parakeet first: Settings → Download Parakeet.")
-                if capture.is_active() or jobs.unfinished_tasks:
+                if dictation_in_flight(capture, jobs, pending_deliveries):
                     raise RuntimeError("Finish the current dictation before switching engines.")
                 persist_engine_and_restart(
                     mode, restart.request,
@@ -3289,17 +3396,13 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
         def action_save(entry_id: str) -> None:
             def work() -> None:
-                import datetime
-                import shutil
-                from pathlib import Path
                 try:
                     entry = store.get(entry_id)
                     if not entry:
                         return
-                    stamp = datetime.datetime.fromtimestamp(
-                        entry["ts"]).strftime("%Y%m%d-%H%M")
-                    shutil.copy(store.audio_path(entry_id),
-                                Path.home() / "Desktop" / f"sotto-{stamp}.wav")
+                    target = save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",
+                                             entry["ts"])
+                    log(f"✓ saved audio to Desktop as {target.name}")
                 except FileNotFoundError:
                     log("! audio missing for that entry")
                     ui_call(status_ui.show_error, "Could not save audio",
@@ -3442,10 +3545,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Menu escape hatch — always works, no gesture required."""
             if shutdown.requested():
                 return
-            if engine.force_finish():
+            ended = end_capture_now(engine, capture, on_finish)
+            if ended == "gesture":
                 log("● finished via menu")
-            elif capture.is_active():
-                on_finish()  # gesture engine desynced; end the capture anyway
+            elif ended == "orphan":
                 log("● orphan capture finished via menu")
 
         def action_start_now() -> None:
@@ -3467,6 +3570,24 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log("● restart requested from the menu")
             except Exception as exc:
                 failed(str(exc))
+
+        def action_quit() -> None:
+            """Quit once the dictation in progress is done, waiting at most
+            QUIT_DRAIN_S. Side effects: refuses new recordings, ends the
+            recording in progress (even one the gesture engine lost), waits
+            until it is pasted, then requests shutdown."""
+            if shutdown.requested():
+                return
+            capture_gate.close()
+            if end_capture_now(engine, capture, on_finish):
+                log("● finishing the recording before quitting")
+
+            def work() -> None:
+                if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                                       deadline_s=QUIT_DRAIN_S):
+                    log(f"! dictation still running after {QUIT_DRAIN_S:.0f}s — quitting anyway")
+                shutdown.request()
+            threading.Thread(target=work, daemon=True).start()
 
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
@@ -3549,22 +3670,22 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             settings_view["installing"] = True
 
             def work() -> None:
-                import subprocess
                 script = Path(__file__).resolve().parent / "scripts" / "setup_nemotron.py"
                 log("● installing Nemotron (about 700 MB) ...")
-                result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
-                settings_view["installing"] = False
+                try:
+                    ok, detail = run_installer([sys.executable, str(script)])
+                finally:
+                    settings_view["installing"] = False
                 refresh_history()
                 if settings_view["controller"] is not None:
                     ui_call(settings_view["controller"].refresh)
-                if result.returncode == 0:
+                if ok:
                     log("✓ Nemotron installed")
                     ui_call(status_ui.show_info, "Nemotron installed",
                             "Choose Speech engine → Nemotron (English streaming) to use it.")
                 else:
-                    log(f"! Nemotron install failed ({result.returncode})")
-                    ui_call(status_ui.show_error, "Could not install Nemotron",
-                            (result.stderr or result.stdout).strip()[-200:])
+                    log(f"! Nemotron install failed ({detail[:80]})")
+                    ui_call(status_ui.show_error, "Could not install Nemotron", detail)
             threading.Thread(target=work, daemon=True).start()
 
         def install_parakeet_in_background() -> None:
@@ -3576,22 +3697,22 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             settings_view["parakeet_installing"] = True
 
             def work() -> None:
-                import subprocess
                 log("● downloading Parakeet (about 2.5 GB) ...")
-                result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "setup",
-                                         "--profile", "parakeet"], capture_output=True, text=True)
-                settings_view["parakeet_installing"] = False
+                try:
+                    ok, detail = run_installer([sys.executable, str(Path(__file__).resolve()),
+                                                "setup", "--profile", "parakeet"])
+                finally:
+                    settings_view["parakeet_installing"] = False
                 refresh_history()
                 if settings_view["controller"] is not None:
                     ui_call(settings_view["controller"].refresh)
-                if result.returncode == 0:
+                if ok:
                     log("✓ Parakeet downloaded")
                     ui_call(status_ui.show_info, "Parakeet downloaded",
                             "Choose Speech engine → Parakeet to use it.")
                 else:
-                    log(f"! Parakeet download failed ({result.returncode})")
-                    ui_call(status_ui.show_error, "Could not download Parakeet",
-                            (result.stdout or result.stderr).strip()[-200:])
+                    log(f"! Parakeet download failed ({detail[:80]})")
+                    ui_call(status_ui.show_error, "Could not download Parakeet", detail)
             threading.Thread(target=work, daemon=True).start()
 
         def action_open_settings() -> None:
@@ -3606,7 +3727,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             """Update this checkout with the installer, then restart into it."""
             if update_state["running"]:
                 return
-            if capture.is_active() or jobs.unfinished_tasks:
+            if dictation_in_flight(capture, jobs, pending_deliveries):
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Update after the current recording and transcription finish.")
                 return
@@ -3625,7 +3746,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     # and the user may have dictated while the update ran. Refuse new
                     # recordings first, then drain, so none can start in between.
                     capture_gate.close()
-                    wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0)
+                    if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                                           deadline_s=UPDATE_DRAIN_DEADLINE_S):
+                        log(f"! dictation still running after {UPDATE_DRAIN_DEADLINE_S:.0f}s — "
+                            "restarting into the update anyway")
                     action_restart(after_failure=capture_gate.reopen)
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
@@ -3668,7 +3792,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             threading.Thread(target=work, daemon=True).start()
 
         status_ui.set_history_callbacks({
-            "quit": shutdown.request,
+            "quit": action_quit,
             "restart": only_while_running(action_restart),
             "copy": only_while_running(action_copy), "retry": only_while_running(action_retry),
             "save": only_while_running(action_save), "delete": only_while_running(action_delete),
@@ -3719,6 +3843,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             nemotron.close()
 
 
+def doctor_input_probe() -> int:
+    """The doctor's input check, run in a subprocess (see doctor): pin the
+    same mic a key press pins, THEN read the input bus format the tap will
+    use. The output bus of an unpinned engine describes the system default
+    device — a USB interface at 96 kHz / 2 ch, say — while dictation records
+    the pinned built-in or headset mic at its own rate."""
+    from AVFoundation import AVAudioEngine
+    engine = AVAudioEngine.alloc().init()
+    node = engine.inputNode()
+    _pin_input_to_builtin(node)   # logs "mic: <which one>" on stderr
+    fmt = node.inputFormatForBus_(0)
+    print(f"{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch")
+    return 0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1
+
+
 def doctor() -> None:
     import subprocess
     import ApplicationServices
@@ -3733,20 +3872,22 @@ def doctor() -> None:
     # Probe the input device in a subprocess: CoreAudio hard-crashes (a native
     # SIGSEGV, not a catchable exception) in sessions with no usable audio
     # context, and a diagnostic must survive the conditions it diagnoses.
-    probe = ("from AVFoundation import AVAudioEngine; "
-             "engine = AVAudioEngine.alloc().init(); "
-             "node = engine.inputNode(); fmt = node.outputFormatForBus_(0); "
-             "print(f'{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch'); "
-             "raise SystemExit(0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1)")
+    # The probe is doctor_input_probe: the capture path's own pin + input bus.
+    probe = "import sotto; raise SystemExit(sotto.doctor_input_probe())"
     try:
         result = subprocess.run([sys.executable, "-c", probe],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30,
+                                cwd=str(Path(__file__).resolve().parent))
     except subprocess.TimeoutExpired:
         log("✗ input device: probe timed out (waiting on a permission prompt?)")
     else:
         if result.returncode == 0:
             usable_input = True
-            log(f"✓ input device: {result.stdout.strip()} (AVAudioEngine)")
+            mics = [line.strip()[len("mic:"):].strip()
+                    for line in result.stderr.splitlines()
+                    if line.strip().startswith("mic:")]
+            log(f"✓ input device: {result.stdout.strip()} "
+                f"({mics[0] if mics else 'AVAudioEngine'})")
         else:
             log("✗ input device: no usable audio input in this session "
                 "(microphone permission missing, or headless/SSH context)")

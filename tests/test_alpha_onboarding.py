@@ -1,8 +1,10 @@
 """Onboarding seams; no microphone, model download or app injection."""
+import inspect
 import json
 import os
 from pathlib import Path
 import plistlib
+import queue
 import subprocess
 import sys
 import tempfile
@@ -135,7 +137,8 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
 
     def test_failed_engine_restart_restores_previous_setting(self):
-        with patch('speech_config.load_engine_mode', return_value='whisper'), patch('speech_config.save_engine_mode') as save:
+        with patch('speech_config.load_engine_mode', return_value='whisper'), \
+                patch('speech_config.save_engine_mode') as save:
             with self.assertRaises(RuntimeError):
                 sotto.persist_engine_and_restart('nemotron', lambda **_: False)
             self.assertEqual([c.args[0] for c in save.call_args_list], ['nemotron', 'whisper'])
@@ -320,8 +323,250 @@ class UpdateRestartTests(unittest.TestCase):
 
     def test_returns_at_once_when_already_idle(self):
         sleeps = []
-        sotto.wait_until_idle(lambda: False, sleep=sleeps.append)
+        self.assertTrue(sotto.wait_until_idle(lambda: False, sleep=sleeps.append))
         self.assertEqual(sleeps, [])
+
+    def test_quit_waits_at_most_its_deadline(self):
+        # Quit finishes the dictation in progress, but never waits forever.
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+        reached = sotto.wait_until_idle(lambda: True, poll_s=0.5, sleep=sleep,
+                                        deadline_s=sotto.QUIT_DRAIN_S, clock=lambda: clock[0])
+        self.assertFalse(reached)
+        self.assertEqual(clock[0], sotto.QUIT_DRAIN_S)
+        self.assertEqual(sotto.QUIT_DRAIN_S, 10.0)
+
+
+def _closure_source(name: str) -> str:
+    """The source of one nested def inside sotto.run, up to the next statement at its indent."""
+    import re
+    runtime = inspect.getsource(sotto.run)
+    start = runtime.index(f"def {name}(")
+    indent = runtime[:start].rsplit("\n", 1)[1]
+    following = re.compile(rf"\n{indent}\S").search(runtime, start)
+    return runtime[start:following.start() if following else None]
+
+
+class QuitDrainTests(unittest.TestCase):
+    """Quit waits for the finished dictation to be pasted, not just transcribed."""
+
+    def test_a_paste_scheduled_after_the_queue_drains_still_counts_as_busy(self):
+        jobs, deliveries, main_loop, pasted = queue.Queue(), sotto.PendingDeliveries(), [], []
+        _, deliver_call = sotto.main_thread_dispatch(
+            has_ui=True, call_after=lambda method, *args: main_loop.append((method, args)),
+            deliveries=deliveries)
+        capture = Mock()
+        capture.is_active.return_value = False
+
+        def paste(text):
+            pasted.append(text)
+            deliveries.finish()
+
+        jobs.put("capture")
+        jobs.get()
+        deliver_call(paste, "hello")  # the worker schedules the paste on the main loop …
+        jobs.task_done()              # … and only then marks the job done
+        self.assertEqual(jobs.unfinished_tasks, 0)
+        self.assertTrue(sotto.dictation_in_flight(capture, jobs, deliveries))
+        method, args = main_loop.pop(0)
+        method(*args)
+        self.assertEqual(pasted, ["hello"])
+        self.assertFalse(sotto.dictation_in_flight(capture, jobs, deliveries))
+
+    def test_quit_waits_for_deliveries_before_requesting_shutdown(self):
+        quit_source = _closure_source("action_quit")
+        drain = quit_source.index("dictation_in_flight(capture, jobs, pending_deliveries)")
+        self.assertLess(drain, quit_source.index("shutdown.request()"))
+        self.assertIn("deadline_s=QUIT_DRAIN_S", quit_source)
+
+    def test_every_delivery_goes_through_the_counted_queue(self):
+        # Both deliver_call targets only enqueue; DeliveryQueue finishes each
+        # entry (on_done=pending_deliveries.finish) when it delivers, drops or
+        # clears it, and posts nothing after shutdown — behaviour pinned in
+        # tests/test_delivery.py PendingDeliveriesAccountingTests.
+        self.assertIn("delivery.paste(text)", _closure_source("inject_when_clear"))
+        self.assertIn("delivery.undo()", _closure_source("undo_when_clear"))
+
+    def test_update_and_engine_restarts_also_wait_for_the_paste(self):
+        # The update restart and the engine switch restart the process too, so
+        # they must count a scheduled paste as busy, like Quit: every in-flight
+        # check in run() goes through dictation_in_flight.
+        for name in ("action_apply_update", "action_set_engine"):
+            source = _closure_source(name)
+            self.assertNotIn("jobs.unfinished_tasks", source, name)
+            self.assertIn("dictation_in_flight(capture, jobs, pending_deliveries)", source, name)
+
+    def test_a_finishing_capture_stays_in_flight_until_its_job_is_queued(self):
+        # capture.end() makes the capture inactive before the job is queued; the
+        # count must cover that gap or a Quit poll landing in it loses the dictation.
+        finish = _closure_source("on_finish")
+        self.assertLess(finish.index("pending_deliveries.add()"), finish.index("finish_capture()"))
+        self.assertIn("pending_deliveries.finish()", finish.split("finally:", 1)[1])
+        body = _closure_source("finish_capture")
+        self.assertLess(body.index("capture.end("), body.index('shutdown.enqueue(jobs, ("live"'))
+
+    def test_the_update_restart_wait_has_a_deadline(self):
+        # The gate is closed while it waits, so a wedged native call (or a paste
+        # count that never drops) must not refuse recordings forever.
+        source = _closure_source("action_apply_update")
+        self.assertIn("deadline_s=UPDATE_DRAIN_DEADLINE_S", source)
+        self.assertGreater(sotto.UPDATE_DRAIN_DEADLINE_S, sotto.HANDS_FREE_MAX_S)  # outlasts any recording
+
+
+class FinishCaptureNowTests(unittest.TestCase):
+    """Finish now and Quit both end a capture the gesture engine lost track of."""
+
+    def _call(self, *, forced: bool, active: bool):
+        engine, capture, on_finish = Mock(), Mock(), Mock()
+        engine.force_finish.return_value = forced
+        capture.is_active.return_value = active
+        return sotto.end_capture_now(engine, capture, on_finish), on_finish
+
+    def test_gesture_recording_is_finished_by_the_engine(self):
+        ended, on_finish = self._call(forced=True, active=True)
+        self.assertEqual(ended, "gesture")
+        on_finish.assert_not_called()
+
+    def test_orphan_capture_is_transcribed_not_dropped(self):
+        ended, on_finish = self._call(forced=False, active=True)
+        self.assertEqual(ended, "orphan")
+        on_finish.assert_called_once_with()
+
+    def test_nothing_recording_changes_nothing(self):
+        ended, on_finish = self._call(forced=False, active=False)
+        self.assertIsNone(ended)
+        on_finish.assert_not_called()
+
+    def test_quit_and_finish_now_share_it(self):
+        for name in ("action_quit", "action_finish_now"):
+            self.assertIn("end_capture_now(engine, capture, on_finish)", _closure_source(name), name)
+
+
+class EngineInstallerTests(unittest.TestCase):
+    """An engine download that fails to start or hangs reports it; it never raises."""
+
+    def test_success_failure_launch_error_and_timeout(self):
+        def finished(code, out="", err=""):
+            return lambda argv, **kwargs: subprocess.CompletedProcess(argv, code, out, err)
+
+        self.assertEqual(sotto.run_installer(["x"], run=finished(0, "done\n")), (True, "done"))
+        self.assertEqual(sotto.run_installer(["x"], run=finished(1, "", "boom\n")), (False, "boom"))
+
+        def cannot_start(argv, **kwargs):
+            raise OSError(35, "Resource temporarily unavailable")
+        ok, detail = sotto.run_installer(["x"], run=cannot_start)
+        self.assertFalse(ok)
+        self.assertIn("could not start", detail)
+
+        def hangs(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], sotto.INSTALL_TIMEOUT_S)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        ok, detail = sotto.run_installer(["x"], run=hangs)
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'AppKit menu bar')
+class TapWarningTests(unittest.TestCase):
+    """A deaf hotkey's ⚠ stays in the menu bar until the tap recovers."""
+
+    def test_hiding_the_pill_keeps_the_warning(self):
+        import ui
+        titles = []
+        status = ui.StatusUI.__new__(ui.StatusUI)
+        status._mode, status._hint, status._live_text = "idle", None, ""
+        status._indicator_state, status._visibility_generation, status._level_timer = "idle", 0, None
+        status._status = types.SimpleNamespace(button=lambda: types.SimpleNamespace(setTitle_=titles.append))
+        status._orb = Mock()
+        status._panel = Mock()
+        status.set_tap_health(False)
+        status.hide()
+        self.assertEqual(titles[-1], "⚠")
+        status.set_tap_health(True)
+        status.hide()
+        self.assertEqual(titles[-1], "◦")
+
+
+class AppLogRotationTests(unittest.TestCase):
+    """The app's log is rotated while Sotto runs, not only at launch."""
+
+    def test_a_log_that_grows_past_its_limit_is_rotated_and_reopened(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sotto.log"
+            path.write_text("x" * 50)
+            reopened = []
+            with patch.object(sotto, "_point_output_at", reopened.append), \
+                    patch.dict(sotto._app_log, {"path": path, "max_bytes": 100}):
+                sotto.keep_app_log_small()
+                self.assertEqual(reopened, [])           # under the limit: untouched
+                path.write_text("x" * 150)
+                sotto.keep_app_log_small()
+            self.assertEqual(reopened, [path])
+            self.assertEqual(path.with_suffix(".log.1").read_text(), "x" * 150)
+            self.assertFalse(path.exists())             # the reopen creates the fresh file
+
+    def test_nothing_happens_when_logs_are_not_routed(self):
+        with patch.object(sotto, "_point_output_at") as reopen, \
+                patch.dict(sotto._app_log, {"path": None, "max_bytes": 100}):
+            sotto.keep_app_log_small()
+        reopen.assert_not_called()
+
+
+class SaveAudioNameTests(unittest.TestCase):
+    """Save audio to Desktop never overwrites an earlier save."""
+
+    def test_names_carry_seconds_and_never_reuse_a_file(self):
+        import datetime
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            moment = datetime.datetime(2026, 10, 9, 1, 53, 7).timestamp()
+            first = sotto.desktop_audio_path(desktop, moment)
+            self.assertEqual(first.name, "sotto-20261009-015307.wav")
+            first.write_bytes(b"one")
+            second = sotto.desktop_audio_path(desktop, moment)
+            self.assertEqual(second.name, "sotto-20261009-015307-2.wav")
+            second.write_bytes(b"two")
+            self.assertEqual(sotto.desktop_audio_path(desktop, moment + 20).name, "sotto-20261009-015327.wav")
+            self.assertEqual(sotto.desktop_audio_path(desktop, moment).name, "sotto-20261009-015307-3.wav")
+
+    def test_a_name_is_reserved_the_moment_it_is_picked(self):
+        # Two saves that both pick a name before either copies must not share it.
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            first = sotto.desktop_audio_path(desktop, 1_760_000_000.0)
+            second = sotto.desktop_audio_path(desktop, 1_760_000_000.0)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.exists() and second.exists())
+
+    def test_concurrent_saves_of_one_entry_make_two_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, desktop = root / "entry.wav", root / "Desktop"
+            source.write_bytes(b"RIFF-audio")
+            desktop.mkdir()
+            both_ready, saved = threading.Barrier(2), []
+
+            def save():
+                both_ready.wait(5)
+                saved.append(sotto.save_audio_copy(source, desktop, 1_760_000_000.0))
+
+            workers = [threading.Thread(target=save) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+            self.assertEqual(len(set(saved)), 2)
+            self.assertEqual(sorted(path.read_bytes() for path in desktop.iterdir()),
+                             [b"RIFF-audio", b"RIFF-audio"])
+
+    def test_missing_audio_leaves_nothing_on_the_desktop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            with self.assertRaises(FileNotFoundError):
+                sotto.save_audio_copy(desktop / "gone.wav", desktop, 1_760_000_000.0)
+            self.assertEqual(list(desktop.iterdir()), [])
 
 
 class LiveWordsTests(unittest.TestCase):

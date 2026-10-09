@@ -75,7 +75,7 @@ weights or personal data.
 
 ```powershell
 py -3.13 -m venv venv-alpha
-venv-alpha\Scripts\python -m pip install --upgrade pip
+venv-alpha\Scripts\python -m pip install pip==26.2.1
 # CPU only:
 venv-alpha\Scripts\python -m pip install -r requirements-alpha-windows.txt
 # ...or, with an NVIDIA GPU (includes the CPU set plus cuBLAS):
