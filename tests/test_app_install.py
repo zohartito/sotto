@@ -202,7 +202,11 @@ case "$1 $2" in
     "-c import platform"*) echo arm64; exit 0 ;;
     "-c import sys"*) echo 3.12; exit 0 ;;
 esac
+if [ "$1 $2 $3" = "-m pip freeze" ]; then echo "numpy==1.0 (installed before the update)"; exit 0; fi
 if [ "$1 $2 $3 $4" = "-m pip install --quiet" ] && [ "$5" = "-r" ]; then
+    if [ "$(basename "$6")" = previous-packages.txt ]; then
+        sed 's/^/restored: /' "$6" >> "$FAKE_LOG"; exit 0
+    fi
     cat "$6" "$(dirname "$6")/constraints-alpha.txt" >> "$FAKE_LOG"
     [ "${PIP_FAILS:-0}" = 1 ] && exit 1
 fi
@@ -252,10 +256,14 @@ class UpdateOrderTests(unittest.TestCase):
                                "--python", str(self.user / "venv-alpha/bin/python")],
                               env=dict(self.env, **env), capture_output=True, text=True)
 
-    def test_failed_package_install_leaves_the_source_alone(self):
+    def test_failed_package_install_restores_the_packages_and_leaves_the_source_alone(self):
+        # pip cannot roll back a half-finished install, so the installer puts the
+        # previous package set back before it reports failure.
         result = self.update(PIP_FAILS="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("source was not switched", result.stderr)
+        self.assertIn("previous packages are back", result.stderr)
+        self.assertIn("restored: numpy==1.0 (installed before the update)", self.log.read_text())
         self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.old)
 
     def test_a_copy_that_is_not_a_git_clone_refuses_to_update(self):

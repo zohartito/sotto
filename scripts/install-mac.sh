@@ -87,8 +87,18 @@ fi
 echo "== Python environment ($VENV)"
 [ -x "$VENV/bin/python" ] || "$PYTHON" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet -r "$REQUIREMENTS" \
-    || fail "Installing packages failed, so the source was not switched. Run this script again to retry."
+if [ -n "$UPSTREAM" ]; then
+    # pip cannot roll back a half-finished install, so remember the working set.
+    PREVIOUS_PACKAGES="$NEXT_REQUIREMENTS/previous-packages.txt"
+    "$VENV/bin/python" -m pip freeze > "$PREVIOUS_PACKAGES"
+fi
+if ! "$VENV/bin/python" -m pip install --quiet -r "$REQUIREMENTS"; then
+    [ -n "$UPSTREAM" ] || fail "Installing packages failed. Run this script again to retry."
+    echo "== Restoring the previous packages"
+    "$VENV/bin/python" -m pip install --quiet -r "$PREVIOUS_PACKAGES" \
+        || fail "Installing the update's packages failed and the previous ones could not be restored; the source was not switched. Run scripts/install-mac.sh --update again (it needs the network)."
+    fail "Installing the update's packages failed; the previous packages are back and the source was not switched. Run this script again to retry."
+fi
 "$VENV/bin/python" -m pip check
 
 if [ -n "$UPSTREAM" ]; then

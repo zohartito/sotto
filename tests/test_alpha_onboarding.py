@@ -271,6 +271,43 @@ class MainThreadDispatchTests(unittest.TestCase):
         self.assertEqual(scheduled, ["show_error", "undo_when_clear"])
 
 
+class CaptureGateTests(unittest.TestCase):
+    """Before an update restart, new recordings are refused, then in-flight work drains."""
+
+    def test_closed_gate_refuses_new_starts_and_reopens(self):
+        gate = sotto.CaptureGate()
+        with gate.starting() as allowed:
+            self.assertTrue(allowed)
+        gate.close()
+        with gate.starting() as allowed:
+            self.assertFalse(allowed)
+        gate.reopen()
+        with gate.starting() as allowed:
+            self.assertTrue(allowed)
+
+    def test_close_waits_for_a_start_already_under_way(self):
+        gate = sotto.CaptureGate()
+        inside, release, order = threading.Event(), threading.Event(), []
+
+        def start():
+            with gate.starting() as allowed:
+                order.append(("start", allowed))
+                inside.set()
+                release.wait(5)
+
+        starter = threading.Thread(target=start)
+        starter.start()
+        inside.wait(5)
+        closer = threading.Thread(target=lambda: (gate.close(), order.append("closed")))
+        closer.start()
+        time.sleep(0.05)
+        self.assertEqual(order, [("start", True)])  # close() is still waiting
+        release.set()
+        starter.join(5)
+        closer.join(5)
+        self.assertEqual(order, [("start", True), "closed"])
+
+
 class UpdateRestartTests(unittest.TestCase):
     """An update restarts Sotto only once nothing is recording or transcribing."""
 

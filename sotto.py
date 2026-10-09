@@ -544,6 +544,34 @@ def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep) -> None:
         sleep(poll_s)
 
 
+class CaptureGate:
+    """Whether a key press may start a new recording.
+
+    close() is called before an update restart: it waits for a start already
+    under way (so that recording is visible as active), then refuses new ones,
+    so "wait until idle, then restart" cannot discard a recording that began
+    in between. reopen() undoes it if the restart does not happen.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._open = True
+
+    @contextmanager
+    def starting(self):
+        """Hold while deciding and starting a recording; yields whether it may start."""
+        with self._lock:
+            yield self._open
+
+    def close(self) -> None:
+        with self._lock:
+            self._open = False
+
+    def reopen(self) -> None:
+        with self._lock:
+            self._open = True
+
+
 def choose_language(probabilities: dict, allowed) -> str:
     """Automatic's pick. Prefer the user's languages, but speech that is
     clearly another language (the allowed ones score < 0.25 while it scores
@@ -2455,6 +2483,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     capture = CaptureService()
     capture.restart_callback = restart.request
     capture.idle_release_s = idle_release
+    capture_gate = CaptureGate()
     if status_ui is not None:
         status_ui.level_source = lambda: capture.latest_rms
         status_ui.live_text_source = (
@@ -2852,13 +2881,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     # Gesture callbacks mark the capture boundary. The audio engine starts and
     # stops off-thread; the ASR model stays resident independently.
     def on_start() -> None:
-        if shutdown.requested():
-            return
-        stream = None
-        if use_nemotron:
-            from streaming_audio import StreamingCapture
-            stream = StreamingCapture(nemotron)
-        cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
+        with capture_gate.starting() as allowed:
+            if shutdown.requested():
+                return
+            if not allowed:
+                log("● an update is restarting Sotto; dictation resumes in a moment")
+                return
+            stream = None
+            if use_nemotron:
+                from streaming_audio import StreamingCapture
+                stream = StreamingCapture(nemotron)
+            cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
         now = time.monotonic()
         if model_rewarm_due(model_activity["last_finished"], now,
                             rewarming=bool(model_activity["rewarming"]),
@@ -3421,15 +3454,19 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             if engine.force_start():
                 log("● dictation started via menu (hands-free)")
 
-        def action_restart() -> None:
-            """Restart this foreground process or its own sealed supervisor."""
+        def action_restart(after_failure=None) -> None:
+            """Restart this foreground process or its own sealed supervisor.
+            after_failure runs if the restart does not happen."""
+            def failed(message: str) -> None:
+                if after_failure is not None:
+                    after_failure()
+                ui_call(status_ui.show_error, "Could not restart Sotto", message[:160])
             try:
-                if not restart.request(on_failure=lambda message: ui_call(
-                        status_ui.show_error, "Could not restart Sotto", message[:160])):
+                if not restart.request(on_failure=failed):
                     raise RuntimeError("Sotto is already shutting down")
                 log("● restart requested from the menu")
             except Exception as exc:
-                ui_call(status_ui.show_error, "Could not restart Sotto", str(exc)[:160])
+                failed(str(exc))
 
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
@@ -3585,9 +3622,11 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 if finished:
                     log("✓ update installed — restarting once dictation is done")
                     # A restart discards any recording or transcription in progress,
-                    # and the user may have dictated while the update ran.
+                    # and the user may have dictated while the update ran. Refuse new
+                    # recordings first, then drain, so none can start in between.
+                    capture_gate.close()
                     wait_until_idle(lambda: capture.is_active() or jobs.unfinished_tasks > 0)
-                    action_restart()
+                    action_restart(after_failure=capture_gate.reopen)
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
                     ui_call(status_ui.show_error, "Update not finished",
@@ -3597,8 +3636,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 else:
                     log("! update failed (see logs/update.log)")
                     ui_call(status_ui.show_error, "Update failed",
-                            f"{tail}\n\nNothing was switched, so Sotto keeps running the current "
-                            "version. Details are in logs/update.log in the data folder.")
+                            f"{tail}\n\nThe source was not switched, so Sotto keeps running the "
+                            "current version. Details are in logs/update.log in the data folder.")
             threading.Thread(target=work, daemon=True).start()
 
         def action_check_updates() -> None:
