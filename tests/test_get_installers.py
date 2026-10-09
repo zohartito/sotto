@@ -83,6 +83,8 @@ class MacInstallerTests(unittest.TestCase):
     def test_the_same_repository_matches_in_https_and_ssh_form(self):
         script = (ROOT / "scripts" / "get.sh").read_text(encoding="utf-8")
         check = script + '\nsame_repo "git@github.com:zohartito/sotto.git" "https://github.com/zohartito/sotto.git" ' \
+                         '&& same_repo "ssh://git@github.com/zohartito/sotto.git" ' \
+                         '"https://github.com/zohartito/sotto.git" ' \
                          '&& same_repo "https://github.com/zohartito/sotto/" ' \
                          '"https://github.com/zohartito/sotto.git" ' \
                          '&& ! same_repo "https://github.com/someone/sotto.git" "https://github.com/zohartito/sotto.git"'
@@ -93,6 +95,19 @@ class MacInstallerTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "win32" and (ROOT / ".git").exists() and shutil.which("git"),
                      "Windows git checkout")
 class WindowsInstallerTests(unittest.TestCase):
+    def test_the_same_repository_matches_in_https_and_both_ssh_forms(self):
+        import re
+        script = (ROOT / "scripts" / "get.ps1").read_text(encoding="utf-8")
+        function = re.search(r"(?ms)^function Test-SameRepo.*?^}", script).group(0)
+        checks = ("@((Test-SameRepo 'git@github.com:zohartito/sotto.git' 'https://github.com/zohartito/sotto.git'),"
+                  " (Test-SameRepo 'ssh://git@github.com/zohartito/sotto.git' 'https://github.com/zohartito/sotto.git'),"
+                  " (Test-SameRepo 'https://github.com/zohartito/sotto/' 'https://github.com/zohartito/sotto.git'),"
+                  " -not (Test-SameRepo 'https://github.com/someone/sotto.git' 'https://github.com/zohartito/sotto.git')"
+                  ") -join ','")
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", f"{function}\n{checks}"],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.strip(), "True,True,True,True", result.stderr)
+
     def test_downloads_then_updates_without_running_the_installer(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
