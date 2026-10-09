@@ -70,8 +70,13 @@ class TranscriptionWorker:
         self._publication = None
         self._publication_adopted = False
         self._publication_committed = False
-        # The History row the live job in flight got back (None until then).
+        # The History row the live job in flight got back (None until then),
+        # whether the user was already told about it (F4/F16a), and whether
+        # the Retry in flight reached commit_retry: the catch-all in run()
+        # reads them to keep or report a job that raised (F4b, N17).
         self._live_row = None
+        self._live_reported = False
+        self._retry_committed = False
 
     def run(self) -> None:
         """The worker loop. Blocks until shutdown is requested.
@@ -87,6 +92,8 @@ class TranscriptionWorker:
             self._publication_adopted = False
             self._publication_committed = False
             self._live_row = None
+            self._live_reported = False
+            self._retry_committed = False
             try:
                 if self.shutdown.requested():
                     continue
@@ -103,7 +110,10 @@ class TranscriptionWorker:
                 else:
                     raise RuntimeError("unknown transcription job")
             except Exception as exc:
-                self.log(f"! transcription failed: {str(exc)[:160]}")
+                try:
+                    self._job_failed(job, exc)
+                except Exception:  # reporting must never end the worker thread
+                    self.log(f"! transcription failed: {str(exc)[:160]}")
             finally:
                 if (self.adaptive_runtime is not None and self._publication is not None
                         and not self._publication_adopted and not self._publication_committed):
@@ -111,6 +121,30 @@ class TranscriptionWorker:
                 if self.status_ui is not None and job[0] not in {"stream-audio", "stream-close"}:
                     self.ui_call(self.status_ui.hide_if_transcribing)
                 self.jobs.task_done()
+
+    def _job_failed(self, job, exc: Exception) -> None:
+        """A job raised outside the paths that handle their own failures.
+
+        A live capture that never reached History is kept for Retry exactly
+        like a failed model call (F4b), whatever step raised: preparation,
+        VAD trim, silence collapse, screening, the adaptive lane. A Retry that
+        raised before commit_retry tells the user once, as Windows does
+        (N17). An error after the result was saved, delivered or already
+        reported is logged as that, not as a transcription failure.
+
+        Side effects: may append one History row and show one alert; logs."""
+        error = f"{type(exc).__name__}: {str(exc)[:160]}"
+        if job[0] == "live" and self._live_row is None and not self._live_reported:
+            _, raw, native_rate, captured_ts, queued_at, _capture_id, job_config, _stream = job
+            self._keep_failed_live_capture(exc, raw=raw, native_rate=native_rate, captured_ts=captured_ts,
+                                           queued_at=queued_at, job_config=job_config, preprocessing={})
+        elif job[0] == "retry" and not self._retry_committed:
+            self.log(f"! retry failed ({error}) — the History entry is unchanged")
+            self._show_error("Retry failed", f"The History entry is unchanged.\n\n{error}")
+        elif job[0] in {"live", "retry"}:
+            self.log(f"! {job[0]} result already handled; a later step failed ({error})")
+        else:
+            self.log(f"! transcription failed: {str(exc)[:160]}")
 
     def _stream_audio(self, job) -> None:
         """Feed one captured block to a Nemotron stream (Nemotron runs its
@@ -195,7 +229,7 @@ class TranscriptionWorker:
             self.log(f"! not pasted ({skip})")
             try:
                 finalize_primary_live_delivery(
-                    append=lambda: self.coordinator.append_live(
+                    append=lambda: self._append_live(
                         text, prepared, seconds, self.model,
                         ts=captured_ts, raw_samples=raw,
                         raw_sample_rate=native_rate,
@@ -422,28 +456,31 @@ class TranscriptionWorker:
 
     def _keep_failed_live_capture(self, exc: Exception, *, raw, native_rate, captured_ts, queued_at,
                                   job_config, preprocessing: dict, prepared=None, vad_metadata=None) -> None:
-        """The speech model failed on a live capture (F4). The recording is not
-        lost: it becomes a ``live_suspect`` History row reading
-        TRANSCRIPTION_FAILED_TEXT, so Retry can transcribe it again.
+        """The speech model (F4), or any step around it (F4b), failed on a live
+        capture. The recording is not lost: it becomes a ``live_suspect``
+        History row reading TRANSCRIPTION_FAILED_TEXT, so Retry can transcribe
+        it again. If even that row cannot be prepared or saved, the user is
+        told to dictate again.
 
         Side effects: appends that row with the raw audio and the error in its
         preprocessing receipt, refreshes the History menu, logs the error, and
         shows one alert. Nothing once shutdown is requested."""
         if self.shutdown.requested():
             return
+        self._live_reported = True
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
         self.log(f"! transcription failed ({error})")
-        if prepared is None:  # the stream failed before any canonical audio existed
-            from audio_codec import prepare_canonical
-            prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
-        seconds = len(prepared.asr_samples) / SAMPLE_RATE
-        _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
-        attempt_metadata.update({
-            "vad": vad_metadata or {"available": None, "speech_fraction": None, "span_count": None},
-            "preprocessing": {**preprocessing, "outcome": "suspect", "error": error},
-            "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4), "asr_seconds": 0.0},
-        })
         try:
+            if prepared is None:  # no canonical audio exists yet (a stream or a step before it failed)
+                from audio_codec import prepare_canonical
+                prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
+            seconds = len(prepared.asr_samples) / SAMPLE_RATE
+            _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
+            attempt_metadata.update({
+                "vad": vad_metadata or {"available": None, "speech_fraction": None, "span_count": None},
+                "preprocessing": {**preprocessing, "outcome": "suspect", "error": error},
+                "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4), "asr_seconds": 0.0},
+            })
             finalize_primary_live_delivery(
                 append=lambda: self._append_live(
                     TRANSCRIPTION_FAILED_TEXT, prepared, seconds, self.model, ts=captured_ts,
@@ -473,6 +510,7 @@ class TranscriptionWorker:
         Side effects: runs ``deliver`` (the cursor insertion or the "scratch
         that" undo, exactly what a saved row would have scheduled); shows one
         alert; logs the error. Nothing once shutdown is requested."""
+        self._live_reported = True
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
         self.log(f"! History append failed ({error})"
                  + (" — delivering the text anyway" if deliver is not None else ""))
@@ -523,6 +561,7 @@ class TranscriptionWorker:
                 entry_id, text, snapshot.expected_revision,
                 model=self.model, provenance="retry",
                 **attempt_metadata)
+            self._retry_committed = True
             self.log("↻ retry skipped — dead microphone (all-zero capture)")
             self.refresh_history()
             return
@@ -581,6 +620,7 @@ class TranscriptionWorker:
         committed = self.coordinator.commit_retry(
             entry_id, text, snapshot.expected_revision, model=retry_model,
             provenance="retry", **attempt_metadata)
+        self._retry_committed = True
         self._publication_committed = committed is not None
         if self.adaptive_runtime is not None and self._publication is not None:
             if committed is None:

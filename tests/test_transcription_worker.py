@@ -804,6 +804,58 @@ class RoundTwoWorkerTests(TemporaryUserFiles, unittest.TestCase):
     """F4b, N10, N16, N17 and N19: a live job or a Retry that fails anywhere is
     kept or reported once, and nothing claims History holds what it does not."""
 
+    def test_f4b_a_failure_outside_the_model_call_keeps_the_recording(self):
+        h, raw = Harness(says("Please call me back at four")), speech(2.0)
+        with patch("transcription.screen", side_effect=RuntimeError("screen broke")):
+            h.run_jobs(h.live_job(raw))
+        FailureHandlingTests.assert_kept_for_retry(self, h, raw, "RuntimeError")
+
+    def test_f4b_a_capture_that_cannot_even_be_prepared_still_tells_the_user(self):
+        h = Harness(says("never transcribed"))
+        with patch("transcription.prepare_for_whisper", side_effect=ValueError("bad buffer")):
+            h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(h.coordinator.appended, [])
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Transcription failed"])
+        self.assertIn("dictate again", h.status_ui.errors[0][1])
+
+    def test_f4b_a_failure_already_reported_by_f16a_is_not_kept_again(self):
+        calls = []
+
+        def disk_full(text, *args, **kwargs):
+            calls.append(text)
+            raise OSError(28, "No space left on device")
+        h = Harness(says("Please call me back at four"), append=disk_full)
+
+        def refresh_broke():
+            raise OSError("menu refresh failed")
+        h.worker.refresh_history = refresh_broke
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(calls, ["Please call me back at four"])   # no second, F4b row
+        self.assertEqual(h.injected, ["Please call me back at four"])
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["History could not be saved"])
+
+    def test_n17_a_failed_retry_tells_the_user_once(self):
+        def boom(samples, **kwargs):
+            raise RuntimeError("[metal::malloc] Resource limit exceeded")
+        h = Harness(boom, snapshot=snapshot(speech(2.0)))
+        h.run_jobs(h.retry_job())
+        self.assertEqual((h.coordinator.retries, h.copied), ([], []))
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Retry failed"])
+        self.assertIn("RuntimeError", h.status_ui.errors[0][1])
+
+    def test_n17_an_error_after_delivery_is_not_a_transcription_failure(self):
+        h = Harness(says("Please call me back at four"))
+
+        def totals_broke(text, seconds):
+            raise OSError("progress file locked")
+        h.worker.record_totals = totals_broke
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(h.injected, ["Please call me back at four"])
+        self.assertEqual(len(h.coordinator.appended), 1)      # not kept a second time
+        self.assertEqual(h.status_ui.errors, [])
+        self.assertFalse(any("transcription failed" in line for line in h.logs), h.logs)
+        self.assertTrue(any("progress file locked" in line for line in h.logs), h.logs)
+
     def test_n10_read_only_history_never_says_the_failed_audio_is_in_history(self):
         def boom(samples, **kwargs):
             raise RuntimeError("[metal::malloc] Resource limit exceeded")
