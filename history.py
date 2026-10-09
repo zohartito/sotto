@@ -620,6 +620,13 @@ class HistoryStore:
     def _sweep_orphans(self) -> None:
         with self._lock:
             known = set()
+            # Rows are untrusted input (F16c): delete only what no row could
+            # own. A row's recordings can only ever be named after its id, so
+            # regular files with those names are kept even when its "audio"
+            # metadata is null or names another file; a spooled row with no
+            # usable digest could own any Silver evidence file, so then none
+            # is swept.
+            named_by_row, sweep_evidence = set(), True
             for entry in self._entries:
                 for kind, directory in (("inference", self.audio_dir), ("raw", self.raw_audio_dir)):
                     path = self._entry_audio_path(entry, kind)
@@ -628,6 +635,10 @@ class HistoryStore:
                 if entry.get("silver_spooled") is True:
                     path=self._entry_audio_path(entry,"inference")
                     if path is not None: known.add(path)
+                    else: sweep_evidence = False
+                else:
+                    named_by_row.update({self.audio_dir / f"{entry['id']}.wav",
+                                         self.raw_audio_dir / f"{entry['id']}.wav"})
             for directory in (self.audio_dir, self.raw_audio_dir, self.silver_evidence_dir):
                 if not self._owned_audio_root(directory):
                     # Refuse to treat an untrusted root as empty: otherwise a
@@ -646,7 +657,9 @@ class HistoryStore:
                         continue
                     if not stat.S_ISREG(mode):
                         continue
-                    if path.suffix == ".tmp" or path not in known:
+                    orphan = (path not in known and path not in named_by_row and
+                              (sweep_evidence or directory != self.silver_evidence_dir))
+                    if path.suffix == ".tmp" or orphan:
                         path.unlink(missing_ok=True)
             for temp in self.base_dir.glob(".history.jsonl.*.tmp"):
                 temp.unlink(missing_ok=True)

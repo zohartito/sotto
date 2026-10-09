@@ -693,5 +693,51 @@ class HistoryLearningTests(unittest.TestCase):
                 learning = LearningStore(root)
                 self.assertEqual([record["corrected_text"] for record in learning.active()], [f"fixed{char}text"])
 
+    def _rewrite_row(self, store: HistoryStore, entry_id: str, **fields) -> None:
+        rows = [json.loads(line) for line in store.index.read_text(encoding="utf-8").split("\n") if line]
+        for row in rows:
+            if row["id"] == entry_id:
+                row.update(fields)
+        store.index.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def test_orphan_sweep_keeps_recordings_of_rows_with_unusable_audio_metadata(self):
+        """F16c: a v2 row whose "audio" is null (or names no usable path) is
+        still a row; startup used to sweep its recordings as orphans while
+        History reported itself readable."""
+        cases = {"audio null": None, "audio a list": [],
+                 "inference null": {"inference": None, "raw": None},
+                 "foreign path": {"inference": {"path": "audio/someone-else.wav"}, "raw": {"path": "x"}}}
+        for name, audio in cases.items():
+            with self.subTest(name):
+                root = self.root / name.replace(" ", "-")
+                store = HistoryStore(root)
+                row = LearningCoordinator(store, LearningStore(root)).append_live(
+                    "kept words", np.array([-1.0, 0, 1.0], np.float32), .5, "model",
+                    raw_samples=np.array([-.5, .5], np.float32), raw_sample_rate=22_050)
+                wav, raw = store.audio_path(row["id"]), store.raw_audio_path(row["id"])
+                self.assertTrue(wav.exists() and raw.exists())
+                orphan = store.audio_dir / "0123456789ab.wav"
+                orphan.write_bytes(b"orphan")
+                self._rewrite_row(store, row["id"], audio=audio)
+                reopened = HistoryStore(root)
+                self.assertIsNone(reopened.unreadable)
+                self.assertEqual([entry["id"] for entry in reopened.entries()], [row["id"]])
+                self.assertTrue(wav.exists(), "the row's recording survives the sweep")
+                self.assertTrue(raw.exists(), "the row's raw recording survives the sweep")
+                self.assertFalse(orphan.exists(), "a recording no row names is still swept")
+
+    def test_orphan_sweep_keeps_silver_evidence_when_a_spooled_row_names_none(self):
+        """F16c: a spooled row whose audio metadata is unusable could own any
+        file in the Silver spool, so none of them is provably orphaned."""
+        store = HistoryStore(self.root / "spooled")
+        evidence = store.silver_evidence_dir / f"{'a' * 64}.wav"
+        evidence.write_bytes(b"evidence")
+        row = {"schema_version": 2, "id": "spooled00001", "revision": 0, "correction": None,
+               "audio": None, "adaptive": True, "language": "en", "silver_spooled": True,
+               "silver_enqueue": {"history_revision": 0, "state": "queued"}}
+        store.index.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        HistoryStore(store.base_dir)
+        self.assertTrue(evidence.exists())
+
 if __name__ == "__main__":
     unittest.main()
