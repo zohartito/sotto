@@ -181,6 +181,53 @@ class WinCaptureTest(unittest.TestCase):
             self._wait_closed(stream)
         capture.shutdown()
 
+    def test_no_second_stream_opens_while_the_last_one_is_still_closing(self) -> None:
+        # [PR15 review] A driver whose stop() outlasts the close wait used to
+        # let join(timeout) return and the next open run anyway: two streams on
+        # the mic.  The start must fail cleanly instead, and work once closed.
+        release = threading.Event()
+
+        class StuckStream(WinCaptureTest.FakeStream):
+            def stop(self) -> None:
+                release.wait(10)
+
+        streams: list = []
+        logs: list[str] = []
+
+        def factory(**kwargs):
+            streams.append(StuckStream() if not streams else WinCaptureTest.FakeStream())
+            return streams[-1]
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=logs.append)
+        capture._close_wait_s = 0.2
+        try:
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s
+                if capture._stream is not None:
+                    break
+                time.sleep(0.01)
+            capture.end()  # the stuck stop() now holds the closing thread
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s: the start fails, or (the defect) a 2nd stream opens
+                if not capture.is_active() or len(streams) > 1:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(streams), 1, "a second stream opened while the first was closing")
+            self.assertFalse(capture.is_active())
+            self.assertFalse(capture.is_waking())
+            self.assertTrue(any("still closing" in line for line in logs), logs)
+        finally:
+            release.set()
+        self._wait_closed(streams[0])
+        self.assertTrue(capture.begin())  # the closed mic opens normally again
+        for _ in range(500):  # up to 5 s
+            if capture._stream is not None:
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(streams), 2)
+        capture.end()
+        self._wait_closed(streams[1])
+
     def test_abort_discards_frames(self) -> None:
         self.capture.begin()
         self._wait_stream_open()
