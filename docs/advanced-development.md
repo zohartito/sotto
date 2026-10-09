@@ -55,7 +55,10 @@ surface hypotheses are memory-only.  Accepted evidence is labelled SILVER.
 `adaptive_worker.py` is headless: it imports neither AppKit nor Quartz and can
 run without the dictation application. It validates history revision/audio
 digest, clear epoch, receipt, lineage, and policy immediately before accepting
-a label. Human correction/delete/clear revokes prior silver first. The worker
+a label. Human correction/delete/clear revokes prior silver first, fail-closed;
+a data folder that never had a silver ledger (`adaptive-learning/silver` holds
+only HistoryStore's empty `evidence` folder) has nothing to revoke, so these
+actions never create one (`learning.silver_lane_exists`). The worker
 opens a prospective post-boundary horizon before teacher work, freezes the
 receipt-backed Whisper champion and disjoint available candidate arms, and
 evaluates the identical accepted cohort synchronously under evaluator leases.

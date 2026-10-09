@@ -86,7 +86,8 @@ fi
 
 echo "== Python environment ($VENV)"
 [ -x "$VENV/bin/python" ] || "$PYTHON" -m venv "$VENV"
-"$VENV/bin/python" -m pip install --quiet --upgrade pip
+# An exact pip, not whatever is newest today (F25); tests/test_dependency_pins.py keeps every copy in step.
+"$VENV/bin/python" -m pip install --quiet pip==26.2.1
 if [ -n "$UPSTREAM" ]; then
     # pip cannot roll back a half-finished install, so remember the working set.
     PREVIOUS_PACKAGES="$NEXT_REQUIREMENTS/previous-packages.txt"

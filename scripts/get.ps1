@@ -6,10 +6,12 @@
 # updates that copy, then runs its scripts\install-windows.ps1 and starts Sotto.
 # No admin rights. Missing tools are named with the command that installs them.
 
-# Same repository? Ignores https vs ssh form, a trailing .git and a trailing slash.
+# Same repository? Ignores https vs either ssh form (git@github.com:... and
+# ssh://git@github.com/...), a trailing .git and a trailing slash.
 function Test-SameRepo([string]$First, [string]$Second) {
   $normalized = foreach ($url in $First, $Second) {
-    (($url -replace '^git@github\.com:', 'https://github.com/').TrimEnd('/')) -replace '\.git$', ''
+    $https = $url -replace '^git@github\.com:', 'https://github.com/' -replace '^ssh://git@github\.com/', 'https://github.com/'
+    ($https.TrimEnd('/')) -replace '\.git$', ''
   }
   return $normalized[0] -eq $normalized[1]
 }

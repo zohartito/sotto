@@ -40,6 +40,38 @@ def scrub_comparator_spools(base_dir: Path | str) -> bool:
         return False
 
 
+def silver_lane_exists(base_dir: Path | str) -> bool:
+    """Whether a silver ledger may hold evidence that History must revoke.
+
+    ``HistoryStore`` always creates an empty ``adaptive-learning/silver/evidence``
+    and nothing else there.  Everything else under ``silver`` belongs to the
+    lane: the SQLite ledger (with its WAL/SHM) is created by ``SilverStore``
+    before any job, label, tombstone, cohort or comparator row can exist;
+    deployment/experiment state is written only by controllers that construct
+    a ``SilverStore`` first; and spooled evidence audio and comparator WAVs
+    are written only for adaptive captures, whose runtime builds the ledger
+    at startup.  So a silver directory that is missing, or holds nothing but
+    an empty ``evidence`` directory, has never had a ledger.  Anything else --
+    an unknown or non-empty entry, a non-directory or symlinked path, an
+    unreadable parent -- counts as present so revocation stays fail-closed.
+    """
+    silver = Path(base_dir) / "adaptive-learning" / "silver"
+    evidence = silver / "evidence"
+    try:
+        if not stat.S_ISDIR(os.lstat(silver).st_mode):
+            return True
+        names = os.listdir(silver)
+        if any(name != "evidence" for name in names):
+            return True
+        if not names:
+            return False
+        return not stat.S_ISDIR(os.lstat(evidence).st_mode) or bool(os.listdir(evidence))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
 def adaptive_review_eligible_entry(entry: dict[str, Any] | None) -> bool:
     """Whether a retained history row may enter the adaptive review protocol."""
     if not isinstance(entry, dict):
@@ -479,13 +511,21 @@ class LearningCoordinator:
         self.learning._reload_locked()
 
     def _revoke_silver_before_history_mutation(self, entry_id: str, history_revision: int | None = None,
-                                               operation: str = "correct") -> tuple[set[str], dict[str, Any]]:
+                                               operation: str = "correct") -> tuple[set[str], dict[str, Any] | None]:
         """Fence machine evidence before a human correction/delete changes it.
 
         Imported lazily so the established human-only startup path does not
         acquire any worker/model dependency.  Failure is deliberately fatal:
         an unknown silver schema must not permit stale pseudo-label evidence.
+
+        A data folder that has never had a silver ledger (the plain alpha,
+        Windows) has no evidence to fence, so nothing is created for it.
+        Callers hold the storage advisory lock, which the worker also holds
+        from marker validation through enqueue, and the worker constructs its
+        ledger before that; any enqueue therefore precedes this check.
         """
+        if not silver_lane_exists(self.history.base_dir):
+            return set(), None
         from silver_store import SilverStore
         from deployment_controller import DeploymentController
         dependencies,intent=SilverStore(self.history.base_dir).revoke_history_with_intent(entry_id,history_revision=history_revision,
@@ -730,10 +770,15 @@ class LearningCoordinator:
             self._reload_current_locked()
             entry = self.history._find_locked(entry_id)
             if entry is None or (expected_revision is not None and entry.get("revision") != expected_revision): return None
-            self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]),operation="delete")
-            # A later correction invalidates its prior explicit consent first.
+            # "correct", not "delete": recovery of an interrupted correction
+            # must keep the (uncorrected) row, never remove it.
+            self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]),operation="correct")
+            # A later correction invalidates its prior explicit consent first,
+            # including a pending enrollment: consent belongs to the text it
+            # was given for, and only auto_enroll below may renew it.
             for record in list(self.learning.active_for_history(entry_id)):
                 self.learning.revoke(record["sample_id"])
+            self.learning.clear_pending_gold(entry_id)
             marker=entry.get("silver_enqueue")
             if isinstance(marker,dict) and marker.get("history_revision") == entry.get("revision"):
                 marker["state"]="released"
@@ -755,6 +800,7 @@ class LearningCoordinator:
             if entry is None or (expected_revision is not None and entry.get("revision") != expected_revision): return None
             self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]))
             for record in list(self.learning.active_for_history(entry_id)): self.learning.revoke(record["sample_id"])
+            self.learning.clear_pending_gold(entry_id)  # consent belongs to the text it was given for
             # Certify exactly the text the user saw in the history menu; the
             # immutable hypothesis remains available for comparison/glossary.
             marker=entry.get("silver_enqueue")
@@ -774,6 +820,7 @@ class LearningCoordinator:
             if entry is None or (expected_revision is not None and entry.get("revision") != expected_revision): return None
             self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]))
             for record in list(self.learning.active_for_history(entry_id)): self.learning.revoke(record["sample_id"])
+            self.learning.clear_pending_gold(entry_id)  # consent belongs to the text it was given for
             marker=entry.get("silver_enqueue")
             if isinstance(marker,dict) and marker.get("history_revision") == entry.get("revision"):
                 marker["state"]="released"
@@ -910,9 +957,22 @@ class LearningCoordinator:
                 marker=entry.get("silver_enqueue")
                 if isinstance(marker,dict) and marker.get("history_revision") == old_revision and marker.get("state") != "released":
                     marker["state"]="released"; marker_changed=True
+            # Delete (or an untargeted intent) revokes every sample for the
+            # row.  Otherwise keep only consent given after the mutation
+            # completed: a sample enrolled at a strictly newer revision.  A
+            # sample at or before the staged revision, or with no valid
+            # revision, is pre-mutation evidence and is revoked.
+            def staged_or_older(revision: Any) -> bool:
+                return (operation == "delete" or old_revision is None or isinstance(revision,bool)
+                        or not isinstance(revision,int) or revision <= old_revision)
             for record in list(self.learning.active_for_history(history_id)):
-                self.learning.revoke(record["sample_id"])
-            self.learning.clear_pending_gold(history_id)
+                if staged_or_older(record.get("history_revision")):
+                    self.learning.revoke(record["sample_id"])
+            # Pending gold carries no revision and enrolls whatever revision
+            # is current, so it survives only when History has moved past the
+            # staged revision.
+            if entry is None or staged_or_older(entry.get("revision")):
+                self.learning.clear_pending_gold(history_id)
             if operation == "delete" and entry is not None and old_revision is not None and entry.get("revision") == old_revision:
                 self.history._delete_locked(history_id)
                 return
@@ -943,13 +1003,16 @@ class LearningCoordinator:
 
     def clear(self) -> None:
         # Epoch/deployment invalidation happens outside history locks, avoiding
-        # cross-store lock inversion with a worker result commit.
-        from silver_store import SilverStore
-        from deployment_controller import DeploymentController
-        store=SilverStore(self.history.base_dir)
-        store.clear(reason="history_clear")
-        scrub_intent=store.scrub_pending()
-        DeploymentController(self.history.base_dir).invalidate("history_clear")
+        # cross-store lock inversion with a worker result commit.  A folder
+        # that has never had a silver ledger has no epoch to fence.
+        lane=silver_lane_exists(self.history.base_dir)
+        if lane:
+            from silver_store import SilverStore
+            from deployment_controller import DeploymentController
+            store=SilverStore(self.history.base_dir)
+            store.clear(reason="history_clear")
+            scrub_intent=store.scrub_pending()
+            DeploymentController(self.history.base_dir).invalidate("history_clear")
         from adaptive_learning import AdaptiveLearning
         # Clear is stronger than ordinary revocation.  Publish an empty
         # personal adaptive namespace rather than retaining revoked capture
@@ -957,6 +1020,11 @@ class LearningCoordinator:
         AdaptiveLearning(self.history.base_dir).clear_personal_state()
         with self._lock, advisory_lock(self.history.base_dir), self.history._lock:
             self._reload_current_locked()
+            # Without an epoch fence, a ledger created since the check above
+            # (a worker enqueues only under this advisory lock) must stop the
+            # wipe; a retried Clear then fences it.
+            if not lane and silver_lane_exists(self.history.base_dir):
+                raise RuntimeError("silver ledger appeared during clear; retry")
             # Epoch fencing occurs before removing any history/audio so a
             # stale teacher result cannot publish into a newly cleared corpus.
             for record in list(self.learning.active()):
@@ -970,16 +1038,18 @@ class LearningCoordinator:
         # The SQLite epoch fence is already committed.  Complete the durable
         # outbox synchronously on the ordinary path; recovery performs these
         # same idempotent erasures if this process dies between steps.
-        from silver_experiment import SilverExperiment
-        SilverExperiment(self.history.base_dir).clear_personal_state()
-        DeploymentController(self.history.base_dir).clear_personal_state()
-        # SQLite has already removed comparator intent/pair authority.  Its
-        # private WAVs must be scrubbed before the exact clear token is
-        # acknowledged; unsafe artifacts deliberately retain the hard fence.
-        if not scrub_comparator_spools(self.history.base_dir):
-            raise RuntimeError("comparator scrub is blocked")
-        if not store.complete_scrub(scrub_intent):
-            raise RuntimeError("clear scrub acknowledgement changed")
+        if lane:
+            from silver_experiment import SilverExperiment
+            SilverExperiment(self.history.base_dir).clear_personal_state()
+            DeploymentController(self.history.base_dir).clear_personal_state()
+            # SQLite has already removed comparator intent/pair authority.  Its
+            # private WAVs must be scrubbed before the exact clear token is
+            # acknowledged; unsafe artifacts deliberately retain the hard fence.
+            # (Without a lane the evidence directory is empty: no WAV exists.)
+            if not scrub_comparator_spools(self.history.base_dir):
+                raise RuntimeError("comparator scrub is blocked")
+            if not store.complete_scrub(scrub_intent):
+                raise RuntimeError("clear scrub acknowledgement changed")
 
     def finish_pending_clear(self) -> None:
         """Complete a SilverStore-fenced clear after a crash without new epoch."""
