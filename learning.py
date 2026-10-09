@@ -773,9 +773,12 @@ class LearningCoordinator:
             # "correct", not "delete": recovery of an interrupted correction
             # must keep the (uncorrected) row, never remove it.
             self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]),operation="correct")
-            # A later correction invalidates its prior explicit consent first.
+            # A later correction invalidates its prior explicit consent first,
+            # including a pending enrollment: consent belongs to the text it
+            # was given for, and only auto_enroll below may renew it.
             for record in list(self.learning.active_for_history(entry_id)):
                 self.learning.revoke(record["sample_id"])
+            self.learning.clear_pending_gold(entry_id)
             marker=entry.get("silver_enqueue")
             if isinstance(marker,dict) and marker.get("history_revision") == entry.get("revision"):
                 marker["state"]="released"
@@ -797,6 +800,7 @@ class LearningCoordinator:
             if entry is None or (expected_revision is not None and entry.get("revision") != expected_revision): return None
             self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]))
             for record in list(self.learning.active_for_history(entry_id)): self.learning.revoke(record["sample_id"])
+            self.learning.clear_pending_gold(entry_id)  # consent belongs to the text it was given for
             # Certify exactly the text the user saw in the history menu; the
             # immutable hypothesis remains available for comparison/glossary.
             marker=entry.get("silver_enqueue")
@@ -816,6 +820,7 @@ class LearningCoordinator:
             if entry is None or (expected_revision is not None and entry.get("revision") != expected_revision): return None
             self._revoke_silver_before_history_mutation(entry_id,history_revision=int(entry["revision"]))
             for record in list(self.learning.active_for_history(entry_id)): self.learning.revoke(record["sample_id"])
+            self.learning.clear_pending_gold(entry_id)  # consent belongs to the text it was given for
             marker=entry.get("silver_enqueue")
             if isinstance(marker,dict) and marker.get("history_revision") == entry.get("revision"):
                 marker["state"]="released"
@@ -952,9 +957,22 @@ class LearningCoordinator:
                 marker=entry.get("silver_enqueue")
                 if isinstance(marker,dict) and marker.get("history_revision") == old_revision and marker.get("state") != "released":
                     marker["state"]="released"; marker_changed=True
+            # Delete (or an untargeted intent) revokes every sample for the
+            # row.  Otherwise keep only consent given after the mutation
+            # completed: a sample enrolled at a strictly newer revision.  A
+            # sample at or before the staged revision, or with no valid
+            # revision, is pre-mutation evidence and is revoked.
+            def staged_or_older(revision: Any) -> bool:
+                return (operation == "delete" or old_revision is None or isinstance(revision,bool)
+                        or not isinstance(revision,int) or revision <= old_revision)
             for record in list(self.learning.active_for_history(history_id)):
-                self.learning.revoke(record["sample_id"])
-            self.learning.clear_pending_gold(history_id)
+                if staged_or_older(record.get("history_revision")):
+                    self.learning.revoke(record["sample_id"])
+            # Pending gold carries no revision and enrolls whatever revision
+            # is current, so it survives only when History has moved past the
+            # staged revision.
+            if entry is None or staged_or_older(entry.get("revision")):
+                self.learning.clear_pending_gold(history_id)
             if operation == "delete" and entry is not None and old_revision is not None and entry.get("revision") == old_revision:
                 self.history._delete_locked(history_id)
                 return

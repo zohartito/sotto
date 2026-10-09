@@ -1574,6 +1574,98 @@ class SilverLaneTests(unittest.TestCase):
         current=self.history.get(row["id"])
         self.assertEqual((current["revision"],current["text"]),(corrected["revision"],"gold"))
 
+    def test_correction_recovery_keeps_sample_enrolled_at_the_corrected_revision(self):
+        from learning import LearningStore
+        row=self.live(); store=SilverStore(self.root)
+        corrected=self.coordinator.correct(row["id"],"gold",expected_revision=row["revision"],auto_enroll=True)
+        enrolled=LearningStore(self.root).active_for_history(row["id"])
+        self.assertEqual([item["history_revision"] for item in enrolled],[corrected["revision"]])
+        # The correction's own intent is still pending: nothing finishes it
+        # before the consented enrollment of the new revision.
+        self.assertEqual([(item["history_revision"],item["operation"]) for item in store.scrub_pending()["intents"]],
+                         [(row["revision"],"correct")])
+        worker=AdaptiveWorker(self.root,history=HistoryStore(self.root),silver=store,teachers=_Teachers())
+        worker.recover_markers()
+        self.assertIsNone(store.scrub_pending())
+        survivors=LearningStore(self.root).active_for_history(row["id"])
+        self.assertEqual([item["sample_id"] for item in survivors],[enrolled[0]["sample_id"]])
+
+    def test_correction_recovery_keeps_pending_enrollment_for_the_corrected_revision(self):
+        from learning import LearningStore
+        row=self.live(); store=SilverStore(self.root)
+        with mock.patch.object(LearningCoordinator,"enroll",side_effect=OSError(5,"I/O error")):
+            corrected=self.coordinator.correct(row["id"],"gold",expected_revision=row["revision"],auto_enroll=True)
+        self.assertEqual([item["history_id"] for item in LearningStore(self.root).pending_gold()],[row["id"]])
+        worker=AdaptiveWorker(self.root,history=HistoryStore(self.root),silver=store,teachers=_Teachers())
+        worker.recover_markers()
+        self.assertIsNone(store.scrub_pending())
+        self.assertEqual([item["history_id"] for item in LearningStore(self.root).pending_gold()],[row["id"]])
+        retried=LearningCoordinator(HistoryStore(self.root),base_dir=self.root)
+        self.assertEqual(retried.retry_pending_gold(),1)
+        self.assertEqual([item["history_revision"] for item in LearningStore(self.root).active_for_history(row["id"])],
+                         [corrected["revision"]])
+
+    def test_a_later_correction_without_consent_clears_a_stale_pending_enrollment(self):
+        # Consent belongs to the text it was given for: a correction made with
+        # auto-enroll off must not let an earlier failed enrollment's marker
+        # enroll the new text, now or after the worker's recovery.
+        from learning import LearningStore
+        row=self.live(); store=SilverStore(self.root)
+        with mock.patch.object(LearningCoordinator,"enroll",side_effect=OSError(5,"I/O error")):
+            first=self.coordinator.correct(row["id"],"first",expected_revision=row["revision"],auto_enroll=True)
+        self.assertEqual([item["history_id"] for item in LearningStore(self.root).pending_gold()],[row["id"]])
+        for mutate in ("correct","correct_as_is","no_speech"):
+            with self.subTest(mutate=mutate):
+                if mutate=="correct":
+                    self.coordinator.correct(row["id"],"second",auto_enroll=False)
+                else:
+                    getattr(self.coordinator,mutate)(row["id"],auto_enroll=False)
+                self.assertEqual(LearningStore(self.root).pending_gold(),[])
+                worker=AdaptiveWorker(self.root,history=HistoryStore(self.root),silver=store,teachers=_Teachers())
+                worker.recover_markers()
+                retried=LearningCoordinator(HistoryStore(self.root),base_dir=self.root)
+                self.assertEqual(retried.retry_pending_gold(),0)
+                self.assertEqual(LearningStore(self.root).active_for_history(row["id"]),[])
+                self.coordinator.learning.mark_pending_gold(row["id"],"enrollment_conflict")  # stale again
+
+    def test_interrupted_correction_recovery_revokes_old_revision_sample_and_pending_enrollment(self):
+        from learning import LearningStore
+        row=self.live(); store=SilverStore(self.root)
+        first=self.coordinator.correct(row["id"],"first",expected_revision=row["revision"],auto_enroll=True)
+        old=LearningStore(self.root).active_for_history(row["id"])
+        self.assertEqual([item["history_revision"] for item in old],[first["revision"]])
+        self.coordinator.learning.mark_pending_gold(row["id"],"enrollment_conflict")
+        # The second correction stages its intent, then dies before revoking
+        # the old consent or saving History.
+        with mock.patch.object(LearningStore,"revoke",side_effect=OSError(5,"I/O error")):
+            with self.assertRaises(OSError):
+                self.coordinator.correct(row["id"],"second",expected_revision=first["revision"])
+        self.assertEqual([(item["history_revision"],item["operation"]) for item in store.scrub_pending()["intents"]],
+                         [(row["revision"],"correct"),(first["revision"],"correct")])
+        worker=AdaptiveWorker(self.root,history=HistoryStore(self.root),silver=store,teachers=_Teachers())
+        worker.recover_markers()
+        self.assertIsNone(store.scrub_pending())
+        learning=LearningStore(self.root)
+        self.assertEqual(learning.active_for_history(row["id"]),[])
+        self.assertEqual(learning._records[old[0]["sample_id"]]["status"],"revoked")
+        self.assertEqual(learning.pending_gold(),[])
+        current=HistoryStore(self.root).get(row["id"])
+        self.assertEqual((current["revision"],current["text"]),(first["revision"],"first"))
+
+    def test_delete_recovery_still_revokes_every_sample_for_the_row(self):
+        from learning import LearningStore
+        row=self.live(); store=SilverStore(self.root)
+        _dependencies,batch=store.revoke_history_with_intent(row["id"],history_revision=row["revision"],operation="delete")
+        intent=next(item for item in batch["intents"] if item["history_id"] == row["id"])
+        corrected=self.coordinator.correct(row["id"],"gold",expected_revision=row["revision"],auto_enroll=True)
+        self.assertEqual([item["history_revision"] for item in LearningStore(self.root).active_for_history(row["id"])],
+                         [corrected["revision"]])
+        self.coordinator.learning.mark_pending_gold(row["id"],"enrollment_conflict")
+        self.coordinator.finish_pending_revoke_intent(intent)
+        learning=LearningStore(self.root)
+        self.assertEqual(learning.active_for_history(row["id"]),[])
+        self.assertEqual(learning.pending_gold(),[])
+
     def test_delete_still_revokes_existing_silver_evidence_for_the_row(self):
         row=self.live(); store=SilverStore(self.root)
         job_args=dict(history_id=row["id"],history_revision=row["revision"],audio_sha256=row["audio"]["inference"]["sha256"],
