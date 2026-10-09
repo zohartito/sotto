@@ -28,8 +28,9 @@ ignore = ["E701", "E702"]
 
 [tool.ruff.lint.per-file-ignores]
 # Being restructured elsewhere; only unused imports were removed here. Review
-# B023 (closures over loop variables) and B905 as part of that work.
-"sotto.py" = ["E402", "E501", "E703", "F841", "B023", "B905"]
+# B905 as part of that work. (B023: the 30 loop closures moved into
+# transcription.py with the worker and were all called synchronously — F65.)
+"sotto.py" = ["E402", "E501", "E703", "F841", "B905"]
 # Being restructured elsewhere. B018: `ctypes.windll.user32.SendInput` is a
 # deliberate availability probe inside `doctor`.
 "sotto_win.py" = ["B018", "B904"]
