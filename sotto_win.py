@@ -26,6 +26,7 @@ counts, never dictated text.
 from __future__ import annotations
 
 import argparse
+import atexit
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass, field
@@ -71,6 +72,11 @@ class _ConsoleLog:
     sotto.log() prints to sys.stderr; teeing it here gives a durable log.
     Under pythonw there is no console (sys.stderr is None): file only.  It
     holds timings and character counts, never transcript text.
+
+    Callers only queue the text; one writer thread does the console and file
+    I/O.  Gesture callbacks log on the keyboard-hook thread, and Windows
+    silently drops a low-level hook that is slow to return, so a log line must
+    never wait for the disk there.  drain() (also at exit) writes what is left.
     """
 
     def __init__(self) -> None:
@@ -84,25 +90,58 @@ class _ConsoleLog:
             self._file = open(path, "a", encoding="utf-8", buffering=1)
         except OSError:
             pass  # console-only rather than crash on a read-only profile
+        self._pending: queue.SimpleQueue = queue.SimpleQueue()
+        self._draining = False
+        self._writer = threading.Thread(target=self._write_pending, daemon=True,
+                                        name="sotto-log")
+        self._writer.start()
+        atexit.register(self.drain)
 
     def write(self, text: str) -> int:
-        if self._console is not None:
-            try:
-                self._console.write(text)
-            except (OSError, ValueError):
-                self._console = None  # the console went away
-        if self._file is not None:
-            self._file.write(text)
+        if self._draining:
+            self._emit(text)  # after drain(): nothing reads the queue any more
+        else:
+            self._pending.put(text)
         return len(text)
 
     def flush(self) -> None:
+        pass  # the writer flushes every line it writes
+
+    def drain(self, timeout: float = 2.0) -> None:
+        """Write every queued line, then write directly from now on.
+
+        Side effects: stops the writer thread.
+        """
+        if self._draining:
+            return
+        self._pending.put(None)
+        self._writer.join(timeout)
+        self._draining = True
+        while True:  # a line queued behind the stop marker is written, never dropped
+            try:
+                text = self._pending.get_nowait()
+            except queue.Empty:
+                return
+            if text is not None:
+                self._emit(text)
+
+    def _write_pending(self) -> None:
+        while (text := self._pending.get()) is not None:
+            self._emit(text)
+
+    def _emit(self, text: str) -> None:
         if self._console is not None:
             try:
+                self._console.write(text)
                 self._console.flush()
             except (OSError, ValueError):
-                self._console = None
+                self._console = None  # the console went away
         if self._file is not None:
-            self._file.flush()
+            try:
+                self._file.write(text)
+                self._file.flush()
+            except (OSError, ValueError):
+                self._file = None
 
 
 def log(msg: str) -> None:

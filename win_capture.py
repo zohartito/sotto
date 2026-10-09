@@ -2,13 +2,18 @@
 
 The privacy boundary matches the Mac's ``--idle-release 0``: the microphone
 is open only while the trigger key is held — ``begin()`` opens the stream,
-``end()`` closes it and returns the accumulated 16 kHz float32 samples.
+``end()`` ends it and returns the accumulated 16 kHz float32 samples.
 
 Unlike the Mac's process-lifetime AVAudioEngine (preroll ring, dead-route
 repair via engine rebuild + launchd restart), Windows v1 opens a fresh
 stream per capture, so a wedged device cannot persist across captures.  The
 worker-side exact-zero guard (sotto.asr_skip_reason) still quarantines a
 dead route that occurs mid-capture.
+
+Stopping a stream can take a while (Bluetooth, slow drivers), and end() and
+abort() are called on the keyboard-hook thread, which must return at once: the
+finished stream is stopped and closed on its own thread, and the next open
+waits for that.
 """
 from __future__ import annotations
 
@@ -48,6 +53,7 @@ class WinCapture:
         # Each begin() owns one generation; a slow open from an earlier,
         # already-ended capture must never attach to (or feed) a newer one.
         self._generation = 0
+        self._closing: list[threading.Thread] = []
         self._lock = threading.Lock()
 
     def begin(self) -> bool:
@@ -67,7 +73,34 @@ class WinCapture:
     def _current(self, generation: int) -> bool:
         return self._active and self._generation == generation
 
+    def _close_later(self, stream) -> None:
+        """Stop and close a finished stream off the caller's thread.
+
+        Side effects: starts a closing thread; the next open waits for it.
+        """
+        def close() -> None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as exc:
+                self._log(f"! mic close failed: {str(exc)[:120]}")
+
+        with self._lock:
+            self._closing = [thread for thread in self._closing if thread.is_alive()]
+            thread = threading.Thread(target=close, daemon=True)
+            self._closing.append(thread)
+            thread.start()
+
+    def _wait_closed(self, timeout: float = 2.0) -> None:
+        """Wait for streams still closing, so two never hold the mic at once."""
+        with self._lock:
+            closing = list(self._closing)
+        for thread in closing:
+            thread.join(timeout)
+
     def _open_stream(self, generation: int) -> None:
+        self._wait_closed()
+
         def _callback(indata, frame_count, time_info, status) -> None:
             block = indata[:, 0].copy()
             with self._lock:
@@ -116,8 +149,7 @@ class WinCapture:
             self._waking = False
             stream, self._stream = self._stream, None
         if stream is not None:
-            stream.stop()
-            stream.close()
+            self._close_later(stream)
         if not frames:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(frames).reshape(-1)
@@ -129,8 +161,7 @@ class WinCapture:
             self._waking = False
             stream, self._stream = self._stream, None
         if stream is not None:
-            stream.stop()
-            stream.close()
+            self._close_later(stream)
 
     def is_active(self) -> bool:
         with self._lock:
@@ -156,3 +187,4 @@ class WinCapture:
                 stream.close()
             except Exception:
                 pass
+        self._wait_closed()  # the mic is closed when Sotto stops

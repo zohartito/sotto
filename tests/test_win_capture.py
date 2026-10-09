@@ -57,6 +57,13 @@ class WinCaptureTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail("stream never opened")
 
+    def _wait_closed(self, stream) -> None:
+        for _ in range(500):  # up to 5 s: streams close on their own thread
+            if stream.closed:
+                return
+            time.sleep(0.01)
+        self.fail("stream was never closed")
+
     def _feed(self, values: list[float]) -> None:
         block = np.array([[v] for v in values], dtype=np.float32)
         self.factory.callback(block, len(block), None, None)
@@ -68,7 +75,7 @@ class WinCaptureTest(unittest.TestCase):
         self._feed([0.1, 0.2])
         self.assertFalse(self.capture.is_waking())
         samples = self.capture.end()
-        self.assertTrue(stream.closed)
+        self._wait_closed(stream)
         self.assertFalse(self.capture.is_active())
         self.assertEqual(samples.dtype, np.float32)
         self.assertEqual(list(samples), [0.1, 0.2])
@@ -135,7 +142,41 @@ class WinCaptureTest(unittest.TestCase):
         callbacks[0](np.array([[0.9]], dtype=np.float32), 1, None, None)
         callbacks[1](np.array([[0.1]], dtype=np.float32), 1, None, None)
         self.assertEqual(list(capture.end()), [np.float32(0.1)])
-        self.assertTrue(all(stream.closed for stream in streams))
+        wait_for(lambda: all(stream.closed for stream in streams))
+
+    def test_a_slow_stream_teardown_never_holds_up_end_or_abort(self) -> None:
+        # [F32] end()/abort() run on the keyboard-hook thread; a Bluetooth or
+        # driver stop() that takes 0.4 s must happen elsewhere.
+        class SlowStream(WinCaptureTest.FakeStream):
+            def stop(self) -> None:
+                time.sleep(0.4)
+
+        streams: list = []
+
+        def factory(**kwargs):
+            streams.append(SlowStream())
+            factory.callback = kwargs["callback"]
+            return streams[-1]
+
+        capture = win_capture.WinCapture(stream_factory=factory)
+        for finish in (capture.end, capture.abort):
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s; the second open waits for the first close
+                if streams and capture._stream is streams[-1]:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("stream never opened")
+            stream = streams[-1]
+            factory.callback(np.array([[0.3]], dtype=np.float32), 1, None, None)
+            started = time.monotonic()
+            result = finish()
+            self.assertLess(time.monotonic() - started, 0.1, f"{finish.__name__} waited for stop()")
+            if finish == capture.end:
+                self.assertEqual(list(result), [np.float32(0.3)])
+            self.assertFalse(capture.is_active())
+            self._wait_closed(stream)
+        capture.shutdown()
 
     def test_abort_discards_frames(self) -> None:
         self.capture.begin()

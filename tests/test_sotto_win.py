@@ -1009,5 +1009,37 @@ class FailureAndTeardownTest(unittest.TestCase):
         self.assertEqual(texts, ["first words", "second words"], "both stay in History")
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class ConsoleLogTest(unittest.TestCase):
+    def test_a_log_line_never_waits_for_the_disk(self):
+        # [F32] Gesture callbacks log on the keyboard-hook thread; a slow disk
+        # or console must not hold that thread (Windows drops slow hooks).
+        written: list[str] = []
+
+        class SlowFile:
+            def write(self, text):
+                time.sleep(0.3)
+                written.append(text)
+
+            def flush(self):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-log-") as temporary, \
+                mock.patch.object(sotto_win, "DATA_DIR", Path(temporary)), \
+                mock.patch.object(sys, "stderr", None):
+            sink = sotto_win._ConsoleLog()
+            sink._file.close()
+            sink._file = SlowFile()
+            started = time.monotonic()
+            print("● recording", file=sink, flush=True)
+            print("○ 0.98s captured", file=sink, flush=True)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.1, "logging waited for the file")
+            sink.drain(timeout=5)
+        self.assertEqual("".join(written), "● recording\n○ 0.98s captured\n")
+        print("after drain", file=sink)  # written directly once the writer has stopped
+        self.assertTrue("".join(written).endswith("after drain\n"), written)
+
+
 if __name__ == "__main__":
     unittest.main()
