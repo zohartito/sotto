@@ -34,6 +34,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+import pipeline
+# The output guards live in pipeline.py (shared with Windows); these names stay
+# importable from sotto for existing callers.
+from pipeline import (LOOP_MAX_UNIT_WORDS, LOOP_MIN_PREFIX_CHARS, LOOP_MIN_REPEATS,  # noqa: F401
+                      NO_SPEECH_TEXT, _find_repetition_loop, apply_voice_cleanup,
+                      looks_hallucinated, reads_as_no_speech, salvage_repetition_loop, screen)
 try:  # Keep content-free CLI/admin helpers importable on non-macOS test hosts.
     import Quartz
     from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
@@ -474,36 +481,9 @@ def seed_totals(store) -> None:
         log(f"! progress totals not started ({type(exc).__name__})")
 
 
-def apply_voice_cleanup(text: str, preprocessing: dict, language: str | None) -> tuple[str, str | None]:
-    """English voice commands and filler removal, after the dictionary. Returns
-    the text to deliver and an action ("scratch" undoes the last dictation)."""
-    import settings
-    import voice_commands
-    preferences = settings.load(settings.SETTINGS_PATH)
-    commands, fillers = preferences["voice_commands"], preferences["remove_fillers"]
-    if not (commands or fillers) or not voice_commands.is_english(language, preferences["languages"]):
-        return text, None
-    cleaned, action = voice_commands.clean(text, fillers=fillers, commands=commands)
-    if action or cleaned != text:
-        preprocessing["voice"] = {"asr_text": text, **({"action": action} if action else {})}
-    return cleaned, action
-
-
 def apply_personal_dictionary(text: str, preprocessing: dict) -> str:
-    """The user's own spellings for text that is about to be delivered.
-
-    Runs after every hallucination/no-speech guard; the recognizer's original
-    output stays in the History row's preprocessing receipt."""
-    import dictionary
-    try:
-        updated, receipt = dictionary.apply(text, dictionary.load(dictionary.DICTIONARY_PATH))
-    except Exception as exc:  # a broken dictionary must never cost a dictation
-        log(f"! dictionary skipped ({type(exc).__name__})")
-        return text
-    if receipt:
-        preprocessing["dictionary"] = {"rules": receipt, "asr_text": text}
-        log(f"  dictionary: {sum(item['count'] for item in receipt)} replacement(s)")
-    return updated
+    """pipeline.apply_personal_dictionary, logging to Sotto's log."""
+    return pipeline.apply_personal_dictionary(text, preprocessing, log)
 
 
 def live_preview(text: str) -> str:
@@ -1515,89 +1495,6 @@ def asr_skip_reason(samples: np.ndarray) -> str | None:
     """Why this capture must not be sent to the ASR, or None to transcribe."""
     if is_dead_route(samples):
         return "dead microphone (all-zero capture)"
-    return None
-
-
-def looks_hallucinated(text: str, seconds: float) -> str | None:
-    """Whisper can turn a second of breath into a thousand characters of
-    looped phrases. Speech is ~15 chars/sec; loops compress absurdly well.
-    Returns the reason if the transcript can't be real speech, else None."""
-    import zlib
-    chars_per_sec = len(text) / max(seconds, 0.1)
-    if chars_per_sec > 40:
-        return f"{chars_per_sec:.0f} chars/sec"
-    if len(text) > 120:
-        ratio = len(zlib.compress(text.encode())) / len(text.encode())
-        if ratio < 0.25:
-            return f"compression ratio {ratio:.2f}"
-    return None
-
-
-LOOP_MIN_REPEATS = 6       # far past what real speech repeats verbatim
-LOOP_MAX_UNIT_WORDS = 6    # loops cycle a word or a short phrase, not a clause
-LOOP_MIN_PREFIX_CHARS = 40  # below this there is no dictation worth rescuing
-
-
-def _find_repetition_loop(text: str) -> tuple[int, str, int] | None:
-    """Earliest degenerate repeated run in `text`, as (char offset where the
-    run starts, the repeated unit, repeat count). Words are matched
-    case-insensitively and without trailing punctuation, so whisper's
-    "Okay. Okay. Okay." loops count as repeats of one unit."""
-    import re
-    spans = [match.span() for match in re.finditer(r"\S+", text)]
-    words = [text[start:end].strip(".,!?;:-").casefold() for start, end in spans]
-    best: tuple[int, str, int] | None = None
-    for unit in range(1, LOOP_MAX_UNIT_WORDS + 1):
-        index = 0
-        while index + unit * LOOP_MIN_REPEATS <= len(words):
-            first = words[index:index + unit]
-            repeats, cursor = 1, index + unit
-            while cursor + unit <= len(words) and words[cursor:cursor + unit] == first:
-                repeats += 1
-                cursor += unit
-            if repeats >= LOOP_MIN_REPEATS:
-                if best is None or spans[index][0] < best[0]:
-                    unit_text = text[spans[index][0]:spans[index + unit - 1][1]]
-                    best = (spans[index][0], unit_text, repeats)
-                index = cursor
-            else:
-                index += 1
-    return best
-
-
-def salvage_repetition_loop(text: str, seconds: float) -> tuple[str, dict] | None:
-    """Whisper can transcribe real dictation and only then fall into a
-    repetition loop ("...that's part of the plan." + "difference" x223,
-    observed 2026-08-15). Blocking the whole transcript costs the user
-    everything they said, so cut at the loop and keep the clean prefix.
-
-    Returns (prefix, receipt) only when the prefix stands on its own as real
-    speech by the same measures that condemned the whole; otherwise None and
-    the caller quarantines as before."""
-    found = _find_repetition_loop(text)
-    if found is None:
-        return None
-    offset, unit_text, repeats = found
-    prefix = text[:offset].strip()
-    if len(prefix) < LOOP_MIN_PREFIX_CHARS:
-        return None
-    if looks_hallucinated(prefix, seconds) is not None:
-        return None
-    return prefix, {"unit": unit_text[:40], "repeats": repeats,
-                    "dropped_chars": len(text) - len(prefix)}
-
-
-def reads_as_no_speech(text: str, speech_fraction: float) -> str | None:
-    """Output-side no-speech verdict, judged AFTER transcription. Whisper
-    turns silence and dead-mic captures into short stock phrases ("you",
-    "Thank you."), so a tiny transcript from a capture the VAD scored as
-    speechless is silence, not dictation. A substantial transcript wins over
-    the VAD score — Silero scores real whispered dictation at 0% speech
-    (whispers on this machine: 240+ chars at VAD 0%; silence: <=15 chars)."""
-    if not text.strip():
-        return "empty transcript"
-    if speech_fraction < 0.06 and len(text.strip()) <= 20:
-        return f"tiny transcript, VAD {speech_fraction*100:.0f}% speech"
     return None
 
 
@@ -2633,30 +2530,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                              "latency": {"queue_wait_seconds": round(started - queued_at, 4),
                                                          "asr_seconds": round(elapsed, 4)}})
                     prepared_seconds = len(prepared.asr_samples) / SAMPLE_RATE
-                    no_speech = reads_as_no_speech(text, speech_fraction)
-                    if no_speech == "empty transcript":
-                        text = "[no speech detected]"
-                    if text and not shutdown.requested():
+                    # Guards, then the user's dictionary and English cleanup
+                    # (pipeline.screen, shared with Retry and Windows). Empty
+                    # output becomes the no-speech marker, so the text going
+                    # in is never empty; "scratch that" may clean down to "".
+                    screened = screen(text, seconds=prepared_seconds, speech_fraction=speech_fraction,
+                                      language=preprocessing.get("detected_language") or job_config.language,
+                                      clean=not entry_adaptive, log=log)
+                    text, reason, voice_action = screened.text, screened.held, screened.voice_action
+                    preprocessing.update(screened.receipts)
+                    if not shutdown.requested():
                         appended_row = None
-                        hallucinated = looks_hallucinated(text, prepared_seconds)
-                        if hallucinated and not no_speech:
-                            # A loop that starts partway through must not cost
-                            # the user the real dictation in front of it.
-                            salvaged = salvage_repetition_loop(text, prepared_seconds)
-                            if salvaged is not None:
-                                text, trim_receipt = salvaged
-                                preprocessing["repetition_trimmed"] = trim_receipt
-                                log(f"  cut a {trim_receipt['repeats']}x repetition loop "
-                                    f"({trim_receipt['dropped_chars']} chars) — "
-                                    "pasting the clean prefix")
-                                hallucinated = None
-                        reason = hallucinated or no_speech
-                        voice_action = None
-                        if not reason and not entry_adaptive:
-                            text = apply_personal_dictionary(text, preprocessing)
-                            text, voice_action = apply_voice_cleanup(
-                                text, preprocessing,
-                                preprocessing.get("detected_language") or job_config.language)
                         attempt_metadata["latency"]["release_to_text_seconds"] = round(
                             time.monotonic() - queued_at, 4)
                         if shutdown.requested():
@@ -2764,9 +2648,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     detected_language = attempt_metadata.pop("detected_language", None)
                     if detected_language:
                         retry_preprocessing["detected_language"] = detected_language
-                    if (adaptive_runtime is None and text
-                            and not looks_hallucinated(text, len(snapshot.samples) / SAMPLE_RATE)):
-                        text = apply_personal_dictionary(text, retry_preprocessing)
+                    held = None
+                    if adaptive_runtime is None:
+                        # The same guards and cleanup as live dictation. Retry has
+                        # no VAD score (speech_fraction 1.0) and never undoes
+                        # anything, so a "scratch that" result keeps its words.
+                        screened = screen(text, seconds=len(snapshot.samples) / SAMPLE_RATE,
+                                          speech_fraction=1.0,
+                                          language=retry_preprocessing.get("detected_language")
+                                          or job_config.language, log=log)
+                        retry_preprocessing.update(screened.receipts)
+                        text = (retry_preprocessing.pop("voice")["asr_text"]
+                                if screened.voice_action == "scratch" else screened.text)
+                        held = screened.held
+                        if held:
+                            retry_preprocessing["outcome"] = "suspect"
                     attempt_metadata.update({"vad": {"available": None, "speech_fraction": None,
                                                        "span_count": None},
                                              "preprocessing": retry_preprocessing,
@@ -2798,7 +2694,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                 adaptive_runtime.fail_comparator_publication(publication_meta)
                                 raise RuntimeError("comparator publication unavailable")
                         publication_adopted = committed is not None and not shutdown.requested()
-                    if text and committed is not None and not shutdown.requested():
+                    if held and committed is not None:
+                        log(f"↻ retried — not copied ({held}); kept in History")
+                    elif text and committed is not None and not shutdown.requested():
                         ui_call(_copy_text, text)
                         log(f"↻ retried · {len(text)} chars")
                     refresh_history()

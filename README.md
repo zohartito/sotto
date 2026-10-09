@@ -128,8 +128,9 @@ you chose in Settings) for at least
 0.35 seconds, speak a short sentence, then release. Wait for final text before
 changing fields. Compare it with what you said. Sotto uses the clipboard to
 paste and attempts to restore its previous contents; clipboard managers and
-apps may retain what was pasted. In **Settings** you can switch to **Type** (the
-clipboard is never touched) and choose the spacing: **Smart** (default) adds a
+apps may retain what was pasted. In **Settings** you can switch to **Type**
+(dictation never touches the clipboard; History's Copy and Retry put text on it
+on purpose) and choose the spacing: **Smart** (default) adds a
 space before the text only where it would touch the previous word, in apps
 that expose the cursor; elsewhere it adds a space after, like before. Password
 fields are never typed or pasted into.
@@ -165,7 +166,9 @@ before restarting or switching engines.
 
 Recent items in the menu offer Copy, Retry, Save audio to Desktop, Delete,
 Correct Transcript and Clear history. Copy lets you recover text when an app
-refuses paste. A correction can explicitly enroll paired audio/reference in a
+refuses paste. Retry transcribes the saved audio again with the same checks as
+live dictation and copies the new text; text that fails a check stays in
+History only. A correction can explicitly enroll paired audio/reference in a
 local learning corpus; this does not start a worker or enable adaptive routing.
 **Your progress** opens with your all-time total, for example "All time: 12,400
 words · about 4.2 hours saved vs typing at 40 wpm" (counts only, kept in
