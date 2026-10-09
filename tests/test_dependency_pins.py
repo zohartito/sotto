@@ -6,7 +6,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 # Places that bootstrap pip before installing the pinned set.
-PIP_BOOTSTRAPS = ["scripts/install-mac.sh", "scripts/sotto-win.bat", "README.md", "docs/windows-alpha.md"]
+PIP_BOOTSTRAPS = ["scripts/install-mac.sh", "scripts/install-windows.ps1", "scripts/sotto-win.bat",
+                  "README.md", "docs/windows-alpha.md"]
 
 # A package pinned in both the Mac and a Windows lock at different versions must
 # be listed here with the reason; anything else is drift and must be aligned.
@@ -31,7 +32,7 @@ class DependencyPinTests(unittest.TestCase):
         for name in PIP_BOOTSTRAPS:
             text = (ROOT / name).read_text("utf-8")
             self.assertIsNone(re.search(r"--upgrade pip\b", text), f"{name} installs whatever pip is newest")
-            found = re.findall(r"pip install (?:--quiet )?pip==(\d+(?:\.\d+)+)\b", text)
+            found = re.findall(r"pip install (?:--[a-z-]+ )*pip==(\d+(?:\.\d+)+)\b", text)
             self.assertTrue(found, f"{name} no longer installs an exact pip")
             versions.update(found)
         self.assertEqual(len(versions), 1, f"pip versions differ: {sorted(versions)}")
