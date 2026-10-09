@@ -865,9 +865,15 @@ def _audio_devices() -> list[dict]:
         get_data(dev_id, fourcc("lnam"), fourcc("glob"), ref)
         if not ref.value:
             return ""
-        buf = ctypes.create_string_buffer(256)
-        cf.CFStringGetCString(ref, buf, 256, 0x08000100)
-        return buf.value.decode("utf-8", "replace")
+        try:
+            buf = ctypes.create_string_buffer(256)
+            cf.CFStringGetCString(ref, buf, 256, 0x08000100)
+            return buf.value.decode("utf-8", "replace")
+        finally:
+            # kAudioObjectPropertyName hands out a +1 CFStringRef that the
+            # caller owns; the idle device scan runs every 5 s, so an
+            # unreleased name leaked a string per device per scan.
+            cf.CFRelease(ref)
 
     def terminals(dev_id, scope) -> list[int]:
         arr = (ctypes.c_uint32 * 32)()
