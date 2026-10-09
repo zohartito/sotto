@@ -125,6 +125,7 @@ PUBLIC_FILES = sorted(set(RUNTIME_SOURCE_FILES) | set(PUBLIC_TEST_FILES) | set(W
     'teachers/requirements-qwen.txt', 'teachers/requirements-granite.txt',
     '.gitignore', '.github/workflows/secret-scan.yml',
     '.github/workflows/benchmark-gate.yml', '.github/workflows/claude-pr-review.yml',
+    '.github/workflows/tests.yml',
     '.github/workflows-disabled/README.md', '.github/workflows-disabled/ci.yml.disabled',
 })
 

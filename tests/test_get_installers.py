@@ -11,8 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def bare_copy_of_this_checkout(folder: Path) -> Path:
+    """A 'GitHub' whose main branch is the commit checked out here. CI checks
+    out a detached, shallow commit, so push it rather than clone the branches."""
     remote = folder / "remote.git"
-    subprocess.run(["git", "clone", "--quiet", "--bare", str(ROOT), str(remote)], check=True)
+    subprocess.run(["git", "init", "--quiet", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(remote), "config", "receive.shallowUpdate", "true"], check=True)
+    subprocess.run(["git", "-C", str(ROOT), "push", "--quiet", str(remote), "HEAD:refs/heads/main"], check=True)
+    subprocess.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
     return remote
 
 
