@@ -164,6 +164,25 @@ class NemotronTests(unittest.TestCase):
         np.testing.assert_array_equal(runtime.retries[0], prepared.asr_samples)
         self.assertEqual(len(prepared.asr_samples), len(audio))
 
+    def test_a_failed_canonical_retry_keeps_the_exact_bytes_it_heard(self):
+        # Both attempts failed: History and Retry must get the boosted canonical
+        # PCM the engine was given, not audio rebuilt from the raw capture.
+        runtime = FakeRuntime(fail=True)
+
+        def retry_fails(samples):
+            runtime.retries.append(samples.copy())
+            raise RuntimeError("native retry failed")
+        runtime.transcribe = retry_fails
+        capture = StreamingCapture(runtime)
+        audio = np.ones(32000, np.float32) * .02
+        for start in range(0, len(audio), 4096):
+            capture.feed(audio[start:start + 4096], 16000)
+        with self.assertRaises(RuntimeError):
+            capture.finish()
+        self.assertIsNotNone(capture.prepared)
+        np.testing.assert_array_equal(runtime.retries[0], capture.prepared.asr_samples)
+        self.assertEqual(hashlib.sha256(capture.prepared.pcm).hexdigest(), capture.prepared.identity.sha256)
+
     def test_cancellation_and_capture_abort_drop_queued_audio(self):
         runtime = FakeRuntime()
         stream = StreamingCapture(runtime)

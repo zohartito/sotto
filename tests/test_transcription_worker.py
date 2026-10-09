@@ -731,6 +731,32 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         self.assert_kept_for_retry(h, raw, "OSError")
         self.assertEqual(h.nemotron.calls, 0)  # the stream already retried once
 
+    def test_f4_nemotron_failure_keeps_the_canonical_bytes_the_engine_heard(self):
+        heard = prepare_canonical(np.full(32_000, 0.4, dtype=np.float32))  # boosted, unlike raw
+
+        class FailingStream(FakeStream):
+            prepared = heard
+
+            def finish(self):
+                raise OSError("nemotron native stream failed after its canonical retry")
+        kept = []
+
+        def keep(text, prepared, seconds, model, **kw):
+            kept.append(prepared)
+            return {"id": "row1", "text": text, "provenance": kw.get("provenance")}
+        h = Harness(nemotron=True, append=keep)
+        h.run_jobs(h.live_job(speech(2.0), stream=FailingStream("never delivered")))
+        self.assertEqual(len(kept), 1, h.logs)
+        self.assertIs(kept[0], heard)
+
+    def test_f16_a_dead_route_row_that_cannot_be_saved_says_so_once(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        h = Harness(append=disk_full)
+        h.run_jobs(h.live_job(np.zeros(32_000, dtype=np.float32)))
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["History could not be saved"])
+        self.assertEqual(h.injected, [])
+
     def test_f4_after_shutdown_nothing_is_kept_or_shown(self):
         holder: dict = {}
 

@@ -149,10 +149,11 @@ class TranscriptionWorker:
                 stream_text, stream_prepared = stream.finish()
             except Exception as exc:
                 # The native stream and its one canonical retry both failed;
-                # the capture is still in hand, so keep it for Retry (F4).
+                # the capture is still in hand, so keep it for Retry (F4) with
+                # the exact canonical bytes the engine heard, when they exist.
                 self._keep_failed_live_capture(
                     exc, raw=raw, native_rate=native_rate, captured_ts=captured_ts, queued_at=queued_at,
-                    job_config=job_config,
+                    job_config=job_config, prepared=getattr(stream, "prepared", None),
                     preprocessing={"resampled_normalized": True, "vad_trimmed": False,
                                    "silence_collapsed": False, "streaming": True,
                                    "streaming_retry": stream.fallback})
@@ -189,16 +190,20 @@ class TranscriptionWorker:
                             "asr_seconds": 0.0},
             })
             self.log(f"! not pasted ({skip})")
-            finalize_primary_live_delivery(
-                append=lambda: self.coordinator.append_live(
-                    text, prepared, seconds, self.model,
-                    ts=captured_ts, raw_samples=raw,
-                    raw_sample_rate=native_rate,
-                    provenance="live_suspect",
-                    adaptive=False, **attempt_metadata),
-                adaptive_runtime=None,
-                appended_publication=None,
-                shutdown=self.shutdown, inject=None)
+            try:
+                finalize_primary_live_delivery(
+                    append=lambda: self.coordinator.append_live(
+                        text, prepared, seconds, self.model,
+                        ts=captured_ts, raw_samples=raw,
+                        raw_sample_rate=native_rate,
+                        provenance="live_suspect",
+                        adaptive=False, **attempt_metadata),
+                    adaptive_runtime=None,
+                    appended_publication=None,
+                    shutdown=self.shutdown, inject=None)
+            except Exception as exc:
+                self._history_append_failed(exc)  # F16(a): held, nothing to deliver
+                return
             self.refresh_history()
             self.log(f"→ 0.00s · {len(text)} chars")
             return
