@@ -446,6 +446,21 @@ class QuitAndUpdateTest(unittest.TestCase):
         self.assertFalse(any(stopped for stopped, _ in polls))
         self.assertEqual(jobs.unfinished_tasks, 0)
 
+    def test_an_update_held_only_by_an_unread_paste_says_so(self):
+        # A Ctrl+V into a window that never reads it holds Update for up to
+        # RENDER_WAIT_S: "finish the current dictation" was the wrong advice.
+        controller, _jobs = self.controller(busy=False)
+        with mock.patch.object(sotto_win.win_inject, "paste_settling", return_value=True), \
+                mock.patch.object(sotto_win.subprocess, "Popen") as popen, \
+                mock.patch.object(sotto_win, "log"):
+            message = controller.update_and_restart()
+        popen.assert_not_called()
+        self.assertNotIn("Finish the current dictation", message)
+        self.assertIn("paste", message)
+        self.assertIn(f"{sotto_win.win_inject.RENDER_WAIT_S:.0f} seconds", message)
+        with controller.capture_gate.starting() as may_start:
+            self.assertTrue(may_start, "dictation works meanwhile")
+
     def test_a_refused_or_failed_update_reopens_the_gate_but_not_a_restarts(self):
         busy, _jobs = self.controller(busy=True)
         with mock.patch.object(sotto_win.subprocess, "Popen") as popen, \

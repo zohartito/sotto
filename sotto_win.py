@@ -69,6 +69,7 @@ RESTART_DRAIN_CAP_S = 300.0
 # sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
 QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
+UNREAD_PASTE = "a paste the app has not read yet"  # in_flight()'s words for it
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
@@ -500,7 +501,7 @@ class Controller:
         if self.deliveries.unfinished_tasks:
             work.append(f"{self.deliveries.unfinished_tasks} insertion(s)")
         if win_inject.paste_settling():
-            work.append("a paste the app has not read yet")
+            work.append(UNREAD_PASTE)
         return work
 
     def busy(self) -> bool:
@@ -666,8 +667,14 @@ class Controller:
                 return "Sotto is already restarting or quitting."
             self._close_gate("updating")
         try:
-            if self.busy():
+            work = self.in_flight()
+            if work:
                 self._reopen_gate("updating")
+                if work == [UNREAD_PASTE]:
+                    # A Ctrl+V the app never reads holds Update until the
+                    # clipboard is put back, at most RENDER_WAIT_S.
+                    return ("The last paste has not been read by its app yet; "
+                            f"try again in {win_inject.RENDER_WAIT_S:.0f} seconds.")
                 return "Finish the current dictation first, then update."
             root = Path(__file__).resolve().parent
             flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
