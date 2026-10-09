@@ -202,6 +202,28 @@ class RestartTest(unittest.TestCase):
         self.assertTrue(waiting.shutdown.requested())
         self.assertFalse(waiting.restart_requested, "Quit wins over a pending restart")
 
+    def test_restart_and_speed_change_never_abandon_a_slow_dictation(self):
+        # [F30] A long dictation on the CPU outlasts the old 20 s drain deadline;
+        # Restart and a Speed change must still wait for it (deadline shrunk here).
+        for start in ("restart", "speed"):
+            controller, jobs = self.controller(busy=True)
+            controller.speed = "accurate"
+            with mock.patch.object(sotto, "RESTART_DRAIN_DEADLINE_S", 0.2), \
+                    mock.patch.object(sotto_win.user_settings, "save"), \
+                    mock.patch.object(sotto_win, "log"):
+                message = controller.restart() if start == "restart" else controller.set_speed("fast")
+                self.assertIn("after the current dictation", message)
+                time.sleep(0.8)
+                self.assertFalse(controller.shutdown.requested(),
+                                 f"{start}: a dictation still transcribing is never abandoned")
+                jobs.get_nowait()
+                jobs.task_done()
+                deadline = time.monotonic() + 5
+                while not controller.shutdown.requested() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            self.assertTrue(controller.shutdown.requested(), f"{start}: restarts once idle")
+            self.assertTrue(controller.restart_requested)
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
 class ConsoleCloseHandlerTest(unittest.TestCase):

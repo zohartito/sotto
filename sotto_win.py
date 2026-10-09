@@ -509,7 +509,13 @@ class Controller:
 
     # lifecycle
     def restart(self) -> str:
-        """Restart once nothing is in flight (bounded, like the Mac's drained restart)."""
+        """Restart once nothing is in flight.  A dictation being recorded,
+        transcribed or inserted always finishes first, however long the model
+        takes (a long dictation on the CPU can take well over 20 s); Quit still
+        stops at once.
+
+        Side effects: refuses new captures from now on; requests shutdown once idle.
+        """
         if self.shutdown.requested():
             return "Sotto is already stopping."
         if self.restart_requested:
@@ -522,8 +528,7 @@ class Controller:
             return "Restarting…"
 
         def when_idle() -> None:
-            deadline = time.monotonic() + sotto.RESTART_DRAIN_DEADLINE_S
-            while self.busy() and time.monotonic() < deadline and not self.shutdown.requested():
+            while self.busy() and not self.shutdown.requested():
                 time.sleep(0.1)
             if self.restart_requested:
                 log("● restarting after the current dictation")

@@ -159,8 +159,8 @@ Right-click the tray icon (left-click opens Settings):
 - **Speed** — Accurate or Fast; switching restarts Sotto once the current
   dictation is done.
 - **Progress** — see below. **Dictionary** — opens your dictionary in Notepad.
-- **Settings…**, **Restart** (finishes a dictation in flight first and ignores
-  new presses meanwhile), **Quit**.
+- **Settings…**, **Restart** (finishes a dictation in flight first, however
+  long the model takes, and ignores new presses meanwhile), **Quit**.
 
 Opening the tray menu takes the focus away from the app you were dictating
 into, so a dictation finished with **Finish dictation** is copied to the
