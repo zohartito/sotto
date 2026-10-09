@@ -258,6 +258,17 @@ class UpdateOrderTests(unittest.TestCase):
         self.assertIn("source was not switched", result.stderr)
         self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.old)
 
+    def test_a_copy_that_is_not_a_git_clone_refuses_to_update(self):
+        copy = self.user.parent / "archive-copy"
+        shutil.copytree(self.user, copy, ignore=shutil.ignore_patterns(".git"))
+        result = subprocess.run(["/bin/bash", str(copy / "scripts/install-mac.sh"), "--update",
+                                 "--python", str(copy / "venv-alpha/bin/python")],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a git clone", result.stderr)
+        self.assertNotIn("Done.", result.stdout)
+        self.assertFalse(self.log.exists())  # no package install ran
+
     def test_new_packages_are_installed_then_the_source_moves(self):
         result = self.update()
         self.assertEqual(result.returncode, 0, result.stderr)

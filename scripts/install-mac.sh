@@ -71,7 +71,7 @@ if [ "$MODE" = update ]; then
         done
         REQUIREMENTS="$NEXT_REQUIREMENTS/requirements-alpha.txt"
     else
-        echo "This folder is not a git clone: extract the new source archive, then run this script from it."
+        fail "This folder is not a git clone, so it cannot update itself. Download the new source archive and run scripts/install-mac.sh from it."
     fi
 fi
 
