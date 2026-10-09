@@ -952,9 +952,22 @@ class LearningCoordinator:
                 marker=entry.get("silver_enqueue")
                 if isinstance(marker,dict) and marker.get("history_revision") == old_revision and marker.get("state") != "released":
                     marker["state"]="released"; marker_changed=True
+            # Delete (or an untargeted intent) revokes every sample for the
+            # row.  Otherwise keep only consent given after the mutation
+            # completed: a sample enrolled at a strictly newer revision.  A
+            # sample at or before the staged revision, or with no valid
+            # revision, is pre-mutation evidence and is revoked.
+            def staged_or_older(revision: Any) -> bool:
+                return (operation == "delete" or old_revision is None or isinstance(revision,bool)
+                        or not isinstance(revision,int) or revision <= old_revision)
             for record in list(self.learning.active_for_history(history_id)):
-                self.learning.revoke(record["sample_id"])
-            self.learning.clear_pending_gold(history_id)
+                if staged_or_older(record.get("history_revision")):
+                    self.learning.revoke(record["sample_id"])
+            # Pending gold carries no revision and enrolls whatever revision
+            # is current, so it survives only when History has moved past the
+            # staged revision.
+            if entry is None or staged_or_older(entry.get("revision")):
+                self.learning.clear_pending_gold(history_id)
             if operation == "delete" and entry is not None and old_revision is not None and entry.get("revision") == old_revision:
                 self.history._delete_locked(history_id)
                 return
