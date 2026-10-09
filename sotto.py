@@ -73,6 +73,8 @@ RESTORE_DELAY_S = 3.0
 TRANSIENT_PASTEBOARD_TYPE = "org.nspasteboard.TransientType"
 DELIVERY_POLL_S = 0.15           # re-check a held key this often before pasting
 DELIVERY_WAIT_MAX_S = 30.0       # key held, no recording: give up, the text stays in History
+# The drop note for a dictation History could not keep (F16a/F16b, N16).
+NOT_IN_HISTORY_EITHER = "History could not save it either; please dictate again."
 SOTTO_EVENT_TAG = 0x534F5454     # "SOTT" in kCGEventSourceUserData on every key event Sotto posts
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
@@ -2208,7 +2210,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
     declined it — only a real insert may arm "scratch that"."""
     global _restore_generation, _pending_restore
     if secure_input_active():
-        log("! secure input active — not inserting; transcript kept in history")
+        log("! secure input active — not inserting")
         return False
 
     text = compose_insertion(text, spacing, character_before_caret() if spacing == "smart" else None)
@@ -2318,8 +2320,10 @@ class DeliveryQueue:
         self._blocked_since: float | None = None
         self.last_delivery: dict | None = None  # the insert "scratch that" may undo
 
-    def paste(self, text: str) -> None:
-        self._items.append(("paste", text))
+    def paste(self, text: str, in_history: bool = True) -> None:
+        """in_history is False when History could not keep this dictation
+        (F16a/F16b): then no note may send the user to History for it."""
+        self._items.append(("paste", text, in_history))
         self._pump()
 
     def undo(self) -> None:
@@ -2342,14 +2346,15 @@ class DeliveryQueue:
             item = self._items.pop(0)
             try:
                 if item[0] == "paste":
-                    self._deliver(item[1])
+                    self._deliver(item[1], item[2])
                 else:
                     self._undo()
             except Exception as exc:  # one failed insert must not strand the items behind it
                 self._log(f"! {item[0]} failed ({type(exc).__name__}: {str(exc)[:160]})")
                 if item[0] == "paste":
                     self._note("Could not paste the dictation",
-                               "It is in History. Open History to copy the text.")
+                               "It is in History. Open History to copy the text." if item[2]
+                               else NOT_IN_HISTORY_EITHER)
             finally:
                 self._on_done()
 
@@ -2367,13 +2372,18 @@ class DeliveryQueue:
             self._blocked_since = now
         elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
             dropped = sum(1 for item in self._items if item[0] == "paste")
+            unsaved = sum(1 for item in self._items if item[0] == "paste" and not item[2])
             self._discard_all()
             self._blocked_since = None
             self._waiting = False
-            self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — "
-                      f"{dropped} dictation(s) not pasted, kept in History")
-            self._note("Dictation kept in History",
-                       "A key was held for too long to paste it. Open History to copy the text.")
+            self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — {dropped} dictation(s) "
+                      f"not pasted, " + (f"{unsaved} not in History" if unsaved else "kept in History"))
+            if unsaved:
+                self._note("Dictation not pasted",
+                           f"A key was held for too long to paste it. {NOT_IN_HISTORY_EITHER}")
+            else:
+                self._note("Dictation kept in History",
+                           "A key was held for too long to paste it. Open History to copy the text.")
             return
         if not self._waiting:
             self._waiting = True
@@ -2399,10 +2409,14 @@ class DeliveryQueue:
         self._poll_armed = False
         self._pump()
 
-    def _deliver(self, text: str) -> None:
+    def _deliver(self, text: str, in_history: bool = True) -> None:
         pid, keydowns = self._frontmost_pid(), self._keydowns()  # the paste target, before ⌘V
         if self._insert(text):  # a secure-input decline inserted nothing: arm no undo
             self.last_delivery = {"at": self._clock(), "pid": pid, "keydowns": keydowns}
+        else:  # N34: every other drop path tells the user, so this one does too
+            self._note("Dictation not pasted",
+                       "Secure input is on (a password field may have focus), so Sotto did not "
+                       "paste. " + ("Open History to copy the text." if in_history else NOT_IN_HISTORY_EITHER))
 
     def _undo(self) -> None:
         """'scratch that': the app's own ⌘Z, only for Sotto's own recent insert —
@@ -3160,9 +3174,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     # deliver_call counts each of these in pending_deliveries when it schedules
     # it; the queue's on_done finishes that entry once the item is delivered,
     # dropped or cleared, so Quit and the update restart wait for the paste.
-    def inject_when_clear(text: str, _attempts: int = 0) -> None:
+    def inject_when_clear(text: str, _attempts: int = 0, in_history: bool = True) -> None:
         """Queue a finished dictation for the cursor (worker call shape kept)."""
-        delivery.paste(text)
+        delivery.paste(text, in_history)
 
     def undo_when_clear(_attempts: int = 0) -> None:
         """Queue a 'scratch that' behind whatever is still waiting to paste."""

@@ -70,6 +70,8 @@ class TranscriptionWorker:
         self._publication = None
         self._publication_adopted = False
         self._publication_committed = False
+        # The History row the live job in flight got back (None until then).
+        self._live_row = None
 
     def run(self) -> None:
         """The worker loop. Blocks until shutdown is requested.
@@ -84,6 +86,7 @@ class TranscriptionWorker:
             self._publication = None
             self._publication_adopted = False
             self._publication_committed = False
+            self._live_row = None
             try:
                 if self.shutdown.requested():
                     continue
@@ -371,10 +374,11 @@ class TranscriptionWorker:
                 if self.shutdown.requested():
                     return
                 deliver = ((lambda: self.deliver_call(self.undo_when_clear, 0)) if voice_action == "scratch"
-                           else (lambda: self.deliver_call(self.inject_when_clear, text, 0)) if text else None)
+                           else (lambda: self.deliver_call(self.inject_when_clear, text, 0, self._in_history()))
+                           if text else None)
                 try:
                     appended_row = finalize_primary_live_delivery(
-                        append=lambda: self.coordinator.append_live(
+                        append=lambda: self._append_live(
                             text, prepared, prepared_seconds, actual_model, ts=captured_ts,
                             raw_samples=raw, raw_sample_rate=native_rate,
                             provenance="live", adaptive=entry_adaptive,
@@ -400,6 +404,17 @@ class TranscriptionWorker:
             discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
         self.log(f"→ {time.monotonic() - queued_at:.2f}s after release "
                  f"(speech model {elapsed:.2f}s) · {len(text)} chars")
+
+    def _append_live(self, *args, **kwargs):
+        """coordinator.append_live, remembering the row it hands back."""
+        self._live_row = self.coordinator.append_live(*args, **kwargs)
+        return self._live_row
+
+    def _in_history(self) -> bool:
+        """Did History really keep this live job's row? None when the append
+        failed (F16a); read-only History hands back a row marked ``saved``
+        False (F16b)."""
+        return self._live_row is not None and self._live_row.get("saved") is not False
 
     def _keep_failed_live_capture(self, exc: Exception, *, raw, native_rate, captured_ts, queued_at,
                                   job_config, preprocessing: dict, prepared=None, vad_metadata=None) -> None:

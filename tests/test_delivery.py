@@ -672,6 +672,59 @@ class EventTapCallbackTests(unittest.TestCase):
         self.assertEqual(tap.user_keydowns["count"], 3)
 
 
+# -- round 2: every way a paste can fail to land is told truthfully ---------------
+
+class UndeliveredPasteNoteTests(unittest.TestCase):
+    def test_n16_a_long_hold_drop_of_text_history_did_not_save_does_not_claim_history(self):
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
+        world.queue.paste("result-1 ", in_history=False)     # F16a: the append failed
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(len(world.notes), 1, world.notes)
+        title, message = world.notes[0]
+        self.assertNotIn("kept in History", title + message)
+        self.assertNotIn("Open History", message)
+        self.assertFalse(any("kept in History" in line for line in world.logs), world.logs)
+
+    def test_n16_a_long_hold_drop_of_saved_text_still_points_at_history(self):
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
+        world.queue.paste("result-1 ")
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(world.notes, [("Dictation kept in History",
+                                        "A key was held for too long to paste it. "
+                                        "Open History to copy the text.")])
+
+    def test_n16_a_failed_insert_of_unsaved_text_does_not_claim_history(self):
+        world = DeliveryQueueHarness()
+        world.on_insert = lambda text: (_ for _ in ()).throw(RuntimeError("pasteboard busy"))
+        world.queue.paste("result-1 ", in_history=False)
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertNotIn("It is in History", world.notes[0][1])
+
+    def test_n34_a_secure_input_decline_tells_the_user_once(self):
+        world = DeliveryQueueHarness()
+        world.inserts_ok = False                              # a password field had focus
+        world.queue.paste("my dictation")
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertIn("Secure input", world.notes[0][1])
+        self.assertIn("History", world.notes[0][1])
+
+    def test_n34_an_unsaved_decline_does_not_claim_history(self):
+        world = DeliveryQueueHarness()
+        world.inserts_ok = False
+        world.queue.paste("my dictation", in_history=False)
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertNotIn("Open History", world.notes[0][1])
+
+    def test_inject_when_clear_forwards_whether_the_text_is_in_history(self):
+        pasted = []
+        namespace = {"delivery": types.SimpleNamespace(
+            paste=lambda text, in_history=True: pasted.append((text, in_history)))}
+        inject_when_clear = run_closures(["inject_when_clear"], namespace)["inject_when_clear"]
+        inject_when_clear("saved ", 0)
+        inject_when_clear("unsaved ", 0, False)
+        self.assertEqual(pasted, [("saved ", True), ("unsaved ", False)])
+
+
 class OwnAlertInFrontTests(unittest.TestCase):
     """N24: Sotto's alerts activate Sotto, and callAfter keeps running during
     their modal loop (repro/N24_repro.py), so a paste must wait instead of

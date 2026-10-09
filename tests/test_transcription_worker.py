@@ -151,7 +151,7 @@ class Harness:
             self.copied.append(text)
         copy_text.__name__ = "_copy_text"
 
-        def inject_when_clear(text, attempts):
+        def inject_when_clear(text, attempts, in_history=True):
             self.injected.append(text)
 
         def undo_when_clear(attempts):
@@ -793,6 +793,27 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         h = holder["harness"] = Harness(says("Please call me back at four"), append=disk_full_after_shutdown)
         h.run_jobs(h.live_job(speech(2.0)))
         self.assertEqual((h.injected, h.status_ui.errors), ([], []))
+
+
+def read_only_history():
+    """What History hands back while history.jsonl is unreadable (F16b)."""
+    return sotto.UnsavedHistory(types.SimpleNamespace(unreadable="damaged line 3"), None).append_live
+
+
+class RoundTwoWorkerTests(TemporaryUserFiles, unittest.TestCase):
+    """F4b, N10, N16, N17 and N19: a live job or a Retry that fails anywhere is
+    kept or reported once, and nothing claims History holds what it does not."""
+
+    def test_n16_the_paste_knows_whether_history_saved_the_text(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        saved = Harness(says("Please call me back at four"))
+        failed = Harness(says("Please call me back at four"), append=disk_full)
+        read_only = Harness(says("Please call me back at four"), append=read_only_history())
+        for h in (saved, failed, read_only):
+            h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual([h.delivered[0][1][2:] for h in (saved, failed, read_only)],
+                         [(True,), (False,), (False,)])
 
 
 if __name__ == "__main__":
