@@ -139,6 +139,16 @@ class SignalStopTests(unittest.TestCase):
         self.assertLessEqual(world.clock(), sotto.SIGTERM_DRAIN_S + 0.5)
         self.assertLess(sotto.SIGTERM_DRAIN_S, 5.0)
 
+    def test_sigterm_during_a_menu_quit_still_fits_launchds_window(self):
+        world = World(frozen=True)
+        world.busy.set()
+        threading.Thread(target=world.lifecycle.watch_signals, daemon=True).start()
+        self.assertTrue(world.lifecycle.quit())          # the menu's Quit: 10 s
+        world.shutdown.request_stop(signal.SIGTERM)      # then logout / launchd
+        time.sleep(0.05)
+        world.clock.now = sotto.SIGTERM_DRAIN_S + 0.2
+        self.assertTrue(world.shutdown.event.wait(1.0), "SIGTERM left the 10 s Quit drain in place")
+
     def test_ctrl_c_waits_like_quit(self):
         world = World()
         world.busy.set()
@@ -362,7 +372,7 @@ class WarmupIsNotDictationTests(unittest.TestCase):
 
 class TeardownTests(unittest.TestCase):
     def wire(self, *, foreground=False, exec_error=None, worker_job=None, worker_alive=False,
-             queued=()):
+             queued=(), abandoned=(), failed_raises=False):
         self.events, self.exits, self.kept, self.failed = [], [], [], []
         shutdown = sotto.ShutdownBoundary()
         shutdown.request()
@@ -381,6 +391,8 @@ class TeardownTests(unittest.TestCase):
 
             def failed(self, message):
                 test.failed.append(message)
+                if failed_raises:
+                    raise OSError(28, "No space left on device")  # restoring the engine choice
 
         class Thread:
             def join(self, timeout=None):
@@ -389,7 +401,7 @@ class TeardownTests(unittest.TestCase):
             def is_alive(self):
                 return worker_alive
 
-        worker = types.SimpleNamespace(current_job=worker_job,
+        worker = types.SimpleNamespace(current_job=worker_job, abandoned=list(abandoned),
                                        keep_untranscribed=lambda job: self.kept.append(job))
         capture = types.SimpleNamespace(abort=lambda: None, shutdown=lambda: None,
                                         wait_released=lambda timeout: True)
@@ -436,11 +448,20 @@ class TeardownTests(unittest.TestCase):
         stop()
         self.assertEqual(self.kept, [live])
 
-    def test_n9_a_capture_the_worker_finished_is_not_kept_twice(self):
+    def test_n9_a_capture_the_worker_finished_meanwhile_is_still_handed_over(self):
+        # The model returned after shutdown and its result was fenced: only
+        # the worker's keep knows whether that capture was saved (it settles
+        # each capture once), so the teardown always hands it over.
         live = ("live", "raw", 48000.0, 1.0, 2.0, "cap3", None, None)
         stop, _ = self.wire(worker_job=live, worker_alive=False)
         stop()
-        self.assertEqual(self.kept, [])
+        self.assertEqual(self.kept, [live])
+
+    def test_n9_a_capture_the_worker_abandoned_before_the_teardown_is_kept(self):
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap4", None, None)
+        stop, _ = self.wire(abandoned=[live])
+        stop()
+        self.assertEqual(self.kept, [live])
 
     def test_n27_a_failed_exec_exits_so_launchd_starts_sotto_again(self):
         for error in (OSError(7, "Argument list too long"), IndexError("tuple index out of range")):
@@ -450,6 +471,53 @@ class TeardownTests(unittest.TestCase):
                 self.assertTrue(self.failed, "the failure callback (engine choice restore) did not run")
                 self.assertEqual(self.exits, [sotto.RESTART_FAILED_EXIT])
                 self.assertNotEqual(sotto.RESTART_FAILED_EXIT, 0)  # KeepAlive: SuccessfulExit false
+
+    def test_n27_a_failure_callback_that_raises_still_exits(self):
+        stop, _ = self.wire(foreground=True, exec_error=OSError(8, "Exec format error"), failed_raises=True)
+        stop()
+        self.assertEqual(self.exits, [sotto.RESTART_FAILED_EXIT])
+
+
+class FinishAtShutdownTests(unittest.TestCase):
+    """N9 (Codex): the audio is in hand between capture.end() and the
+    enqueue; shutdown in that window must not lose it."""
+
+    def test_a_capture_refused_by_the_queue_is_kept(self):
+        kept, ui = [], []
+        raw = sotto.np.full(48_000, 0.1, dtype=sotto.np.float32)
+        shutdown, jobs = sotto.ShutdownBoundary(), queue.Queue()
+
+        def end(include_stream):
+            shutdown.request()  # the Quit drain ran out while the audio was being joined
+            return raw, None
+        capture = types.SimpleNamespace(end=end, release_soon=lambda: None, native_rate=48_000.0)
+        namespace = {
+            "shutdown": shutdown, "capture": capture, "jobs": jobs, "status_ui": None,
+            "ui_call": lambda *a: ui.append(a), "log": lambda line: None, "time": time,
+            "uuid": sotto.uuid, "current_speech_config": lambda: "config",
+            "pending_deliveries": sotto.PendingDeliveries(),
+            "worker": types.SimpleNamespace(keep_untranscribed=kept.append),
+        }
+        closures(["on_finish", "finish_capture"], namespace)["on_finish"]()
+        self.assertEqual(len(kept), 1, "the recording in hand was dropped")
+        self.assertEqual(kept[0][0], "live")
+        self.assertIs(kept[0][1], raw)
+        self.assertEqual(jobs.unfinished_tasks, 0)
+
+    def test_a_capture_discarded_by_the_enqueue_race_is_kept(self):
+        kept, jobs = [], queue.Queue()
+
+        class LateShutdown(sotto.ShutdownBoundary):
+            def requested(self):
+                answer = jobs.qsize() > 1  # shutdown lands right after the put
+                if answer:
+                    self.request()
+                return answer
+        live = ("live", "raw", 48_000.0, 1.0, 2.0, "cap5", None, None)
+        jobs.put(("live", "older", 48_000.0, 1.0, 2.0, "cap6", None, None))
+        self.assertFalse(LateShutdown().enqueue(jobs, live, keep=kept.append))
+        self.assertEqual([job[5] for job in kept], ["cap6", "cap5"])
+        self.assertEqual(jobs.unfinished_tasks, 0)
 
 
 if __name__ == "__main__":

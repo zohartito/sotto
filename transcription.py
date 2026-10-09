@@ -17,6 +17,7 @@ so there is no cycle at load whichever module is imported first.
 from __future__ import annotations
 
 import queue
+import threading
 import time
 
 
@@ -72,8 +73,15 @@ class TranscriptionWorker:
         self._publication = None
         self._publication_adopted = False
         self._publication_committed = False
-        # The job being run, for the teardown's keep_untranscribed (N9).
+        # The job being run, and the live captures it gave up on because
+        # shutdown came first: the teardown keeps both (N9).
         self.current_job = None
+        self.abandoned: list = []
+        # Capture ids whose fate is decided — saved here, dropped as a tap,
+        # or kept by the teardown — so no capture is ever saved twice.
+        self._settled: set[str] = set()
+        self._settle_lock = threading.Lock()
+        self._live_id = None
 
     def run(self) -> None:
         """The worker loop. Blocks until shutdown is requested.
@@ -91,8 +99,6 @@ class TranscriptionWorker:
             self.current_job = job
             try:
                 if self.shutdown.requested():
-                    if job[0] == "live":
-                        self.keep_untranscribed(job)  # taken just as shutdown came (N9)
                     continue
                 if job[0] == "stream-audio":
                     self._stream_audio(job)
@@ -114,6 +120,8 @@ class TranscriptionWorker:
                     self.adaptive_runtime.cancel_comparator_publication({"comparator_publication": self._publication})
                 if self.status_ui is not None and job[0] not in {"stream-audio", "stream-close"}:
                     self.ui_call(self.status_ui.hide_if_transcribing)
+                if job[0] == "live" and self.shutdown.requested():
+                    self.abandoned.append(job)  # kept by the teardown unless saved here
                 self.current_job = None
                 self.jobs.task_done()
 
@@ -149,6 +157,7 @@ class TranscriptionWorker:
         ``deliver_call``, records progress totals, refreshes the History menu, logs.
         Nothing is appended, delivered or persisted once shutdown is requested."""
         _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, stream = job
+        self._live_id = capture_id
         started = time.monotonic()
         stream_prepared = None
         stream_text = None
@@ -173,6 +182,7 @@ class TranscriptionWorker:
         seconds = len(samples) / SAMPLE_RATE
         if seconds < 0.2:
             self.log("○ sub-0.2s capture dropped (key-tap artifact)")
+            self._settle(capture_id)
             return
         skip = asr_skip_reason(samples)
         if skip:
@@ -200,7 +210,7 @@ class TranscriptionWorker:
             self.log(f"! not pasted ({skip})")
             try:
                 finalize_primary_live_delivery(
-                    append=lambda: self.coordinator.append_live(
+                    append=lambda: self._append_live(
                         text, prepared, seconds, self.model,
                         ts=captured_ts, raw_samples=raw,
                         raw_sample_rate=native_rate,
@@ -361,7 +371,7 @@ class TranscriptionWorker:
                 preprocessing["outcome"] = "suspect"
                 try:
                     appended_row = finalize_primary_live_delivery(
-                        append=lambda: self.coordinator.append_live(
+                        append=lambda: self._append_live(
                             text, prepared, prepared_seconds, actual_model,
                             ts=captured_ts, raw_samples=raw,
                             raw_sample_rate=native_rate, provenance="live_suspect",
@@ -382,7 +392,7 @@ class TranscriptionWorker:
                            else (lambda: self.deliver_call(self.inject_when_clear, text, 0)) if text else None)
                 try:
                     appended_row = finalize_primary_live_delivery(
-                        append=lambda: self.coordinator.append_live(
+                        append=lambda: self._append_live(
                             text, prepared, prepared_seconds, actual_model, ts=captured_ts,
                             raw_samples=raw, raw_sample_rate=native_rate,
                             provenance="live", adaptive=entry_adaptive,
@@ -434,7 +444,7 @@ class TranscriptionWorker:
         })
         try:
             finalize_primary_live_delivery(
-                append=lambda: self.coordinator.append_live(
+                append=lambda: self._append_live(
                     TRANSCRIPTION_FAILED_TEXT, prepared, seconds, self.model, ts=captured_ts,
                     raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
                     adaptive=False, **attempt_metadata),
@@ -455,8 +465,11 @@ class TranscriptionWorker:
         Unlike every other append this runs after shutdown is requested; the
         teardown calls it only for captures nothing else will save.
 
-        Side effects: appends that row with the raw audio; logs. Never raises."""
-        _, raw, native_rate, captured_ts, queued_at, _capture_id, job_config, _stream = job
+        Side effects: appends that row with the raw audio; logs. Never raises.
+        Nothing when this capture was already saved or kept."""
+        _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, _stream = job
+        if not self._settle(capture_id):
+            return
         try:
             from audio_codec import prepare_canonical
             prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
@@ -479,6 +492,22 @@ class TranscriptionWorker:
             return
         self.log(f"○ {len(raw) / max(native_rate, 1.0):.1f}s capture not transcribed before "
                  "stopping — kept in History for Retry")
+
+    def _settle(self, capture_id) -> bool:
+        """Claim a live capture's one History row; False if already claimed."""
+        with self._settle_lock:
+            if capture_id in self._settled:
+                return False
+            self._settled.add(capture_id)
+            return True
+
+    def _append_live(self, *args, **kwargs):
+        """coordinator.append_live for the live capture in hand, unless the
+        teardown already kept it (a model that returned too late): then None,
+        so nothing is registered or delivered."""
+        if not self._settle(self._live_id):
+            return None
+        return self.coordinator.append_live(*args, **kwargs)
 
     def _history_append_failed(self, exc: Exception, deliver=None) -> None:
         """History could not take the live row (F16a): disk full, a locked or

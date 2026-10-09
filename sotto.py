@@ -82,6 +82,7 @@ QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up t
 # keeps what is left in History before that.
 SIGTERM_DRAIN_S = 2.0
 SIGTERM_RESTORE_WAIT_S = 1.0
+DRAIN_POLL_S = 0.1               # how often a Quit/Restart drain re-checks the dictation
 # A foreground restart that cannot exec exits with this status, never 0:
 # KeepAlive {SuccessfulExit: false} (the login item, the sealed LaunchAgent)
 # then starts Sotto again instead of leaving the user without it.
@@ -124,13 +125,17 @@ class ShutdownBoundary:
         self.stop_signal = signum
         self.stop_event.set()
 
-    def enqueue(self, jobs: queue.Queue, job: tuple) -> bool:
-        """Queue work only while live; race with shutdown is discarded below."""
+    def enqueue(self, jobs: queue.Queue, job: tuple, keep=None) -> bool:
+        """Queue work only while live; race with shutdown is discarded below.
+        ``keep`` is handed a live capture that is refused or discarded, as in
+        discard_queued, so its audio can stay in History (N9)."""
         if self.requested():
+            if keep is not None and job[0] == "live":
+                keep(job)
             return False
         jobs.put(job)
         if self.requested():
-            self.discard_queued(jobs)
+            self.discard_queued(jobs, keep=keep)
             return False
         return True
 
@@ -751,6 +756,7 @@ class Lifecycle:
         self.busy = busy                    # -> whether a dictation is in flight
         self.clock, self.sleep = clock, sleep
         self.closed: str | None = None
+        self._quit_by = 0.0
         self._lock = threading.Lock()
 
     def close(self, reason: str) -> bool:
@@ -789,12 +795,19 @@ class Lifecycle:
         Side effects: closes the gate as "quitting"; ends the recording in
         progress; requests shutdown from a thread once idle or out of time."""
         with self._lock:
-            if self.shutdown.requested() or self.closed == "quitting":
+            if self.shutdown.requested():
+                return False
+            stop_by = self.clock() + deadline_s
+            if self.closed == "quitting":
+                # Already draining: a SIGTERM after the menu's Quit must still
+                # stop inside launchd's window, so the sooner deadline wins.
+                self._quit_by = min(self._quit_by, stop_by)
                 return False
             self.closed = "quitting"
+            self._quit_by = stop_by
             self.capture_gate.close()
         self._finish_recording("quitting")
-        self._drain_then("quitting", deadline_s, self.shutdown.request)
+        self._drain_then("quitting", lambda: self._quit_by, self.shutdown.request)
         return True
 
     def restart(self, request_restart) -> bool:
@@ -808,7 +821,8 @@ class Lifecycle:
         def restart_unless_quitting() -> None:
             if self.closed == "restarting":
                 request_restart(after_failure=lambda: self.reopen("restarting"))
-        self._drain_then("restarting", QUIT_DRAIN_S, restart_unless_quitting)
+        stop_by = self.clock() + QUIT_DRAIN_S
+        self._drain_then("restarting", lambda: stop_by, restart_unless_quitting)
         return True
 
     def watch_signals(self) -> None:
@@ -826,13 +840,18 @@ class Lifecycle:
         if ended:
             log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} before {verb}")
 
-    def _drain_then(self, verb: str, deadline_s: float, then) -> None:
+    def _drain_then(self, verb: str, stop_by, then) -> None:
+        """From a thread: wait while busy, until the clock reaches ``stop_by()``
+        (re-read every poll), then call ``then``."""
         def work() -> None:
+            started = self.clock()
             try:
-                if not wait_until_idle(lambda: self.busy() and not self.shutdown.requested(),
-                                       deadline_s=deadline_s, clock=self.clock, sleep=self.sleep):
-                    log(f"! dictation still running after {deadline_s:.0f}s — {verb} anyway; "
-                        "its audio stays in History")
+                while self.busy() and not self.shutdown.requested():
+                    if self.clock() >= stop_by():
+                        log(f"! dictation still running after {self.clock() - started:.0f}s — "
+                            f"{verb} anyway; its audio stays in History")
+                        break
+                    self.sleep(DRAIN_POLL_S)
             except Exception as exc:
                 log(f"! {verb} without waiting: {str(exc)[:160]}")
             finally:
@@ -3186,8 +3205,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             return
         if status_ui:
             ui_call(status_ui.show_transcribing)
+        # Shutdown may come while the audio is in hand: keep it in History (N9).
         shutdown.enqueue(jobs, ("live", raw, capture.native_rate, captured_ts,
-                                released_at, uuid.uuid4().hex, current_speech_config(), stream))
+                                released_at, uuid.uuid4().hex, current_speech_config(), stream),
+                         keep=worker.keep_untranscribed)
 
     def on_discard() -> None:
         capture.abort()
@@ -3457,17 +3478,20 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     def keep_untranscribed() -> None:
         """A capture still untranscribed at teardown stays in History with its
-        audio (N9), for Retry: every queued live capture, and the one the
-        worker is still on unless it finishes within APP_DRAIN_TIMEOUT (it
-        then appends nothing, shutdown fences it, so it is kept once).
+        audio (N9), for Retry: every queued live capture, the one the worker
+        is on (given APP_DRAIN_TIMEOUT to finish an append already under way)
+        and any it gave up on because shutdown came first. The worker settles
+        each capture once, so one it saved is never kept again, and a model
+        that returns after this keep saves nothing.
 
         Side effects: History rows; may join the worker briefly; logs."""
         shutdown.discard_queued(jobs, keep=worker.keep_untranscribed)
         running = worker.current_job
         if running is not None and running[0] == "live":
             transcription_thread.join(APP_DRAIN_TIMEOUT)
-            if transcription_thread.is_alive() and worker.current_job is running:
-                worker.keep_untranscribed(running)
+            worker.keep_untranscribed(running)
+        for job in list(worker.abandoned):
+            worker.keep_untranscribed(job)
 
     def stop_runtime_on_main() -> None:
         """Main-loop teardown once shutdown is requested (Quit and the signal
@@ -3523,7 +3547,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 # Sotto again; exit 0 would be a Quit it leaves alone, and an
                 # alert queued now would never be shown.
                 restart.foreground_pending = False
-                restart.failed(f"foreground restart failed ({type(exc).__name__}: {str(exc)[:120]})")
+                try:
+                    restart.failed(f"foreground restart failed ({type(exc).__name__}: {str(exc)[:120]})")
+                except Exception as callback_exc:
+                    log(f"! restart failure handling failed: {str(callback_exc)[:120]}")
                 log(f"! exiting with status {RESTART_FAILED_EXIT} so launchd can start Sotto again; "
                     "from a terminal, run the command again")
                 os._exit(RESTART_FAILED_EXIT)

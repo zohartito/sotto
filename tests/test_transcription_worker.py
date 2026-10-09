@@ -829,10 +829,42 @@ class UntranscribedAtShutdownTests(TemporaryUserFiles, unittest.TestCase):
                 h.shutdown.request()  # shutdown lands between the get and the check
                 return job
         h.jobs = h.worker.jobs = ShutdownOnGet()
-        h.jobs.put(h.live_job(raw))
+        job = h.live_job(raw)
+        h.jobs.put(job)
         h.run()
-        self.assertEqual([row["text"] for row in h.coordinator.appended], ["[not transcribed: Sotto stopped]"])
+        self.assertEqual(h.worker.abandoned, [job])  # the teardown keeps it
         self.assertEqual((h.jobs.unfinished_tasks, h.worker.current_job), (0, None))
+
+    def test_a_result_fenced_by_shutdown_is_left_for_the_teardown_to_keep(self):
+        holder: dict = {}
+
+        def finish_then_shutdown(samples, **kwargs):
+            holder["harness"].shutdown.request()
+            return {"text": "Please call me back at four", "segments": []}
+        h = holder["harness"] = Harness(finish_then_shutdown)
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        self.assertEqual(h.coordinator.appended, [])      # nothing committed after shutdown
+        self.assertEqual(h.worker.abandoned, [job])
+        h.worker.keep_untranscribed(job)
+        self.assertEqual([row["text"] for row in h.coordinator.appended],
+                         ["[not transcribed: Sotto stopped]"])
+
+    def test_a_saved_capture_is_never_kept_again(self):
+        h = Harness(says("Please call me back at four"))
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        h.worker.keep_untranscribed(job)  # the teardown hands it over anyway
+        self.assertEqual([row["text"] for row in h.coordinator.appended], ["Please call me back at four"])
+
+    def test_a_kept_capture_is_never_saved_again_by_a_late_model(self):
+        h = Harness(says("Please call me back at four"))
+        job = h.live_job(speech(2.0))
+        h.worker.keep_untranscribed(job)  # the teardown kept it while the model ran
+        h.run_jobs(job)
+        self.assertEqual([row["text"] for row in h.coordinator.appended],
+                         ["[not transcribed: Sotto stopped]"])
+        self.assertEqual(h.injected, [])
 
     def test_the_running_job_is_visible_to_the_teardown(self):
         seen = {}
