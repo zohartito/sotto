@@ -1844,6 +1844,26 @@ class ConsoleLogTest(unittest.TestCase):
         print("after drain", file=sink)  # written directly once the writer has stopped
         self.assertTrue("".join(written).endswith("after drain\n"), written)
 
+    def test_a_log_that_grows_past_its_limit_rotates_while_sotto_runs(self):
+        # [N36] sotto.log rotated only at startup, so a long session grew it without bound.
+        line = "○ 0.98s captured · 12 chars\n"
+        with tempfile.TemporaryDirectory(prefix="sotto-win-log-") as temporary, \
+                mock.patch.object(sotto_win, "DATA_DIR", Path(temporary)), \
+                mock.patch.object(sotto_win, "LOG_ROTATE_BYTES", 200), \
+                mock.patch.object(sys, "stderr", None):
+            sink = sotto_win._ConsoleLog()
+            for _ in range(30):  # about 900 bytes
+                print(line, end="", file=sink)
+            sink.drain(timeout=5)
+            sink._file.close()
+            current, rotated = Path(temporary, "sotto.log"), Path(temporary, "sotto.log.1")
+            self.assertTrue(rotated.is_file(), "nothing was rotated while running")
+            self.assertLessEqual(current.stat().st_size, 200 + len(line.encode("utf-8")))
+            self.assertLessEqual(rotated.stat().st_size, 200 + len(line.encode("utf-8")))
+            kept = current.read_text(encoding="utf-8") + rotated.read_text(encoding="utf-8")
+            self.assertTrue(kept and set(kept.splitlines()) == {line.strip()}, kept)
+
+
 def _fake_tray(notes: list):
     """A tray that records its notifications (win_ui.TrayApp's surface)."""
     class FakeTray:

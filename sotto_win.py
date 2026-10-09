@@ -91,6 +91,8 @@ class _ConsoleLog:
     I/O.  Gesture callbacks log on the keyboard-hook thread, and Windows
     silently drops a low-level hook that is slow to return, so a log line must
     never wait for the disk there.  drain() (also at exit) writes what is left.
+    A log that grows past LOG_ROTATE_BYTES while Sotto runs moves to
+    sotto.log.1 and a fresh sotto.log starts (the Mac's keep_app_log_small).
     """
 
     def __init__(self) -> None:
@@ -98,10 +100,7 @@ class _ConsoleLog:
         self._file = None
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            path = DATA_DIR / "sotto.log"
-            if path.is_file() and path.stat().st_size > LOG_ROTATE_BYTES:
-                path.replace(path.with_name("sotto.log.1"))
-            self._file = open(path, "a", encoding="utf-8", buffering=1)
+            self._open_file()
         except OSError:
             pass  # console-only rather than crash on a read-only profile
         self._pending: queue.SimpleQueue = queue.SimpleQueue()
@@ -154,8 +153,28 @@ class _ConsoleLog:
             try:
                 self._file.write(text)
                 self._file.flush()
+                self._size += len(text.encode("utf-8", "replace"))
+                if self._size > LOG_ROTATE_BYTES:
+                    self._file.close()  # Windows cannot move a file that is open
+                    self._file = None
+                    self._open_file()
             except (OSError, ValueError):
                 self._file = None
+
+    def _open_file(self) -> None:
+        """Open DATA_DIR/sotto.log for appending, first moving one past
+        LOG_ROTATE_BYTES to sotto.log.1 (replacing the older one).
+
+        Side effects: may replace sotto.log.1; sets self._file and self._size.
+        """
+        path = DATA_DIR / "sotto.log"
+        if path.is_file() and path.stat().st_size > LOG_ROTATE_BYTES:
+            try:
+                path.replace(path.with_name("sotto.log.1"))
+            except OSError:
+                pass  # sotto.log.1 is held open elsewhere: keep appending, retry next time
+        self._file = open(path, "a", encoding="utf-8", buffering=1)
+        self._size = path.stat().st_size
 
 
 def log(msg: str) -> None:
