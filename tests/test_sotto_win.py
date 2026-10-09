@@ -461,6 +461,37 @@ class QuitAndUpdateTest(unittest.TestCase):
         with controller.capture_gate.starting() as may_start:
             self.assertTrue(may_start, "dictation works meanwhile")
 
+    def test_a_quit_chosen_while_update_checks_keeps_the_gate_closed(self):
+        # Update closes the gate, then a Quit takes it over before Update
+        # reopens it (refused as busy, or the updater failed to start): the
+        # gate belongs to Quit now and stays closed.
+        for refused in ("busy", "updater failed"):
+            controller, _jobs = self.controller(busy=False)
+            self.virtual_clock(controller)
+            work = {"left": refused == "busy"}
+
+            def quit_chosen_meanwhile():
+                controller.quit()  # from the tray, between Update's close and reopen
+                return work["left"]
+
+            def launch(*args, **kwargs):
+                quit_chosen_meanwhile()
+                raise OSError("no powershell")
+
+            controller.finishing = quit_chosen_meanwhile if refused == "busy" else lambda: False
+            with mock.patch.object(sotto_win.subprocess, "Popen", side_effect=launch), \
+                    mock.patch.object(sotto_win, "log"):
+                if refused == "busy":
+                    self.assertIn("Finish the current dictation", controller.update_and_restart())
+                    work["left"] = False
+                else:
+                    with self.assertRaises(OSError):
+                        controller.update_and_restart()
+                with controller.capture_gate.starting() as may_start:
+                    self.assertFalse(may_start, f"{refused}: the gate stays closed for Quit")
+                self.assertEqual(controller.lifecycle["closed"], "quitting", refused)
+                self.assertTrue(controller.shutdown.event.wait(5), f"{refused}: Quit still stops")
+
     def test_a_refused_or_failed_update_reopens_the_gate_but_not_a_restarts(self):
         busy, _jobs = self.controller(busy=True)
         with mock.patch.object(sotto_win.subprocess, "Popen") as popen, \
