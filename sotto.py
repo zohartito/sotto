@@ -3056,6 +3056,15 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             threading.Thread(target=announce_live, daemon=True).start()
 
     def on_finish() -> None:
+        # In flight from before the capture ends until its job is queued, so
+        # Quit's drain never sees an idle gap between the two.
+        pending_deliveries.add()
+        try:
+            finish_capture()
+        finally:
+            pending_deliveries.finish()
+
+    def finish_capture() -> None:
         released_at = time.monotonic()  # latency is measured from the key release
         if shutdown.requested():
             shutdown.stop_capture(capture)

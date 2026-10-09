@@ -397,6 +397,15 @@ class QuitDrainTests(unittest.TestCase):
             self.assertNotIn("jobs.unfinished_tasks", source, name)
             self.assertIn("dictation_in_flight(capture, jobs, pending_deliveries)", source, name)
 
+    def test_a_finishing_capture_stays_in_flight_until_its_job_is_queued(self):
+        # capture.end() makes the capture inactive before the job is queued; the
+        # count must cover that gap or a Quit poll landing in it loses the dictation.
+        finish = _closure_source("on_finish")
+        self.assertLess(finish.index("pending_deliveries.add()"), finish.index("finish_capture()"))
+        self.assertIn("pending_deliveries.finish()", finish.split("finally:", 1)[1])
+        body = _closure_source("finish_capture")
+        self.assertLess(body.index("capture.end("), body.index('shutdown.enqueue(jobs, ("live"'))
+
     def test_the_update_restart_wait_has_a_deadline(self):
         # The gate is closed while it waits, so a wedged native call (or a paste
         # count that never drops) must not refuse recordings forever.
