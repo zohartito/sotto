@@ -1751,11 +1751,14 @@ def collapse_silence(samples: np.ndarray) -> np.ndarray:
 class GestureEngine:
     """Press/release edges -> hold / double-tap / discard decisions.
 
-    Every deadline carries an epoch token: any newer event invalidates it, so
-    a Timer callback that already fired but is waiting on the lock can never
-    act on stale state. Callbacks are invoked OUTSIDE the lock. The second
-    press of a double-tap is classified on its RELEASE: held short = arm
-    hands-free, held long = it was a deliberate push-to-talk.
+    Every key deadline carries an epoch token: any newer key event invalidates
+    it, so a Timer callback that already fired but is waiting on the lock can
+    never act on stale state. The hands-free watchdog is the exception: it
+    belongs to the capture, not the key epoch, so a stop tap whose release is
+    lost cannot disarm it — only ending or re-arming hands-free does.
+    Callbacks are invoked OUTSIDE the lock. The second press of a double-tap
+    is classified on its RELEASE: held short = arm hands-free, held long = it
+    was a deliberate push-to-talk.
     """
 
     def __init__(self, on_start, on_finish, on_discard, on_hands_free=None) -> None:
@@ -1765,6 +1768,7 @@ class GestureEngine:
         self._on_hands_free = on_hands_free
         self._lock = threading.Lock()
         self._epoch = 0
+        self._hands_free_token = 0
         self._recording = False
         self._hands_free = False
         self._tap_pending = False      # a lone short tap awaits its verdict
@@ -1823,7 +1827,7 @@ class GestureEngine:
             elif self._second_candidate:
                 self._hands_free = True
                 self._epoch += 1
-                self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
+                self._arm_hands_free_watchdog()
                 log("● hands-free (tap again to stop)")
                 if self._on_hands_free is not None:
                     fires.append(self._on_hands_free)
@@ -1847,7 +1851,7 @@ class GestureEngine:
             self._tap_pending = False
             self._recording = True
             self._hands_free = True
-            self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
+            self._arm_hands_free_watchdog()
         self._fire([self._on_start] + ([self._on_hands_free] if self._on_hands_free is not None else []))
         return True
 
@@ -1893,10 +1897,20 @@ class GestureEngine:
                 fires.append(self._on_discard)
         self._fire(fires)
 
-    def _schedule(self, delay: float, handler) -> None:
-        timer = threading.Timer(delay, handler, args=(self._epoch,))
+    def _schedule(self, delay: float, handler, token: int | None = None) -> None:
+        timer = threading.Timer(delay, handler,
+                                args=(self._epoch if token is None else token,))
         timer.daemon = True
         timer.start()
+
+    def _arm_hands_free_watchdog(self) -> None:
+        """Caller holds the lock. The watchdog is bound to THIS hands-free
+        capture: pressing the key again must not disarm it (a stop tap whose
+        release is lost used to leave the mic open forever), and a re-armed
+        hands-free gets a fresh token so the old deadline cannot end it."""
+        self._hands_free_token += 1
+        self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout,
+                       self._hands_free_token)
 
     def _expire_tap(self, epoch: int) -> None:
         fires = []
@@ -1908,10 +1922,10 @@ class GestureEngine:
             fires.append(self._on_discard)
         self._fire(fires)
 
-    def _hands_free_timeout(self, epoch: int) -> None:
+    def _hands_free_timeout(self, token: int) -> None:
         fires = []
         with self._lock:
-            if epoch != self._epoch or not self._hands_free:
+            if token != self._hands_free_token or not self._hands_free:
                 return
             self._hands_free = False
             self._recording = False
