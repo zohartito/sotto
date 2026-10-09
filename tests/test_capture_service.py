@@ -252,5 +252,53 @@ class TeardownTest(unittest.TestCase):
         self.assertIn("○ mic released (idle) — wakes on next press", self.logs)
 
 
+# -- F21: tick's idle release honours -1 and never races a press ---------------
+
+class IdleReleaseTest(unittest.TestCase):
+    def setUp(self):
+        self.logs = []
+        patcher = mock.patch.object(sotto, "log", self.logs.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def live_capture(self, idle_release):
+        capture = sotto.CaptureService()
+        engine = FakeEngine()
+        engine.running = True
+        capture._engine_obj = capture._engine = engine
+        capture._node = engine.node
+        capture.idle_release_s = idle_release
+        capture._last_device_scan = sotto.time.monotonic()  # skip the device scan
+        return capture, engine
+
+    def test_negative_idle_release_means_never_for_tick_too(self):
+        capture, engine = self.live_capture(-1)
+        capture.release_soon()                               # already honours -1
+        capture._last_use -= 3600                            # idle for an hour
+        for _ in range(3):
+            capture.tick()
+        self.assertTrue(engine.isRunning(), "--idle-release -1 engine released by tick()")
+        self.assertIs(capture._engine, engine)
+
+    def test_a_press_during_ticks_release_keeps_its_engine_and_audio(self):
+        capture, engine = self.live_capture(30.0)            # retained engine, ring warm
+        feed(capture, tone(200, 2.0, 48000), 48000)
+        capture._last_use -= 31                              # idle past the threshold
+        real_release = capture._release_engine
+
+        def press_lands_first(**kwargs):                     # between tick's read and its release
+            capture.begin()
+            return real_release(**kwargs)
+
+        with mock.patch.object(capture, "_release_engine", press_lands_first):
+            capture.tick()
+        self.assertTrue(capture.is_active())
+        self.assertIs(capture._engine, engine, "tick released the engine under a new capture")
+        self.assertTrue(engine.isRunning())
+        feed(capture, tone(300, 3.0, 48000), 48000, start_sample=96000)
+        raw = capture.end()
+        self.assertGreaterEqual(len(raw) / 48000, 3.0)       # pre-roll + the 3 s spoken
+
+
 if __name__ == "__main__":
     unittest.main()

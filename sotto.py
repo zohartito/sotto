@@ -1256,8 +1256,12 @@ class CaptureService:
                     self._release_engine()
                     self._start_engine()
                     return
-            if not active and idle_for > self.idle_release_s:
-                if self._release_engine():
+            # Negative = never, exactly as release_soon reads it. only_if_idle:
+            # "idle" was decided under the lock a moment ago, and a press that
+            # lands in between must keep the engine it is about to record on.
+            if (not active and self.idle_release_s >= 0
+                    and idle_for > self.idle_release_s):
+                if self._release_engine(only_if_idle=True):
                     log("○ mic released (idle) — wakes on next press")
         except Exception as exc:
             log(f"! mic health check failed: {str(exc)[:120]}")
