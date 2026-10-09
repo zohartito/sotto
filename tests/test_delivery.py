@@ -83,6 +83,12 @@ class FakePasteboard:
     def setString_forType_(self, text, pb_type):
         self.items = [FakeItem({pb_type: text})]
 
+    def setData_forType_(self, data, pb_type):
+        """Like NSPasteboard: after clearContents, a write lands in the first item."""
+        if not self.items:
+            self.items = [FakeItem()]
+        self.items[0].setData_forType_(data, pb_type)
+
     def writeObjects_(self, items):
         self.items.extend(items)
 
@@ -664,6 +670,18 @@ class EventTapCallbackTests(unittest.TestCase):
         self.assertEqual(tap.user_keydowns["count"], 2)
         tap.key_down(hotkey_code)                              # a plain "d" is
         self.assertEqual(tap.user_keydowns["count"], 3)
+
+
+class TransientPasteTests(unittest.TestCase):
+    def test_n33_the_paste_is_marked_transient_for_clipboard_managers(self):
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        types_at_paste = world.pasteboard.items[0].types()
+        self.assertIn("org.nspasteboard.TransientType", types_at_paste)
+        self.assertEqual(world.pasteboard.text(), "dictation ")
+        world.timers.advance_to(sotto.RESTORE_DELAY_S * 2 + 1.0)
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+        self.assertNotIn("org.nspasteboard.TransientType", world.pasteboard.items[0].types())
 
 
 if __name__ == "__main__":

@@ -68,6 +68,9 @@ HANDS_FREE_MAX_S = 600.0        # watchdog: force-finish a forgotten open mic
 # still runs only if changeCount is unchanged (a user ⌘C in the window wins),
 # and overlapping pastes carry the original forward (see inject()).
 RESTORE_DELAY_S = 3.0
+# nspasteboard.org marker on Sotto's own paste write: clipboard managers skip
+# it, so dictations do not pile up in their history (the restore is untouched).
+TRANSIENT_PASTEBOARD_TYPE = "org.nspasteboard.TransientType"
 DELIVERY_POLL_S = 0.15           # re-check a held key this often before pasting
 DELIVERY_WAIT_MAX_S = 30.0       # key held, no recording: give up, the text stays in History
 SOTTO_EVENT_TAG = 0x534F5454     # "SOTT" in kCGEventSourceUserData on every key event Sotto posts
@@ -2207,6 +2210,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
             snapshot.append([(t, item.dataForType_(t)) for t in item.types()])
     pasteboard.clearContents()
     pasteboard.setString_forType_(text, NSPasteboardTypeString)
+    pasteboard.setData_forType_(b"", TRANSIENT_PASTEBOARD_TYPE)
     own_count = pasteboard.changeCount()
     post_command_key(9)  # ⌘V
 
