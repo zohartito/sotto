@@ -298,6 +298,7 @@ class DeliveryQueueHarness:
         self.queue = sotto.DeliveryQueue(
             insert=self._insert, undo_keys=lambda: self.undos.append(round(self.timers.now, 2)),
             keys_held=self.held, recording=lambda: self.held() and self.recording_while_held,
+            frontmost_pid=lambda: self.pid, keydowns=lambda: self.keydowns,
             secure_input=lambda: self.secure, call_after=lambda fn, *args: fn(*args),
             note=lambda title, message: self.notes.append((title, message)), log=self.logs.append,
             shutdown_requested=lambda: self.shutdown, clock=lambda: self.timers.now,
@@ -369,6 +370,76 @@ class DeliveryQueueOrderTests(unittest.TestCase):
         self.assertEqual(world.delivered, [])
 
 
+# -- F7: inject() reports whether anything reached the app ----------------------
+
+class InjectReportsInsertTests(unittest.TestCase):
+    def test_secure_input_decline_reports_no_insert(self):
+        world = patch_insertion(self, secure=True)
+        self.assertIs(sotto.inject("secret"), False)
+        self.assertIs(sotto.inject("secret", insert_mode="type"), False)
+        self.assertEqual(world.quartz.posted, [])
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+
+    def test_paste_and_typing_report_an_insert(self):
+        world = patch_insertion(self)
+        self.assertIs(sotto.inject("hello"), True)
+        self.assertIs(sotto.inject("hello", insert_mode="type"), True)
+        self.assertGreater(len(world.quartz.posted), 2)
+
+
+# -- F7: "scratch that" undoes only Sotto's own insert ---------------------------
+
+class ScratchThatTests(unittest.TestCase):
+    def test_secure_input_decline_does_not_arm_undo(self):
+        world = DeliveryQueueHarness()
+        world.inserts_ok = False                              # a password field had focus
+        world.queue.paste("my dictation")
+        world.secure = False                                  # the user tabs out of the field
+        world.queue.undo()
+        self.assertEqual(world.undos, [])
+        self.assertTrue(any("nothing recent" in line for line in world.logs))
+
+    def test_undo_refused_when_another_app_is_frontmost(self):
+        world = DeliveryQueueHarness(pid=100)
+        world.queue.paste("hello")                            # pasted into app 100
+        world.pid = 200                                       # the user switched to app 200
+        world.queue.undo()
+        self.assertEqual(world.undos, [])
+        self.assertTrue(any("another app" in line for line in world.logs), world.logs)
+
+    def test_undo_refused_after_the_user_typed(self):
+        world = DeliveryQueueHarness()
+        world.queue.paste("hello")
+        world.keydowns += 3                                   # the user kept typing
+        world.queue.undo()
+        self.assertEqual(world.undos, [])
+        self.assertTrue(any("typed" in line for line in world.logs), world.logs)
+
+    def test_undo_fires_once_for_sottos_own_insert_in_the_same_app(self):
+        world = DeliveryQueueHarness()
+        world.queue.paste("hello")
+        world.timers.advance_to(2.0)
+        world.queue.undo()
+        self.assertEqual(world.undos, [2.0])
+        world.queue.undo()                                    # a second "scratch that" has nothing left
+        self.assertEqual(world.undos, [2.0])
+
+    def test_undo_window_expires(self):
+        import voice_commands
+        world = DeliveryQueueHarness()
+        world.queue.paste("hello")
+        world.timers.advance_to(voice_commands.SCRATCH_WINDOW_S + 1.0)
+        world.queue.undo()
+        self.assertEqual(world.undos, [])
+
+    def test_undo_is_not_sent_into_a_secure_field(self):
+        world = DeliveryQueueHarness()
+        world.queue.paste("hello")
+        world.secure = True
+        world.queue.undo()
+        self.assertEqual(world.undos, [])
+
+
 # -- the event tap: Sotto's own events are never chords or user typing ----------
 
 class EventTapCallbackHarness:
@@ -422,6 +493,22 @@ class EventTapCallbackTests(unittest.TestCase):
         tap.press_trigger()
         tap.key_down(9, flags=CMD)                             # the user's own ⌘V
         self.assertEqual(tap.events, ["start", "discard"])
+
+    def test_user_keydowns_are_counted_but_not_sottos_or_the_hotkey(self):
+        world = patch_insertion(self)
+        tap = EventTapCallbackHarness(self, world.quartz)
+        tap.key_down(0)                                        # "a"
+        tap.key_down(1)                                        # "s"
+        self.assertEqual(tap.user_keydowns["count"], 2)
+        sotto.inject("hello", spacing="none")
+        for event in world.quartz.key_downs(9):
+            tap.callback(None, RealQuartz.kCGEventKeyDown, event, None)
+        self.assertEqual(tap.user_keydowns["count"], 2)        # Sotto's own ⌘V is not typing
+        hotkey_flags, hotkey_code = sotto.parse_hotkey("ctrl-opt-d")
+        tap.key_down(hotkey_code, flags=hotkey_flags)          # starting a dictation is not typing
+        self.assertEqual(tap.user_keydowns["count"], 2)
+        tap.key_down(hotkey_code)                              # a plain "d" is
+        self.assertEqual(tap.user_keydowns["count"], 3)
 
 
 if __name__ == "__main__":

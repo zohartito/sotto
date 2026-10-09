@@ -1968,19 +1968,32 @@ def secure_input_active() -> bool:
         return False
 
 
-def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") -> None:
+def frontmost_pid() -> int | None:
+    """The process a synthetic key event would reach right now (NSWorkspace)."""
+    try:
+        import AppKit
+        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app is not None else None
+    except Exception:
+        return None
+
+
+def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") -> bool:
     """Insert at the cursor. "paste": full-pasteboard snapshot, synthetic
     cmd-V, then a changeCount-guarded restore so a user copy in the window
-    always wins. "type": synthetic Unicode typing, clipboard untouched."""
+    always wins. "type": synthetic Unicode typing, clipboard untouched.
+
+    Returns True when the text was handed to the app, False when secure input
+    declined it — only a real insert may arm "scratch that"."""
     global _restore_generation, _pending_restore
     if secure_input_active():
         log("! secure input active — not inserting; transcript kept in history")
-        return
+        return False
 
     text = compose_insertion(text, spacing, character_before_caret() if spacing == "smart" else None)
     if insert_mode == "type":
         type_text(text)
-        return
+        return True
 
     pasteboard = NSPasteboard.generalPasteboard()
     pending = _pending_restore
@@ -2009,6 +2022,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
     timer = threading.Timer(RESTORE_DELAY_S, queue_restore)
     timer.daemon = True
     timer.start()
+    return True
 
 
 def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
@@ -2050,13 +2064,15 @@ class DeliveryQueue:
     the poll timer only bounces back there, so there is no lock.
     """
 
-    def __init__(self, *, insert, undo_keys, keys_held, recording, secure_input,
-                 call_after, note, log=log, shutdown_requested=lambda: False,
+    def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
+                 secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
                  clock=time.monotonic, timer=threading.Timer) -> None:
         self._insert = insert            # (text) -> bool: did the text reach the app?
         self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
         self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
         self._recording = recording      # () -> bool: a dictation is being captured
+        self._frontmost_pid = frontmost_pid  # () -> pid of the app a key event reaches
+        self._keydowns = keydowns        # () -> count of the user's real key-downs so far
         self._secure_input = secure_input
         self._call_after = call_after
         self._note = note                # (title, message) -> None: one user-visible note
@@ -2124,15 +2140,23 @@ class DeliveryQueue:
         self._pump()
 
     def _deliver(self, text: str) -> None:
-        self._insert(text)
-        self.last_delivery = {"at": self._clock()}
+        pid, keydowns = self._frontmost_pid(), self._keydowns()  # the paste target, before ⌘V
+        if self._insert(text):  # a secure-input decline inserted nothing: arm no undo
+            self.last_delivery = {"at": self._clock(), "pid": pid, "keydowns": keydowns}
 
     def _undo(self) -> None:
-        """'scratch that': the app's own ⌘Z, only for a recent Sotto paste."""
+        """'scratch that': the app's own ⌘Z, only for Sotto's own recent insert —
+        same app still in front, nothing typed by the user since."""
         import voice_commands
         last = self.last_delivery
         if last is None or self._clock() - last["at"] > voice_commands.SCRATCH_WINDOW_S:
             self._log("  scratch that: nothing recent to undo")
+            return
+        if self._frontmost_pid() != last["pid"]:
+            self._log("  scratch that: the dictation went to another app — nothing undone")
+            return
+        if self._keydowns() != last["keydowns"]:
+            self._log("  scratch that: you typed since the dictation — nothing undone")
             return
         if self._secure_input():
             return
@@ -3144,11 +3168,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if status_ui is not None:
             ui_call(status_ui.show_info, title, message)
 
+    # Real key-downs seen by the tap (Sotto's tagged events excluded): typing
+    # after a paste means "scratch that" must not undo it.
+    user_keydowns = {"count": 0}
+
     # Finished text and "scratch that" share one FIFO (see DeliveryQueue):
     # capture order is kept, and nothing is posted while a key is held.
     delivery = DeliveryQueue(
         insert=insert_text, undo_keys=lambda: post_command_key(6), keys_held=keys_held,
-        recording=lambda: engine.snapshot()[0], secure_input=secure_input_active,
+        recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
+        keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
         call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested)
 
     def inject_when_clear(text: str, _attempts: int = 0) -> None:
@@ -3192,11 +3221,13 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp,
                           Quartz.kCGEventFlagsChanged) and is_own_event(event):
             return event  # Sotto's own ⌘V / ⌘Z / typing: never a chord, never the user typing
-        if event_type == Quartz.kCGEventKeyDown and trigger_state["down"]:
-            # Any other key during a trigger hold makes it a shortcut.
+        if event_type == Quartz.kCGEventKeyDown:
             code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-            if hotkey is None or code != hotkey[1]:
-                engine.chorded()
+            hotkey_key = hotkey is not None and code == hotkey[1]
+            if not (hotkey_key and (Quartz.CGEventGetFlags(event) & ALL_MODIFIERS) == hotkey[0]):
+                user_keydowns["count"] += 1  # the user typed: "scratch that" is off the table
+            if trigger_state["down"] and not hotkey_key:
+                engine.chorded()  # any other key during a trigger hold makes it a shortcut
         # Hotkey: hold it and release to stop, or tap it and tap again later.
         # Normal keys carry real keycodes AND key-up events through remote
         # desktops, so both gestures survive an AnyDesk session.
