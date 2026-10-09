@@ -8,13 +8,18 @@ local changes are never overwritten.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 
 RELEASES_URL = "https://github.com/zohartito/sotto/releases"
 MAX_LISTED_CHANGES = 5
+UPDATE_TIMEOUT_S = 1800
+# Time a stopped Mac update gets to put the previous packages back (one pip run).
+UPDATE_STOP_GRACE_S = 300
 # The Windows tray runs under pythonw: without this flag each git call would
 # flash a console window.
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
@@ -87,7 +92,28 @@ def _head(root: Path, run) -> str:
         return ""
 
 
-def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run) -> tuple[bool, str, bool]:
+def _stop_group(installer) -> None:
+    """Stop the installer and everything it started (pip included): SIGTERM
+    makes install-mac.sh put the previous packages back; SIGKILL whatever is
+    left after UPDATE_STOP_GRACE_S."""
+    try:
+        os.killpg(installer.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        installer.wait(timeout=UPDATE_STOP_GRACE_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(installer.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    installer.wait()
+
+
+def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run,
+              popen=subprocess.Popen) -> tuple[bool, str, bool]:
     """Run the installer's own update path (fetch, the new version's pinned
     packages, then the source switch, model check and Sotto.app) while Sotto
     keeps running.
@@ -95,16 +121,27 @@ def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run) -> tu
     Returns (finished, last log line, source_changed). The installer switches
     the source only after the packages installed, so a failure with
     source_changed False left this copy's code untouched.
+
+    Side effects: the installer runs in its own process group, named as
+    started from this Sotto (SOTTO_UPDATE_FROM_PID, so its running-Sotto check
+    lets it through); after UPDATE_TIMEOUT_S that whole group is stopped.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     before = _head(root, run)
     try:
         with open(log_path, "w", encoding="utf-8") as log:
-            result = run(["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update", "--python", python],
-                         cwd=str(root), stdout=log, stderr=subprocess.STDOUT, timeout=1800)
-        finished = result.returncode == 0
+            installer = popen(["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update", "--python", python],
+                              cwd=str(root), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                              env=dict(os.environ, SOTTO_UPDATE_FROM_PID=str(os.getpid())))
+            try:
+                finished, stopped = installer.wait(timeout=UPDATE_TIMEOUT_S) == 0, False
+            except subprocess.TimeoutExpired:
+                _stop_group(installer)
+                finished, stopped = False, True
         tail = _last_line(log_path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        if stopped:
+            tail = f"The update took over {UPDATE_TIMEOUT_S // 60} minutes and was stopped. {tail}".strip()
+    except OSError as exc:
         finished, tail = False, f"The update did not finish ({str(exc)[:120]})."
     after = _head(root, run)
     return finished, tail, bool(before and after and before != after)

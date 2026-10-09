@@ -1,9 +1,12 @@
 """Check for Updates: only on request, only a clean checkout strictly behind GitHub."""
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -124,17 +127,22 @@ class ApplyMacTests(unittest.TestCase):
         heads = iter(heads)
         installer_calls = []
 
-        def fake(argv, **kwargs):
-            if argv[0] == "git":
-                return completed(next(heads) + "\n")
-            installer_calls.append(argv)
+        def git(argv, **kwargs):
+            return completed(next(heads) + "\n")
+
+        def popen(argv, **kwargs):
+            installer_calls.append((argv, kwargs))
             kwargs["stdout"].write(output)
-            return completed(returncode=installer_code)
+            return mock.Mock(**{"wait.return_value": installer_code})
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            result = updates.apply_mac(root, "/venv/bin/python", root / "logs" / "update.log", run=fake)
-        self.assertEqual(installer_calls, [["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update",
-                                            "--python", "/venv/bin/python"]])
+            result = updates.apply_mac(root, "/venv/bin/python", root / "logs" / "update.log", run=git, popen=popen)
+        self.assertEqual([argv for argv, _kwargs in installer_calls],
+                         [["/bin/bash", str(root / "scripts" / "install-mac.sh"), "--update",
+                           "--python", "/venv/bin/python"]])
+        kwargs = installer_calls[0][1]
+        self.assertTrue(kwargs["start_new_session"])  # [N25] stopped as a whole group
+        self.assertEqual(kwargs["env"]["SOTTO_UPDATE_FROM_PID"], str(os.getpid()))  # [N26]
         return result
 
     def test_a_finished_update_reports_its_last_line_and_the_new_source(self):
@@ -147,6 +155,40 @@ class ApplyMacTests(unittest.TestCase):
     def test_a_failure_after_the_switch_says_the_source_changed(self):
         self.assertEqual(self.apply(["aaa", "bbb"], 1, "✗ model download failed\n"),
                          (False, "✗ model download failed", True))
+
+    @unittest.skipIf(sys.platform == "win32", "the Mac updater")
+    def test_a_stuck_update_is_stopped_with_everything_it_started(self):
+        # [N25] The timeout killed bash but not its pip child, which went on
+        # changing packages after Sotto had reported the update failed.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            child = root / "child.pid"
+            (root / "scripts" / "install-mac.sh").write_text(
+                f"/bin/bash -c 'echo $$ > \"{child}\"; sleep 60; true'\necho finished\n")
+            with mock.patch.object(updates, "UPDATE_TIMEOUT_S", 2):
+                finished, tail, source_changed = updates.apply_mac(root, sys.executable,
+                                                                    root / "logs" / "update.log")
+            pid = int(child.read_text())
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and _alive(pid):
+                    time.sleep(0.05)
+                self.assertFalse(_alive(pid), "the installer's child kept running")
+            finally:
+                if _alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            self.assertFalse(finished)
+            self.assertFalse(source_changed)
+            self.assertIn("stopped", tail)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows tray updater")
