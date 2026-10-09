@@ -406,8 +406,10 @@ History copies are separate.
 - **"Sotto is already running":** another Sotto (tray or console) is running
   in this Windows sign-in; quit it from its tray menu or its console.
 - **`✗ microphone`:** pick a default input in **Settings → System → Sound**
-  and check the microphone privacy switch for desktop apps. `! mic open failed`
-  in the log usually means another app holds the device exclusively.
+  and check the microphone privacy switch for desktop apps. Sotto records from
+  the Windows default input through PortAudio's default host API (MME), which
+  converts to 16 kHz. `! mic open failed` in the log usually means another app
+  holds the device exclusively.
 - **`! cuda (float16) unavailable … falling back to CPU`:** expected on a
   CPU-only install. For the GPU, run the installer with `-Cuda` (or install
   `requirements-alpha-windows-cuda.txt`) and update the NVIDIA driver;

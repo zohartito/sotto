@@ -1,4 +1,4 @@
-# sotto — local, offline push-to-talk dictation: hold a key, speak, release; text lands at the cursor. macOS: PyObjC + mlx-whisper on Metal. Windows source alpha: `sotto_win.py` — pynput trigger hook (right-ctrl default), WASAPI capture, pinned faster-whisper (CUDA float16, CPU int8 fallback), paste-or-type insertion, pystray tray + Tk dialogs (`--tray`).
+# sotto — local, offline push-to-talk dictation: hold a key, speak, release; text lands at the cursor. macOS: PyObjC + mlx-whisper on Metal. Windows source alpha: `sotto_win.py` — pynput trigger hook (right-ctrl default), default-input capture (PortAudio's MME host API, not WASAPI), pinned faster-whisper (CUDA float16, CPU int8 fallback), paste-or-type insertion, pystray tray + Tk dialogs (`--tray`).
 
 ## Run & test
 All commands run from the repo root using the local `venv` (macOS only, Apple Silicon).

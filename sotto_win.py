@@ -5,7 +5,7 @@ Same pipeline as sotto.py — the pure logic (GestureEngine, VAD, hallucination
 guards, history/learning stores, dictionary, settings) is imported and shared —
 with Windows I/O:
   * trigger   pynput low-level keyboard hook (win_hotkey)
-  * capture   one fresh WASAPI stream per capture (win_capture / sounddevice)
+  * capture   one fresh stream per capture on the default input, MME (win_capture)
   * ASR       faster-whisper / CTranslate2: CUDA float16, else CPU int8 (win_asr)
   * insert    paste (clipboard restored) or type (SendInput Unicode) (win_inject)
   * tray      system-tray menu, Settings and History dialogs (win_ui, --tray)

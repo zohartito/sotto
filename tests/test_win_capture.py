@@ -6,6 +6,7 @@ stream exists — the mic must never be left open).
 """
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 import threading
 import time
@@ -15,6 +16,8 @@ import numpy as np
 
 if sys.platform == "win32":
     import win_capture
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only module")
@@ -202,3 +205,17 @@ class WinCaptureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostApiDocsTest(unittest.TestCase):
+    """[F39] The stream opens PortAudio's default input, which is MME on
+    Windows; the docs used to call it WASAPI."""
+
+    def test_the_docs_name_the_host_api_the_stream_really_uses(self) -> None:
+        source = (ROOT / "win_capture.py").read_text(encoding="utf-8")
+        opened = source.split("self._stream_factory(", 1)[1].split(")", 1)[0]
+        self.assertNotIn("device", opened, "no device or host API is chosen: PortAudio's default")
+        self.assertIn("MME", source.split('"""', 2)[1])
+        for name in ("win_capture.py", "sotto_win.py", "AGENTS.md", "docs/windows-alpha.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"WASAPI (stream|capture)", name)

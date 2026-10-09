@@ -1,4 +1,8 @@
-"""Windows capture: one fresh WASAPI stream per capture (sounddevice/PortAudio).
+"""Windows capture: one fresh input stream per capture (sounddevice/PortAudio).
+
+The stream opens PortAudio's default input device, which on Windows belongs to
+the MME host API (Windows resamples to the 16 kHz Sotto asks for).  No host
+API is chosen explicitly.
 
 The privacy boundary matches the Mac's ``--idle-release 0``: the microphone
 is open only while the trigger key is held — ``begin()`` opens the stream,
