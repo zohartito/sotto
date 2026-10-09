@@ -86,8 +86,10 @@ class WinCapture:
     def _current(self, generation: int) -> bool:
         return self._active and self._generation == generation
 
-    def _close_later(self, stream) -> None:
-        """Stop and close a finished stream off the caller's thread.
+    def _close_later_locked(self, stream) -> None:
+        """Stop and close a finished stream off the caller's thread.  The
+        caller holds _lock and detached ``stream`` under it: an open that
+        follows can never miss this close and put a second stream on the mic.
 
         Side effects: starts a closing thread; the next open waits for it.
         """
@@ -98,11 +100,10 @@ class WinCapture:
             except Exception as exc:
                 self._log(f"! mic close failed: {str(exc)[:120]}")
 
-        with self._lock:
-            self._closing = [thread for thread in self._closing if thread.is_alive()]
-            thread = threading.Thread(target=close, daemon=True)
-            self._closing.append(thread)
-            thread.start()
+        self._closing = [thread for thread in self._closing if thread.is_alive()]
+        thread = threading.Thread(target=close, daemon=True)
+        self._closing.append(thread)
+        thread.start()
 
     def _wait_closed(self, timeout: float) -> bool:
         """Wait up to ``timeout`` in all for streams still closing; True once none is."""
@@ -177,8 +178,8 @@ class WinCapture:
             self._active = False
             self._waking = False
             stream, self._stream = self._stream, None
-        if stream is not None:
-            self._close_later(stream)
+            if stream is not None:
+                self._close_later_locked(stream)
         if not frames:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(frames).reshape(-1)
@@ -189,8 +190,8 @@ class WinCapture:
             self._active = False
             self._waking = False
             stream, self._stream = self._stream, None
-        if stream is not None:
-            self._close_later(stream)
+            if stream is not None:
+                self._close_later_locked(stream)
 
     def is_active(self) -> bool:
         with self._lock:
