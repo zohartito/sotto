@@ -2160,7 +2160,11 @@ class DeliveryQueue:
         if last is None or self._clock() - last["at"] > voice_commands.SCRATCH_WINDOW_S:
             self._log("  scratch that: nothing recent to undo")
             return
-        if self._frontmost_pid() != last["pid"]:
+        pid = self._frontmost_pid()
+        if pid is None or last["pid"] is None:  # no identity to compare: None == None proves nothing
+            self._log("  scratch that: the app in front is unknown — nothing undone")
+            return
+        if pid != last["pid"]:
             self._log("  scratch that: the dictation went to another app — nothing undone")
             return
         if self._keydowns() != last["keydowns"]:

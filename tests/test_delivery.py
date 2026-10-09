@@ -6,10 +6,14 @@ Everything runs against fakes: no key event is posted, the real pasteboard is
 never touched, and a virtual clock drives threading.Timer, so nothing sleeps.
 """
 import ast
+import sys
 import threading
 import types
 import unittest
 from unittest.mock import patch
+
+if sys.platform != "darwin":
+    raise unittest.SkipTest("Quartz key events and the AppKit pasteboard — macOS-only")
 
 import Quartz as RealQuartz
 
@@ -430,6 +434,13 @@ class ScratchThatTests(unittest.TestCase):
         world.queue.undo()
         self.assertEqual(world.undos, [])
         self.assertTrue(any("another app" in line for line in world.logs), world.logs)
+
+    def test_undo_refused_when_the_frontmost_app_is_unknown(self):
+        world = DeliveryQueueHarness(pid=None)                # NSWorkspace gave no answer at paste time
+        world.queue.paste("hello")
+        world.queue.undo()                                    # ...nor now: None == None proves nothing
+        self.assertEqual(world.undos, [])
+        self.assertTrue(any("unknown" in line for line in world.logs), world.logs)
 
     def test_undo_refused_after_the_user_typed(self):
         world = DeliveryQueueHarness()
