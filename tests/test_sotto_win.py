@@ -634,8 +634,9 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
 
         def end(self):
             FakeCapture.closed += 1
-            FakeCapture.active = False
-            return captures.pop(0)
+            was_active, FakeCapture.active = FakeCapture.active, False
+            # Like WinCapture.end: a capture that never began has no frames.
+            return captures.pop(0) if was_active else np.zeros(0, dtype=np.float32)
 
         def abort(self): FakeCapture.active = False
         def release_soon(self): pass
@@ -1591,11 +1592,8 @@ class QuitRunTest(unittest.TestCase):
         # The engine marked itself recording before on_start met the closed
         # gate: the tray offered "Finish dictation" and a hands-free start
         # stayed armed with no microphone open.
-        import numpy as np
-
         hooks, boundaries, controllers, logs = [], [], [], []
-        silence = np.zeros(0, dtype=np.float32)
-        fakes = _app_fakes(16_000, [silence, silence, silence], [], hooks, [])
+        fakes = _app_fakes(16_000, [], [], hooks, [])  # no capture ever begins
         seen: dict = {}
 
         def drive(results):
@@ -1625,6 +1623,7 @@ class QuitRunTest(unittest.TestCase):
         self.assertEqual(seen["after key press"], (False, False), "no phantom push-to-talk recording")
         self.assertIn("updating", seen["tray message"])
         self.assertIn("○ updating — this press is ignored", logs)
+        self.assertFalse([line for line in logs if "callback failed" in line], logs)
         self.assertIn("Updating", results["update"])
 
 
