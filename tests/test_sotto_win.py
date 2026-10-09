@@ -1973,6 +1973,48 @@ class RoundTwoRunTest(unittest.TestCase):
         self.assertEqual(cleaned["voice"], {"asr_text": "Hello, um, world"})
         self.assertNotIn("voice", results["row"]["attempts"][-1]["preprocessing"])
 
+    def test_a_history_that_cannot_take_the_row_still_delivers_and_says_so(self):
+        # [N1] An append_live that raised (disk full, a locked History) used
+        # to lose the dictation: not inserted, not saved, "could not be
+        # transcribed".  The Mac's F16a: the text is still delivered, one note.
+        from history import HistoryStore
+        fakes = self.fakes([_voiced(), _voiced(), _voiced()],
+                           ["hello world", RuntimeError("CUDA failed with error out of memory"), ""])
+
+        def drive(results, app):
+            for _ in range(3):
+                self.dictate(app)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-append-") as temporary:
+            data = Path(temporary)
+            results, app = self.run_app(fakes, drive, data, extra=(mock.patch(
+                "learning.LearningCoordinator.append_live",
+                side_effect=OSError(28, "No space left on device")),))
+            rows = HistoryStore(data).entries(10)
+        self.assertEqual(app["delivered"], ["hello world"], app["logs"])
+        self.assertEqual(rows, [])
+        self.assertEqual(app["notes"], [
+            "History could not be saved. The text was still delivered, but it is not in History.",
+            "Transcription failed, and the recording could not be saved to History either; "
+            "please dictate again.",
+            "History could not be saved. The held-back text could not be kept in History."])
+
+    def test_a_failed_transcription_with_history_unreadable_does_not_promise_a_retry(self):
+        # [N10] With History unreadable the row is never written, but the
+        # tray said "The recording is in History: choose Retry".
+        fakes = self.fakes([_voiced()], [RuntimeError("CUDA failed with error out of memory")])
+
+        def drive(results, app):
+            self.dictate(app)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-unreadable-") as temporary:
+            data = Path(temporary)
+            (data / "history.jsonl").write_text('{"id": "abc123", "text": "cut of', encoding="utf-8")
+            results, app = self.run_app(fakes, drive, data)
+        self.assertEqual(app["notes"], [
+            "Transcription failed, and the recording could not be saved to History either; "
+            "please dictate again."])
+
 
 if __name__ == "__main__":
     unittest.main()

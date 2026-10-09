@@ -925,12 +925,17 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                             "asr_seconds": 0.0},
             })
             log(f"! not pasted ({skip})")
-            sotto.finalize_primary_live_delivery(
-                append=lambda: coordinator.append_live(
-                    text, prepared, seconds, model_repo, ts=captured_ts, raw_samples=raw,
-                    raw_sample_rate=native_rate, provenance="live_suspect",
-                    adaptive=False, **attempt_metadata),
-                adaptive_runtime=None, appended_publication=None, shutdown=shutdown, inject=None)
+            try:
+                sotto.finalize_primary_live_delivery(
+                    append=lambda: coordinator.append_live(
+                        text, prepared, seconds, model_repo, ts=captured_ts, raw_samples=raw,
+                        raw_sample_rate=native_rate, provenance="live_suspect",
+                        adaptive=False, **attempt_metadata),
+                    adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
+                    inject=None)
+            except Exception as exc:
+                history_append_failed(exc)  # held: nothing to deliver
+                return
             log(f"→ 0.00s · {len(text)} chars")
             return
         # VAD is advisory only: it trims dead air from long captures and
@@ -1006,16 +1011,20 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         if reason:
             log(f"! not pasted ({reason}) — kept in history")
             preprocessing["outcome"] = "suspect"
-        appended = sotto.finalize_primary_live_delivery(
-            append=lambda: coordinator.append_live(
-                text, prepared, prepared_seconds, model_repo, ts=captured_ts,
-                raw_samples=raw, raw_sample_rate=native_rate,
-                provenance="live_suspect" if reason else "live", adaptive=False,
-                **attempt_metadata),
-            adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
-            inject=None if reason or not (text or voice_action) else lambda: deliveries.put(
-                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only,
-                 time.monotonic())))
+        deliver = None if reason or not (text or voice_action) else lambda: deliveries.put(
+            (SCRATCH if voice_action == "scratch" else text, prefs, copy_only, time.monotonic()))
+        try:
+            appended = sotto.finalize_primary_live_delivery(
+                append=lambda: coordinator.append_live(
+                    text, prepared, prepared_seconds, model_repo, ts=captured_ts,
+                    raw_samples=raw, raw_sample_rate=native_rate,
+                    provenance="live_suspect" if reason else "live", adaptive=False,
+                    **attempt_metadata),
+                adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
+                inject=deliver)
+        except Exception as exc:
+            appended = None
+            history_append_failed(exc, deliver)
         if appended is not None and text and not reason and voice_action is None:
             sotto.record_totals(text, len(raw) / max(native_rate, 1.0))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
@@ -1025,7 +1034,9 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                             vad_metadata, preprocessing, queued_at, started) -> None:
         """The speech model raised (CUDA out of memory, a driver error): the
         recording must not be lost.  It is kept as a suspect History row that
-        Retry can transcribe again, and the tray says so.
+        Retry can transcribe again, and the tray says so — unless History
+        could not take the row (an append that raised, or History unreadable
+        since startup), when the tray says the recording is lost instead.
 
         Side effects: appends one History row with its audio; a tray notification.
         """
@@ -1041,15 +1052,46 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             "vad": vad_metadata, "preprocessing": preprocessing,
             "latency": {"queue_wait_seconds": round(started - queued_at, 4),
                         "asr_seconds": round(time.monotonic() - started, 4)}})
-        sotto.finalize_primary_live_delivery(
-            append=lambda: coordinator.append_live(
-                TRANSCRIPTION_FAILED_TEXT, prepared, prepared_seconds, model_repo,
-                ts=captured_ts, raw_samples=raw, raw_sample_rate=native_rate,
-                provenance="live_suspect", adaptive=False, **attempt_metadata),
-            adaptive_runtime=None, appended_publication=None, shutdown=shutdown, inject=None)
+        try:
+            row = sotto.finalize_primary_live_delivery(
+                append=lambda: coordinator.append_live(
+                    TRANSCRIPTION_FAILED_TEXT, prepared, prepared_seconds, model_repo,
+                    ts=captured_ts, raw_samples=raw, raw_sample_rate=native_rate,
+                    provenance="live_suspect", adaptive=False, **attempt_metadata),
+                adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
+                inject=None)
+        except Exception as append_exc:
+            log(f"! failed capture not saved ({type(append_exc).__name__}: "
+                f"{str(append_exc)[:160]})")
+            row = None
+        # UnsavedHistory (History unreadable) hands back a row it never wrote.
+        saved = row is not None and row.get("saved", True)
         if ui is not None:
             ui.notify("Transcription failed. The recording is in History: "
-                      "choose Retry there to transcribe it again.")
+                      "choose Retry there to transcribe it again." if saved else
+                      "Transcription failed, and the recording could not be saved to "
+                      "History either; please dictate again.")
+
+    def history_append_failed(exc: Exception, deliver=None) -> None:
+        """History could not take the live row (the Mac's F16a): disk full,
+        a locked or damaged store.  The dictation still reaches the user,
+        who is told once that it was not saved.
+
+        Side effects: runs ``deliver`` (the insertion, copy or "scratch that"
+        a saved row would have queued); one tray notification; a log line.
+        Nothing once shutdown is requested.
+        """
+        log(f"! History append failed ({type(exc).__name__}: {str(exc)[:160]})"
+            + (" — delivering the text anyway" if deliver is not None else ""))
+        if shutdown.requested():
+            return
+        if deliver is not None:
+            deliver()
+        if ui is not None:
+            ui.notify("History could not be saved. "
+                      + ("The text was still delivered, but it is not in History."
+                         if deliver is not None else
+                         "The held-back text could not be kept in History."))
 
     def retry_job(job) -> None:
         _, entry_id, queued_at, _capture_id, job_config = job
