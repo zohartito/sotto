@@ -34,6 +34,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+import pipeline
+# The output guards live in pipeline.py (shared with Windows); these names stay
+# importable from sotto for existing callers.
+from pipeline import (LOOP_MAX_UNIT_WORDS, LOOP_MIN_PREFIX_CHARS, LOOP_MIN_REPEATS,  # noqa: F401
+                      NO_SPEECH_TEXT, _find_repetition_loop, apply_voice_cleanup,
+                      looks_hallucinated, reads_as_no_speech, salvage_repetition_loop, screen)
 try:  # Keep content-free CLI/admin helpers importable on non-macOS test hosts.
     import Quartz
     from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
@@ -485,36 +492,9 @@ def seed_totals(store) -> None:
         log(f"! progress totals not started ({type(exc).__name__})")
 
 
-def apply_voice_cleanup(text: str, preprocessing: dict, language: str | None) -> tuple[str, str | None]:
-    """English voice commands and filler removal, after the dictionary. Returns
-    the text to deliver and an action ("scratch" undoes the last dictation)."""
-    import settings
-    import voice_commands
-    preferences = settings.load(settings.SETTINGS_PATH)
-    commands, fillers = preferences["voice_commands"], preferences["remove_fillers"]
-    if not (commands or fillers) or not voice_commands.is_english(language):
-        return text, None
-    cleaned, action = voice_commands.clean(text, fillers=fillers, commands=commands)
-    if action or cleaned != text:
-        preprocessing["voice"] = {"asr_text": text, **({"action": action} if action else {})}
-    return cleaned, action
-
-
 def apply_personal_dictionary(text: str, preprocessing: dict) -> str:
-    """The user's own spellings for text that is about to be delivered.
-
-    Runs after every hallucination/no-speech guard; the recognizer's original
-    output stays in the History row's preprocessing receipt."""
-    import dictionary
-    try:
-        updated, receipt = dictionary.apply(text, dictionary.load(dictionary.DICTIONARY_PATH))
-    except Exception as exc:  # a broken dictionary must never cost a dictation
-        log(f"! dictionary skipped ({type(exc).__name__})")
-        return text
-    if receipt:
-        preprocessing["dictionary"] = {"rules": receipt, "asr_text": text}
-        log(f"  dictionary: {sum(item['count'] for item in receipt)} replacement(s)")
-    return updated
+    """pipeline.apply_personal_dictionary, logging to Sotto's log."""
+    return pipeline.apply_personal_dictionary(text, preprocessing, log)
 
 
 def live_preview(text: str) -> str:
@@ -876,9 +856,15 @@ def _audio_devices() -> list[dict]:
         get_data(dev_id, fourcc("lnam"), fourcc("glob"), ref)
         if not ref.value:
             return ""
-        buf = ctypes.create_string_buffer(256)
-        cf.CFStringGetCString(ref, buf, 256, 0x08000100)
-        return buf.value.decode("utf-8", "replace")
+        try:
+            buf = ctypes.create_string_buffer(256)
+            cf.CFStringGetCString(ref, buf, 256, 0x08000100)
+            return buf.value.decode("utf-8", "replace")
+        finally:
+            # kAudioObjectPropertyName hands out a +1 CFStringRef that the
+            # caller owns; the idle device scan runs every 5 s, so an
+            # unreleased name leaked a string per device per scan.
+            cf.CFRelease(ref)
 
     def terminals(dev_id, scope) -> list[int]:
         arr = (ctypes.c_uint32 * 32)()
@@ -916,7 +902,6 @@ def _select_input_device() -> tuple[int | None, str]:
     when one is connected — its mic is at your mouth — otherwise the built-in
     MacBook mic. Never the iPhone Continuity mic or a Bluetooth speaker's mic:
     those sit across the room and produced this project's deaf recordings."""
-    import ctypes
 
     def fourcc(code: str) -> int:
         return int.from_bytes(code.encode("ascii"), "big")
@@ -1021,9 +1006,10 @@ class CaptureService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
-        self._ring: list[np.ndarray] = []
+        self._ring: list[tuple[np.ndarray, float]] = []   # (block, its rate)
         self._ring_samples = 0
         self._active: list[np.ndarray] | None = None
+        self._active_rates: list[float] = []   # per-block rates, parallel to _active
         self._stream = None
         self._stream_enqueue = None
         self._next_expected = None
@@ -1041,6 +1027,7 @@ class CaptureService:
         self._process_started_at = time.monotonic()
         self._restart_deferred_at = 0.0
         self.restart_callback = None
+        self.on_start_failed = None   # runtime hook: the mic never came up under a capture
         self._release_thread = None
         self._last_device_scan = 0.0
         self._device_id = None
@@ -1056,13 +1043,17 @@ class CaptureService:
         # overlap. A release racing the next press used to be able to stop the
         # newly started capture.
         with self._lifecycle_lock:
-            self._start_engine_locked()
+            started = self._start_engine_locked()
+        if not started:
+            self._report_start_failure()
 
-    def _start_engine_locked(self) -> None:
+    def _start_engine_locked(self) -> bool:
         """Build, pin, and start the capture engine. NEVER raises — an audio
         error must not kill the daemon (a stale tap format threw straight out
         of installTapOnBus and took the whole process down, which launchd then
         restarted in a loop while dictations silently captured nothing).
+        Returns whether the engine is live afterwards; a False under an
+        in-flight capture is surfaced by _report_start_failure.
 
         The format must be re-read on a FRESH engine AFTER pinning: a device
         switch (AirPods run at 24 kHz, built-in at 48 kHz) briefly leaves the
@@ -1079,11 +1070,11 @@ class CaptureService:
         try:
             with self._lock:
                 if self._closed:
-                    return
+                    return False
             for attempt in range(5):
                 with self._lock:
                     if self._closed:
-                        return
+                        return False
                 # ONE engine for the process lifetime. Allocating a new
                 # AVAudioEngine per wake leaked its CoreAudio threads (43
                 # threads / 10 audio threads observed after ~50 wake cycles,
@@ -1132,18 +1123,37 @@ class CaptureService:
                             engine.stop()
                         except Exception:
                             pass
-                        return
+                        return False
                 self._engine = engine
                 self._node = node
                 self._last_block_at = time.monotonic()
                 self._engine_started_at = time.monotonic()
                 self._zero_since = None
-                return
+                return True
             log("! could not start the mic after 5 tries")
+            return False
         except Exception as exc:
             log(f"! mic engine error: {str(exc)[:150]}")
+            return False
         finally:
             self._starting = False
+
+    def _report_start_failure(self) -> None:
+        """The engine never came up: stop pretending. Clear the waking flag
+        so the overlay cannot flip to "mic live", and if a capture is waiting
+        on this engine hand it to the runtime hook, which ends the gesture
+        and tells the user once. Idle failures (the device scan switching
+        mics) stay quiet: the next press retries and reports then."""
+        with self._lock:
+            self._waking = False
+            pending = (self._active is not None and self._engine is None
+                       and not self._closed)
+        handler = self.on_start_failed
+        if pending and handler is not None:
+            try:
+                handler()
+            except Exception as exc:
+                log(f"! mic failure handler failed: {str(exc)[:120]}")
 
     def _release_engine(self, *, only_if_idle: bool = False) -> bool:
         with self._lifecycle_lock:
@@ -1151,7 +1161,13 @@ class CaptureService:
 
     def _release_engine_locked(self, *, only_if_idle: bool = False) -> bool:
         """Stop capture but KEEP the engine object — see _start_engine: a new
-        AVAudioEngine per wake leaks CoreAudio threads and CPU forever."""
+        AVAudioEngine per wake leaks CoreAudio threads and CPU forever.
+
+        Every teardown step runs even when an earlier one raises: a tap
+        removal that threw used to skip engine.stop(), and with the handle
+        already cleared nothing ever stopped that engine — idle Sotto kept
+        the microphone open. Returns True only when the engine actually
+        stopped; otherwise the handle stays so the next tick retries."""
         with self._lock:
             if only_if_idle and self._active is not None:
                 return False
@@ -1165,9 +1181,16 @@ class CaptureService:
         try:
             if node is not None:
                 node.removeTapOnBus_(0)
+        except Exception as exc:
+            log(f"! mic tap not removed: {str(exc)[:120]}")
+        try:
             engine.stop()
         except Exception as exc:
-            log(f"! mic release failed: {str(exc)[:120]}")
+            log(f"! mic engine not stopped: {str(exc)[:120]}")
+            with self._lock:
+                if not self._closed:
+                    self._engine, self._node = engine, node
+            return False
         return True
 
     def _observe_config_changes(self, engine) -> None:
@@ -1248,9 +1271,13 @@ class CaptureService:
                     self._release_engine()
                     self._start_engine()
                     return
-            if not active and idle_for > self.idle_release_s:
-                self._release_engine()
-                log("○ mic released (idle) — wakes on next press")
+            # Negative = never, exactly as release_soon reads it. only_if_idle:
+            # "idle" was decided under the lock a moment ago, and a press that
+            # lands in between must keep the engine it is about to record on.
+            if (not active and self.idle_release_s >= 0
+                    and idle_for > self.idle_release_s):
+                if self._release_engine(only_if_idle=True):
+                    log("○ mic released (idle) — wakes on next press")
         except Exception as exc:
             log(f"! mic health check failed: {str(exc)[:120]}")
 
@@ -1366,6 +1393,7 @@ class CaptureService:
                 return
             if all(not block.any() for block in self._active):
                 self._active = []
+                self._active_rates = []
 
     def _tap(self, buffer, when) -> None:
         n = int(buffer.frameLength())
@@ -1402,19 +1430,25 @@ class CaptureService:
             self.native_rate = float(buffer.format().sampleRate())
         except Exception:
             pass
+        rate = self.native_rate
         with self._lock:
             if self._active is not None:
+                # Each block keeps its own rate: a route change mid-recording
+                # (built-in 48 kHz -> AirPods 24 kHz) rebuilds the engine
+                # under a live capture, and end() must not read the earlier
+                # blocks at the later device's rate.
                 self._active.append(block)
+                self._active_rates.append(rate)
                 if self._stream is not None:
                     # Only queue references on the tap. Resampling and ASR run
                     # on the existing serialized transcription worker.
-                    self._stream_enqueue(("stream-audio", self._stream, block, self.native_rate))
+                    self._stream_enqueue(("stream-audio", self._stream, block, rate))
             else:
-                self._ring.append(block)
+                self._ring.append((block, rate))
                 self._ring_samples += len(block)
-                limit = int(RING_S * self.native_rate)
+                limit = int(RING_S * rate)
                 while self._ring_samples > limit and len(self._ring) > 1:
-                    self._ring_samples -= len(self._ring.pop(0))
+                    self._ring_samples -= len(self._ring.pop(0)[0])
 
     def begin(self, *, stream=None, enqueue=None) -> None:
         cold_start = False
@@ -1425,18 +1459,21 @@ class CaptureService:
                 self._stream.cancelled.set()
                 self._stream_enqueue(("stream-close", self._stream))
             preroll: list[np.ndarray] = []
+            preroll_rates: list[float] = []
             needed = int(PREROLL_S * self.native_rate)
             collected = 0
-            for block in reversed(self._ring):
+            for block, rate in reversed(self._ring):
                 preroll.insert(0, block)
+                preroll_rates.insert(0, rate)
                 collected += len(block)
                 if collected >= needed:
                     break
             self._active = preroll
+            self._active_rates = preroll_rates
             self._stream, self._stream_enqueue = stream, enqueue
             if stream is not None:
-                for block in preroll:
-                    enqueue(("stream-audio", stream, block, self.native_rate))
+                for block, rate in zip(preroll, preroll_rates):
+                    enqueue(("stream-audio", stream, block, rate))
             self._last_use = time.monotonic()
             # A start that never completed must not block every future wake —
             # treat a stale "starting" flag as dead and try again.
@@ -1457,16 +1494,25 @@ class CaptureService:
         """True until audio actually flows after a cold start (up to ~5s)."""
         return self._waking
 
+    def is_live(self) -> bool:
+        """An engine is up; False after a start that failed every try."""
+        with self._lock:
+            return self._engine is not None
+
     def end(self, *, include_stream=False):
         with self._lock:
             frames, self._active = self._active or [], None
+            rates, self._active_rates = self._active_rates, []
             stream, self._stream = self._stream, None
             self._stream_enqueue = None
             self._last_use = time.monotonic()
         if not frames:
             empty = np.zeros(0, dtype=np.float32)
             return (empty, stream) if include_stream else empty
-        samples = np.concatenate(frames).reshape(-1)
+        # Blocks placed directly (tests, old callers) carry no rate: they are
+        # at the current one, which is also what the caller reads next.
+        rates = rates + [self.native_rate] * (len(frames) - len(rates))
+        samples = join_capture_blocks(frames, rates, self.native_rate)
         # A hold shorter than the in-capture silence watch (3s) ends before
         # tick() can react, so short presses would keep landing on the same
         # wedged input unit forever (2026-09-20: 1.37s and 1.88s holds, peak
@@ -1485,6 +1531,7 @@ class CaptureService:
                 self._stream_enqueue(("stream-close", self._stream))
             self._stream = self._stream_enqueue = None
             self._active = None
+            self._active_rates = []
             self._last_use = time.monotonic()
 
     def is_active(self) -> bool:
@@ -1532,6 +1579,33 @@ class CaptureService:
             thread.join(timeout)
         return thread is None or not thread.is_alive()
 
+
+def join_capture_blocks(frames: list, rates: list, target_rate: float) -> np.ndarray:
+    """Join tap blocks into one signal at target_rate.
+
+    A route change mid-recording (built-in mic at 48 kHz, then AirPods at
+    24 kHz) leaves blocks of both rates in one capture. Reading them all at
+    the last device's rate stretched the earlier speech to twice its length
+    and halved its pitch; instead every run of same-rate blocks is resampled
+    on its own before the runs are concatenated."""
+    runs: list[tuple[list, float]] = []
+    for block, rate in zip(frames, rates):
+        if runs and runs[-1][1] == rate:
+            runs[-1][0].append(block)
+        else:
+            runs.append(([block], rate))
+    pieces = []
+    for blocks, rate in runs:
+        samples = np.concatenate(blocks).reshape(-1)
+        if rate != target_rate and rate > 0 and target_rate > 0:
+            from fractions import Fraction
+
+            from scipy.signal import resample_poly
+            ratio = Fraction(int(target_rate), int(rate)).limit_denominator(1000)
+            samples = resample_poly(samples, ratio.numerator,
+                                    ratio.denominator).astype(np.float32)
+        pieces.append(samples)
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
 
 
 def prepare_for_whisper(raw: np.ndarray, native_rate: float) -> np.ndarray:
@@ -1584,89 +1658,6 @@ def asr_skip_reason(samples: np.ndarray) -> str | None:
     return None
 
 
-def looks_hallucinated(text: str, seconds: float) -> str | None:
-    """Whisper can turn a second of breath into a thousand characters of
-    looped phrases. Speech is ~15 chars/sec; loops compress absurdly well.
-    Returns the reason if the transcript can't be real speech, else None."""
-    import zlib
-    chars_per_sec = len(text) / max(seconds, 0.1)
-    if chars_per_sec > 40:
-        return f"{chars_per_sec:.0f} chars/sec"
-    if len(text) > 120:
-        ratio = len(zlib.compress(text.encode())) / len(text.encode())
-        if ratio < 0.25:
-            return f"compression ratio {ratio:.2f}"
-    return None
-
-
-LOOP_MIN_REPEATS = 6       # far past what real speech repeats verbatim
-LOOP_MAX_UNIT_WORDS = 6    # loops cycle a word or a short phrase, not a clause
-LOOP_MIN_PREFIX_CHARS = 40  # below this there is no dictation worth rescuing
-
-
-def _find_repetition_loop(text: str) -> tuple[int, str, int] | None:
-    """Earliest degenerate repeated run in `text`, as (char offset where the
-    run starts, the repeated unit, repeat count). Words are matched
-    case-insensitively and without trailing punctuation, so whisper's
-    "Okay. Okay. Okay." loops count as repeats of one unit."""
-    import re
-    spans = [match.span() for match in re.finditer(r"\S+", text)]
-    words = [text[start:end].strip(".,!?;:-").casefold() for start, end in spans]
-    best: tuple[int, str, int] | None = None
-    for unit in range(1, LOOP_MAX_UNIT_WORDS + 1):
-        index = 0
-        while index + unit * LOOP_MIN_REPEATS <= len(words):
-            first = words[index:index + unit]
-            repeats, cursor = 1, index + unit
-            while cursor + unit <= len(words) and words[cursor:cursor + unit] == first:
-                repeats += 1
-                cursor += unit
-            if repeats >= LOOP_MIN_REPEATS:
-                if best is None or spans[index][0] < best[0]:
-                    unit_text = text[spans[index][0]:spans[index + unit - 1][1]]
-                    best = (spans[index][0], unit_text, repeats)
-                index = cursor
-            else:
-                index += 1
-    return best
-
-
-def salvage_repetition_loop(text: str, seconds: float) -> tuple[str, dict] | None:
-    """Whisper can transcribe real dictation and only then fall into a
-    repetition loop ("...that's part of the plan." + "difference" x223,
-    observed 2026-08-15). Blocking the whole transcript costs the user
-    everything they said, so cut at the loop and keep the clean prefix.
-
-    Returns (prefix, receipt) only when the prefix stands on its own as real
-    speech by the same measures that condemned the whole; otherwise None and
-    the caller quarantines as before."""
-    found = _find_repetition_loop(text)
-    if found is None:
-        return None
-    offset, unit_text, repeats = found
-    prefix = text[:offset].strip()
-    if len(prefix) < LOOP_MIN_PREFIX_CHARS:
-        return None
-    if looks_hallucinated(prefix, seconds) is not None:
-        return None
-    return prefix, {"unit": unit_text[:40], "repeats": repeats,
-                    "dropped_chars": len(text) - len(prefix)}
-
-
-def reads_as_no_speech(text: str, speech_fraction: float) -> str | None:
-    """Output-side no-speech verdict, judged AFTER transcription. Whisper
-    turns silence and dead-mic captures into short stock phrases ("you",
-    "Thank you."), so a tiny transcript from a capture the VAD scored as
-    speechless is silence, not dictation. A substantial transcript wins over
-    the VAD score — Silero scores real whispered dictation at 0% speech
-    (whispers on this machine: 240+ chars at VAD 0%; silence: <=15 chars)."""
-    if not text.strip():
-        return "empty transcript"
-    if speech_fraction < 0.06 and len(text.strip()) <= 20:
-        return f"tiny transcript, VAD {speech_fraction*100:.0f}% speech"
-    return None
-
-
 def collapse_silence(samples: np.ndarray) -> np.ndarray:
     """Shorten long silent stretches in a capture. Dead air is what whisper
     hallucinates on during long dictations ("Okay. Okay. Okay."), and it
@@ -1696,11 +1687,16 @@ def collapse_silence(samples: np.ndarray) -> np.ndarray:
 class GestureEngine:
     """Press/release edges -> hold / double-tap / discard decisions.
 
-    Every deadline carries an epoch token: any newer event invalidates it, so
-    a Timer callback that already fired but is waiting on the lock can never
-    act on stale state. Callbacks are invoked OUTSIDE the lock. The second
-    press of a double-tap is classified on its RELEASE: held short = arm
-    hands-free, held long = it was a deliberate push-to-talk.
+    Every key deadline carries an epoch token: any newer key event invalidates
+    it, so a Timer callback that already fired but is waiting on the lock can
+    never act on stale state. The hands-free watchdog is the exception: it
+    belongs to the capture, not the key epoch, so a stop tap whose release is
+    lost cannot disarm it — only ending or re-arming hands-free does.
+    Callbacks run OUTSIDE the lock, one at a time, in the order their
+    decisions were made: a decision queues its actions while it still holds
+    the lock, and whichever thread finds nobody draining runs the queue (see
+    _drain). The second press of a double-tap is classified on its RELEASE:
+    held short = arm hands-free, held long = it was a deliberate push-to-talk.
     """
 
     def __init__(self, on_start, on_finish, on_discard, on_hands_free=None) -> None:
@@ -1710,20 +1706,45 @@ class GestureEngine:
         self._on_hands_free = on_hands_free
         self._lock = threading.Lock()
         self._epoch = 0
+        self._hands_free_token = 0
         self._recording = False
         self._hands_free = False
         self._tap_pending = False      # a lone short tap awaits its verdict
         self._second_candidate = False
         self._pressed_at = 0.0
         self._last_tap_at = -1e9
+        self._pending: list = []       # actions decided, not yet run (in order)
+        self._draining = False
 
     def snapshot(self) -> tuple[bool, bool]:
         """(recording, hands_free) — for the lost-release resync poller."""
         with self._lock:
             return self._recording, self._hands_free
 
-    def _fire(self, callbacks) -> None:
-        for callback in callbacks:
+    def _queue(self, callbacks) -> None:
+        """Caller holds the lock: actions join the queue in decision order."""
+        self._pending.extend(callbacks)
+
+    def _drain(self) -> None:
+        """Run queued actions one at a time, in order, outside the lock.
+
+        The thread that finds nobody draining becomes the drainer and runs
+        everything queued, including what other threads add meanwhile; a
+        thread that arrives while another is draining has already queued its
+        actions under the lock and returns at once. So the event tap never
+        waits on a timer thread's callback, and a discard decided before a
+        start (the tap-expiry timer racing the next press) can never run
+        after it and kill the new capture."""
+        with self._lock:
+            if self._draining:
+                return
+            self._draining = True
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._draining = False
+                    return
+                callback = self._pending.pop(0)
             try:
                 callback()
             except Exception as exc:
@@ -1749,7 +1770,8 @@ class GestureEngine:
                 self._recording = True
                 fires.append(self._on_start)
             self._pressed_at = now
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def released(self) -> None:
         fires = []
@@ -1768,7 +1790,7 @@ class GestureEngine:
             elif self._second_candidate:
                 self._hands_free = True
                 self._epoch += 1
-                self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
+                self._arm_hands_free_watchdog()
                 log("● hands-free (tap again to stop)")
                 if self._on_hands_free is not None:
                     fires.append(self._on_hands_free)
@@ -1778,7 +1800,8 @@ class GestureEngine:
                 self._epoch += 1
                 self._schedule(DOUBLE_TAP_WINDOW_S, self._expire_tap)
             self._second_candidate = False
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_start(self) -> bool:
         """Menu-driven start: arm a hands-free recording without any key
@@ -1792,12 +1815,21 @@ class GestureEngine:
             self._tap_pending = False
             self._recording = True
             self._hands_free = True
-            self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout)
-        self._fire([self._on_start] + ([self._on_hands_free] if self._on_hands_free is not None else []))
+            self._arm_hands_free_watchdog()
+            fires.append(self._on_start)
+            if self._on_hands_free is not None:
+                fires.append(self._on_hands_free)
+            self._queue(fires)
+        self._drain()
         return True
 
-    def force_finish(self) -> bool:
-        """Menu escape hatch: end any in-flight recording as a normal finish."""
+    def force_finish(self, finish=None) -> bool:
+        """Menu escape hatch: end any in-flight recording as a normal finish.
+
+        `finish` replaces on_finish for this one decision. It may run after
+        this returns (another thread is draining), so anything the caller
+        wants that finish to know must travel inside it — never in state the
+        caller sets around this call."""
         fires = []
         with self._lock:
             self._epoch += 1
@@ -1806,8 +1838,9 @@ class GestureEngine:
             if self._recording:
                 self._recording = False
                 self._hands_free = False
-                fires.append(self._on_finish)
-        self._fire(fires)
+                fires.append(finish or self._on_finish)
+            self._queue(fires)
+        self._drain()
         return was_recording
 
     def chorded(self) -> None:
@@ -1823,7 +1856,8 @@ class GestureEngine:
             self._second_candidate = False
             self._recording = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
     def force_reset(self) -> None:
         """Sleep/lock/tap-disable recovery: drop any in-flight recording."""
@@ -1836,12 +1870,23 @@ class GestureEngine:
                 self._recording = False
                 self._hands_free = False
                 fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
-    def _schedule(self, delay: float, handler) -> None:
-        timer = threading.Timer(delay, handler, args=(self._epoch,))
+    def _schedule(self, delay: float, handler, token: int | None = None) -> None:
+        timer = threading.Timer(delay, handler,
+                                args=(self._epoch if token is None else token,))
         timer.daemon = True
         timer.start()
+
+    def _arm_hands_free_watchdog(self) -> None:
+        """Caller holds the lock. The watchdog is bound to THIS hands-free
+        capture: pressing the key again must not disarm it (a stop tap whose
+        release is lost used to leave the mic open forever), and a re-armed
+        hands-free gets a fresh token so the old deadline cannot end it."""
+        self._hands_free_token += 1
+        self._schedule(HANDS_FREE_MAX_S, self._hands_free_timeout,
+                       self._hands_free_token)
 
     def _expire_tap(self, epoch: int) -> None:
         fires = []
@@ -1851,18 +1896,20 @@ class GestureEngine:
             self._recording = False
             self._tap_pending = False
             fires.append(self._on_discard)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
-    def _hands_free_timeout(self, epoch: int) -> None:
+    def _hands_free_timeout(self, token: int) -> None:
         fires = []
         with self._lock:
-            if epoch != self._epoch or not self._hands_free:
+            if token != self._hands_free_token or not self._hands_free:
                 return
             self._hands_free = False
             self._recording = False
             log(f"! hands-free watchdog ({HANDS_FREE_MAX_S:.0f}s) — finishing")
             fires.append(self._on_finish)
-        self._fire(fires)
+            self._queue(fires)
+        self._drain()
 
 
 # -- clipboard injection (main thread only) ---------------------------------
@@ -2680,382 +2727,6 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     jobs: queue.Queue = queue.Queue()
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
 
-    vad_warnings: set[str] = set()
-
-    def transcribe_worker() -> None:
-        while not shutdown.requested():
-            try:
-                job = jobs.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            publication=None
-            publication_adopted=False
-            publication_committed=False
-            try:
-                if shutdown.requested():
-                    continue
-                if job[0] == "stream-audio":
-                    _, stream, block, rate = job
-                    stream.feed(block, rate)
-                elif job[0] == "stream-close":
-                    job[1].close()
-                elif job[0] == "warmup":
-                    try:
-                        warm_speech_runtime(adaptive=False, model=model,
-                                            speech_config=current_speech_config(),
-                                            mlx_whisper=mlx_whisper)
-                        log("✓ model refreshed after idle")
-                    finally:
-                        model_activity["last_finished"] = time.monotonic()
-                        model_activity["rewarming"] = False
-                elif job[0] == "live":
-                    _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, stream = job
-                    started = time.monotonic()
-                    stream_prepared = None
-                    stream_text = None
-                    if stream is not None and raw.any():
-                        stream_text, stream_prepared = stream.finish()
-                    elif stream is not None:
-                        stream.close()
-                    samples = (stream_prepared.asr_samples if stream_prepared is not None
-                               else prepare_for_whisper(raw, native_rate))
-                    seconds = len(samples) / SAMPLE_RATE
-                    rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
-                    if seconds < 0.2:
-                        log("○ sub-0.2s capture dropped (key-tap artifact)")
-                        continue
-                    skip = asr_skip_reason(samples)
-                    if skip:
-                        # Exact zeros never reach Whisper. This is not an
-                        # energy gate: quiet whispered dictation is non-zero
-                        # and still goes to the ASR (2026-08-13/14).
-                        from audio_codec import prepare_canonical
-                        prepared = prepare_canonical(samples)
-                        if shutdown.requested():
-                            continue
-                        text = DEAD_ROUTE_TEXT
-                        _, attempt_metadata = _transcription_kwargs(
-                            job_config, glossary_terms, seconds)
-                        attempt_metadata.update({
-                            "vad": {"available": False, "speech_fraction": 0.0,
-                                    "span_count": 0},
-                            "preprocessing": {"resampled_normalized": True,
-                                              "vad_trimmed": False,
-                                              "silence_collapsed": False,
-                                              "outcome": "suspect"},
-                            "latency": {"queue_wait_seconds": round(
-                                time.monotonic() - queued_at, 4),
-                                        "asr_seconds": 0.0},
-                        })
-                        log(f"! not pasted ({skip})")
-                        finalize_primary_live_delivery(
-                            append=lambda: coordinator.append_live(
-                                text, prepared, seconds, model,
-                                ts=captured_ts, raw_samples=raw,
-                                raw_sample_rate=native_rate,
-                                provenance="live_suspect",
-                                adaptive=False, **attempt_metadata),
-                            adaptive_runtime=None,
-                            appended_publication=None,
-                            shutdown=shutdown, inject=None)
-                        refresh_history()
-                        log(f"→ 0.00s · {len(text)} chars")
-                        continue
-                    # VAD is advisory only: it trims dead air from long
-                    # captures and feeds the output-side no-speech verdict.
-                    # It must never block transcription — Silero scores real
-                    # whispered dictation at 0% speech, so a deliberate
-                    # capture always reaches the ASR and the transcript
-                    # decides what happens (2026-08-13/14 incidents).
-                    vad_available = True
-                    speech_fraction = 1.0
-                    speech_spans: list = []
-                    try:
-                        import vad
-                        speech_fraction, speech_spans = vad.analyze(samples)
-                    except Exception as exc:
-                        vad_available = False
-                        reason = str(exc)[:80]
-                        if reason not in vad_warnings:  # once per cause, not every dictation
-                            vad_warnings.add(reason)
-                            log(f"○ advisory VAD unavailable ({reason}); transcribing without trimming")
-                    vad_metadata = {"available": vad_available,
-                                    "speech_fraction": round(float(speech_fraction), 4),
-                                    "span_count": len(speech_spans)}
-                    preprocessing = {"resampled_normalized": True,
-                                     "vad_trimmed": False,
-                                     "silence_collapsed": False}
-                    if stream is not None:
-                        preprocessing.update({"streaming": True,
-                                              "streaming_retry": stream.fallback})
-                    if speech_spans and seconds > 10 and not use_nemotron:
-                        before = seconds
-                        samples = vad.trim_to_speech(samples, speech_spans)
-                        trimmed = before - len(samples) / SAMPLE_RATE
-                        preprocessing["vad_trimmed"] = trimmed > 0
-                        if trimmed > 1:
-                            log(f"  trimmed {trimmed:.0f}s of non-speech (VAD)")
-                    if len(samples) / SAMPLE_RATE > LONG_CAPTURE_S and not use_nemotron:
-                        before = len(samples)
-                        samples = collapse_silence(samples)
-                        preprocessing["silence_collapsed"] = len(samples) < before
-                        if len(samples) < before:
-                            log(f"  trimmed {(before - len(samples)) / SAMPLE_RATE:.0f}s of dead air")
-                    from audio_codec import prepare_canonical
-                    prepared = stream_prepared if stream_prepared is not None else prepare_canonical(samples)
-                    if shutdown.requested():
-                        continue
-                    staged_live_path = None
-                    entry_adaptive = adaptive
-                    if adaptive_runtime is not None:
-                        try:
-                            text, adaptive_metadata, staged_live_path = adaptive_live_transcribe_prepared(
-                                adaptive_runtime,prepared,capture_id)
-                            publication=adaptive_metadata.pop("comparator_publication",None)
-                            attempt_metadata = {"profile": "adaptive-en", "language": "en",
-                                                "prompt": {"disabled": "adaptive candidate policy"},
-                                                "candidate": adaptive_metadata}
-                            actual_model = adaptive_metadata["repo"]
-                        except Exception as exc:
-                            discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                            if shutdown.requested():
-                                continue
-                            # An exception can escape after a durable comparator
-                            # intent/spool was created.  That state is owned by
-                            # the store's recovery machinery: guarantee the
-                            # deferred lease-window sweep FIRST (a failed
-                            # immediate reconcile must not prevent it), then
-                            # attempt prompt recovery too.
-                            try:
-                                adaptive_runtime.schedule_orphan_sweep(is_shutdown=shutdown.requested)
-                            except Exception:
-                                pass
-                            try:
-                                adaptive_runtime.reconcile(retry_pending=False)
-                            except Exception:
-                                pass
-                            # Adaptive authority drift (stale receipts, changed
-                            # runtime) must never cost the user their capture:
-                            # degrade to plain baseline dictation.  The result
-                            # enters ordinary non-adaptive history only, so
-                            # nothing reaches the adaptive lane without valid
-                            # receipts and no gate is weakened.
-                            log(f"! adaptive lane unavailable ({str(exc)[:80]}) — baseline dictation only")
-                            import mlx_whisper as mlx_whisper_fallback
-                            text, attempt_metadata = transcribe_prepared(
-                                LocalWhisper(mlx_whisper_fallback, model), prepared, job_config, glossary_terms)
-                            actual_model = model
-                            entry_adaptive = False
-                            publication = None
-                    elif use_nemotron:
-                        from nemotron_backend import metadata
-                        text = stream_text if stream_text is not None else nemotron.transcribe(prepared.asr_samples)
-                        attempt_metadata = metadata()
-                        actual_model = model
-                    else:
-                        text, attempt_metadata = transcribe_prepared(
-                            mlx_whisper, prepared, job_config, glossary_terms)
-                        actual_model = model
-                    # A backend may ignore cancellation.  Its result is never
-                    # pasted, registered, or persisted after shutdown.
-                    if shutdown.requested():
-                        if adaptive_runtime is not None:
-                            discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                        continue
-                    elapsed = time.monotonic() - started
-                    model_activity["last_finished"] = time.monotonic()
-                    detected_language = attempt_metadata.pop("detected_language", None)
-                    if detected_language:
-                        preprocessing["detected_language"] = detected_language
-                    attempt_metadata.update({"vad": vad_metadata,
-                                             "preprocessing": preprocessing,
-                                             "latency": {"queue_wait_seconds": round(started - queued_at, 4),
-                                                         "asr_seconds": round(elapsed, 4)}})
-                    prepared_seconds = len(prepared.asr_samples) / SAMPLE_RATE
-                    no_speech = reads_as_no_speech(text, speech_fraction)
-                    if no_speech == "empty transcript":
-                        text = "[no speech detected]"
-                    if text and not shutdown.requested():
-                        appended_row = None
-                        hallucinated = looks_hallucinated(text, prepared_seconds)
-                        if hallucinated and not no_speech:
-                            # A loop that starts partway through must not cost
-                            # the user the real dictation in front of it.
-                            salvaged = salvage_repetition_loop(text, prepared_seconds)
-                            if salvaged is not None:
-                                text, trim_receipt = salvaged
-                                preprocessing["repetition_trimmed"] = trim_receipt
-                                log(f"  cut a {trim_receipt['repeats']}x repetition loop "
-                                    f"({trim_receipt['dropped_chars']} chars) — "
-                                    "pasting the clean prefix")
-                                hallucinated = None
-                        reason = hallucinated or no_speech
-                        voice_action = None
-                        if not reason and not entry_adaptive:
-                            text = apply_personal_dictionary(text, preprocessing)
-                            text, voice_action = apply_voice_cleanup(
-                                text, preprocessing,
-                                preprocessing.get("detected_language") or job_config.language)
-                        attempt_metadata["latency"]["release_to_text_seconds"] = round(
-                            time.monotonic() - queued_at, 4)
-                        if shutdown.requested():
-                            continue
-                        publication_meta={"comparator_publication":publication} if publication is not None else {}
-                        if publication is not None and not adaptive_runtime.adopt_comparator_publication(
-                                publication_meta,history_id=capture_id,history_revision=0):
-                            adaptive_runtime.cancel_comparator_publication(publication_meta)
-                            adaptive_runtime.fail_comparator_publication(publication_meta)
-                            raise RuntimeError("comparator publication adoption unavailable")
-                        if reason:
-                            log(f"! not pasted ({reason}) — kept in history")
-                            preprocessing["outcome"] = "suspect"
-                            try:
-                                appended_row = finalize_primary_live_delivery(
-                                    append=lambda: coordinator.append_live(
-                                        text, prepared, prepared_seconds, actual_model,
-                                        ts=captured_ts, raw_samples=raw,
-                                        raw_sample_rate=native_rate, provenance="live_suspect",
-                                        adaptive=entry_adaptive, entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
-                                    adaptive_runtime=adaptive_runtime,appended_publication=publication_meta,
-                                    shutdown=shutdown,inject=None)
-                                publication_committed = appended_row is not None
-                            except Exception:
-                                if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                                raise
-                        else:
-                            if shutdown.requested():
-                                continue
-                            try:
-                                appended_row = finalize_primary_live_delivery(
-                                    append=lambda: coordinator.append_live(
-                                        text, prepared, prepared_seconds, actual_model, ts=captured_ts,
-                                        raw_samples=raw, raw_sample_rate=native_rate,
-                                        provenance="live", adaptive=entry_adaptive,
-                                        entry_id=capture_id if entry_adaptive else None, **attempt_metadata),
-                                    adaptive_runtime=adaptive_runtime,appended_publication=publication_meta,
-                                    shutdown=shutdown,
-                                    inject=(lambda: deliver_call(undo_when_clear, 0)) if voice_action == "scratch"
-                                    else (lambda: deliver_call(inject_when_clear, text, 0)) if text else None)
-                                publication_committed = appended_row is not None
-                            except Exception:
-                                if adaptive_runtime is not None: discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                                raise
-                        publication_adopted = (appended_row is not None and not shutdown.requested())
-                        if appended_row is not None and text and not reason and voice_action is None:
-                            record_totals(text, len(raw) / max(native_rate, 1.0))
-                        refresh_history()
-                    elif adaptive_runtime is not None:
-                        # No History append adopted this pre-publication WAV.
-                        if publication is not None:
-                            adaptive_runtime.cancel_comparator_publication({"comparator_publication":publication})
-                        discard_staged_adaptive_live_audio(adaptive_runtime.history,capture_id)
-                    log(f"→ {time.monotonic() - queued_at:.2f}s after release "
-                        f"(speech model {elapsed:.2f}s) · {len(text)} chars")
-                elif job[0] == "retry":
-                    _, entry_id, queued_at, capture_id, job_config = job
-                    snapshot = coordinator.snapshot_for_retry(entry_id)
-                    if snapshot is None:
-                        log("↻ retry skipped — entry deleted")
-                        continue
-                    prepared_seconds = len(snapshot.samples) / SAMPLE_RATE
-                    # Retry uses the immutable canonical decode from its snapshot;
-                    # it must never re-trim or re-collapse persisted inference input.
-                    if asr_skip_reason(snapshot.samples):
-                        text = DEAD_ROUTE_TEXT
-                        _, attempt_metadata = _transcription_kwargs(
-                            job_config, glossary_terms, prepared_seconds)
-                        attempt_metadata.update({
-                            "vad": {"available": None, "speech_fraction": None,
-                                    "span_count": None},
-                            "preprocessing": {"retry_canonical": True,
-                                              "outcome": "suspect"},
-                            "latency": {"queue_wait_seconds": round(
-                                time.monotonic() - queued_at, 4),
-                                        "asr_seconds": 0.0},
-                        })
-                        coordinator.commit_retry(
-                            entry_id, text, snapshot.expected_revision,
-                            model=model, provenance="retry",
-                            **attempt_metadata)
-                        log("↻ retry skipped — dead microphone (all-zero capture)")
-                        refresh_history()
-                        continue
-                    retry_started = time.monotonic()
-                    if shutdown.requested():
-                        continue
-                    if adaptive_runtime is not None:
-                        text, adaptive_metadata = adaptive_runtime.live_transcribe(
-                            snapshot.samples, canonical_path=snapshot.inference_audio_path,
-                            canonical_identity=snapshot.inference_identity, capture_id=capture_id)
-                        publication=adaptive_metadata.pop("comparator_publication",None)
-                        attempt_metadata = {"profile": "adaptive-en", "language": "en",
-                                            "prompt": {"disabled": "adaptive candidate policy"},
-                                            "candidate": adaptive_metadata}
-                        retry_model = adaptive_metadata["repo"]
-                    else:
-                        text, attempt_metadata = transcribe_canonical_samples(
-                            mlx_whisper, snapshot.samples, job_config, glossary_terms, nemotron=nemotron)
-                        retry_model = model
-                    model_activity["last_finished"] = time.monotonic()
-                    if shutdown.requested():
-                        continue
-                    retry_preprocessing = {"retry_canonical": True}
-                    detected_language = attempt_metadata.pop("detected_language", None)
-                    if detected_language:
-                        retry_preprocessing["detected_language"] = detected_language
-                    if (adaptive_runtime is None and text
-                            and not looks_hallucinated(text, len(snapshot.samples) / SAMPLE_RATE)):
-                        text = apply_personal_dictionary(text, retry_preprocessing)
-                    attempt_metadata.update({"vad": {"available": None, "speech_fraction": None,
-                                                       "span_count": None},
-                                             "preprocessing": retry_preprocessing,
-                                             "latency": {"queue_wait_seconds": round(retry_started - queued_at, 4),
-                                                         "asr_seconds": round(time.monotonic() - retry_started, 4)}})
-                    if shutdown.requested():
-                        continue
-                    publication_meta={"comparator_publication":publication} if publication is not None else {}
-                    if publication is not None and not adaptive_runtime.adopt_comparator_publication(
-                            publication_meta,history_id=entry_id,
-                            history_revision=snapshot.expected_revision + 1):
-                        adaptive_runtime.cancel_comparator_publication(publication_meta)
-                        adaptive_runtime.fail_comparator_publication(publication_meta)
-                        raise RuntimeError("comparator publication adoption unavailable")
-                    committed = coordinator.commit_retry(
-                        entry_id, text, snapshot.expected_revision, model=retry_model,
-                        provenance="retry", **attempt_metadata)
-                    publication_committed = committed is not None
-                    if adaptive_runtime is not None and publication is not None:
-                        if committed is None:
-                            adaptive_runtime.cancel_comparator_publication(publication_meta)
-                        elif not shutdown.requested() and not adaptive_runtime.acknowledge_comparator_publication(publication_meta):
-                            # Retry's old revision revoke can have an exact
-                            # scrub marker in flight.  Keep the adopted
-                            # prepared row for restart reconciliation rather
-                            # than falsely cancelling a committed delivery.
-                            if not adaptive_runtime.comparator_publication_recovery_pending(publication_meta):
-                                adaptive_runtime.cancel_comparator_publication(publication_meta)
-                                adaptive_runtime.fail_comparator_publication(publication_meta)
-                                raise RuntimeError("comparator publication unavailable")
-                        publication_adopted = committed is not None and not shutdown.requested()
-                    if text and committed is not None and not shutdown.requested():
-                        ui_call(_copy_text, text)
-                        log(f"↻ retried · {len(text)} chars")
-                    refresh_history()
-                else:
-                    raise RuntimeError("unknown transcription job")
-            except Exception as exc:
-                log(f"! transcription failed: {str(exc)[:160]}")
-            finally:
-                if (adaptive_runtime is not None and publication is not None and not publication_adopted
-                        and not publication_committed):
-                    adaptive_runtime.cancel_comparator_publication({"comparator_publication":publication})
-                if status_ui is not None and job[0] not in {"stream-audio", "stream-close"}:
-                    ui_call(status_ui.hide_if_transcribing)
-                jobs.task_done()
-
-    transcription_thread = threading.Thread(target=transcribe_worker, daemon=True)
-    transcription_thread.start()
-
     def _copy_text(text: str) -> None:
         if shutdown.requested():
             return
@@ -3100,7 +2771,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 deadline = time.monotonic() + 10
                 while capture.is_waking() and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if engine.snapshot()[0]:
+                # A start that failed every try also ends the wait: say
+                # "live" only when an engine actually exists.
+                if engine.snapshot()[0] and capture.is_live():
                     ui_call(status_ui.show_recording)
                     log("● recording (mic live)")
 
@@ -3139,7 +2812,23 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         if status_ui:
             ui_call(status_ui.show_hands_free, hands_free_hint(binding["trigger"]))
 
+    def on_mic_failed() -> None:
+        """The engine never started under this capture (device busy or gone).
+        End the gesture so the key-up finds nothing to finish, and say so
+        once — a dead mic used to show "recording" and then lose the dictation
+        without a word. Finishing (not discarding) keeps whatever a
+        mid-capture rebuild had already recorded."""
+        if engine.force_finish():
+            log("✗ could not start the microphone — dictation cancelled")
+        if status_ui:
+            ui_call(status_ui.show_error, "Could not start the microphone",
+                    "Sotto could not open the input device. Check that another app "
+                    "is not holding it and that Sotto may use the microphone "
+                    "(System Settings → Privacy & Security → Microphone), then "
+                    "press the key again.")
+
     engine = GestureEngine(on_start, on_finish, on_discard, on_hands_free=on_hands_free)
+    capture.on_start_failed = on_mic_failed
     hotkey = parse_hotkey(hotkey_spec) if hotkey_spec else None
     hotkey_state: dict = {"pressed_at": None, "skip_up": False}
     if hotkey_spec and hotkey is None:
@@ -3205,6 +2894,23 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     def undo_when_clear(_attempts: int = 0) -> None:
         """Queue a 'scratch that' behind whatever is still waiting to paste."""
         delivery.undo()
+
+    # Built here, after inject_when_clear / undo_when_clear exist: the worker
+    # holds its collaborators instead of resolving them late like the closure
+    # did. Imported inside run() so transcription.py can bind sotto's helpers
+    # at import time without a cycle at module load.
+    from transcription import TranscriptionWorker
+    worker = TranscriptionWorker(
+        shutdown=shutdown, jobs=jobs, log=log, model=model, mlx_whisper=mlx_whisper,
+        nemotron=nemotron, current_speech_config=current_speech_config,
+        coordinator=coordinator, refresh_history=refresh_history,
+        adaptive_runtime=adaptive_runtime, adaptive=adaptive, use_nemotron=use_nemotron,
+        status_ui=status_ui, ui_call=ui_call, deliver_call=deliver_call,
+        inject_when_clear=inject_when_clear,
+        undo_when_clear=undo_when_clear, copy_text=_copy_text, record_totals=record_totals,
+        model_activity=model_activity, glossary_terms=glossary_terms)
+    transcription_thread = threading.Thread(target=worker.run, daemon=True)
+    transcription_thread.start()
 
     tap_watch = {"warned_at": 0.0}
 
@@ -3452,7 +3158,6 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                         "Switch engines after the current recording and transcription finish.")
                 return
             try:
-                from speech_config import save_engine_mode
                 if mode == "nemotron":
                     from nemotron_backend import installation
                     installation()  # verify before persisting a restart choice
@@ -3899,6 +3604,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             nemotron.close()
 
 
+def doctor_input_probe() -> int:
+    """The doctor's input check, run in a subprocess (see doctor): pin the
+    same mic a key press pins, THEN read the input bus format the tap will
+    use. The output bus of an unpinned engine describes the system default
+    device — a USB interface at 96 kHz / 2 ch, say — while dictation records
+    the pinned built-in or headset mic at its own rate."""
+    from AVFoundation import AVAudioEngine
+    engine = AVAudioEngine.alloc().init()
+    node = engine.inputNode()
+    _pin_input_to_builtin(node)   # logs "mic: <which one>" on stderr
+    fmt = node.inputFormatForBus_(0)
+    print(f"{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch")
+    return 0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1
+
+
 def doctor() -> None:
     import subprocess
     import ApplicationServices
@@ -3913,20 +3633,22 @@ def doctor() -> None:
     # Probe the input device in a subprocess: CoreAudio hard-crashes (a native
     # SIGSEGV, not a catchable exception) in sessions with no usable audio
     # context, and a diagnostic must survive the conditions it diagnoses.
-    probe = ("from AVFoundation import AVAudioEngine; "
-             "engine = AVAudioEngine.alloc().init(); "
-             "node = engine.inputNode(); fmt = node.outputFormatForBus_(0); "
-             "print(f'{fmt.sampleRate():.0f} Hz, {fmt.channelCount()} ch'); "
-             "raise SystemExit(0 if fmt.sampleRate() > 0 and fmt.channelCount() > 0 else 1)")
+    # The probe is doctor_input_probe: the capture path's own pin + input bus.
+    probe = "import sotto; raise SystemExit(sotto.doctor_input_probe())"
     try:
         result = subprocess.run([sys.executable, "-c", probe],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30,
+                                cwd=str(Path(__file__).resolve().parent))
     except subprocess.TimeoutExpired:
         log("✗ input device: probe timed out (waiting on a permission prompt?)")
     else:
         if result.returncode == 0:
             usable_input = True
-            log(f"✓ input device: {result.stdout.strip()} (AVAudioEngine)")
+            mics = [line.strip()[len("mic:"):].strip()
+                    for line in result.stderr.splitlines()
+                    if line.strip().startswith("mic:")]
+            log(f"✓ input device: {result.stdout.strip()} "
+                f"({mics[0] if mics else 'AVAudioEngine'})")
         else:
             log("✗ input device: no usable audio input in this session "
                 "(microphone permission missing, or headless/SSH context)")

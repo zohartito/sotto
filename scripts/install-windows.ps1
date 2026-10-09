@@ -221,6 +221,9 @@ if (Test-Path -LiteralPath $VenvPython -PathType Leaf) {
 }
 
 if ($PSCmdlet.ShouldProcess($VenvDir, "Install pinned packages from $(Split-Path -Leaf $Requirements)")) {
+  # An exact pip, not whichever one this Python shipped (F25); tests/test_dependency_pins.py keeps every copy in step.
+  Native { & $VenvPython -m pip install --disable-pip-version-check pip==26.2.1 }
+  if ($LASTEXITCODE -ne 0) { Fail 'Could not install pip 26.2.1 (see above); check the network and run again.' }
   Native { & $VenvPython -m pip install --disable-pip-version-check -r $Requirements }
   if ($LASTEXITCODE -ne 0) { Fail 'pip could not install the pinned packages (see above); check the network and run again.' }
   Native { & $VenvPython -m pip check --disable-pip-version-check }

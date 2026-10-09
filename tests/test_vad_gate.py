@@ -48,7 +48,8 @@ class SileroInstallTests(unittest.TestCase):
     """The advisory VAD model is pinned: nothing unverified is kept or loaded."""
 
     def test_install_keeps_only_the_pinned_bytes(self):
-        import hashlib, tempfile
+        import hashlib
+        import tempfile
         from pathlib import Path
         import vad
         with tempfile.TemporaryDirectory() as temporary:

@@ -38,6 +38,8 @@ RUNTIME_SOURCE_FILES = (
     "login_item.py",
     "updates.py",
     "voice_commands.py",
+    "pipeline.py",
+    "transcription.py",
     "launchd_templates.py",
     "audio_codec.py",
     "comparator_spool.py",
