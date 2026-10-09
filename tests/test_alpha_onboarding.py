@@ -137,7 +137,8 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
 
     def test_failed_engine_restart_restores_previous_setting(self):
-        with patch('speech_config.load_engine_mode', return_value='whisper'), patch('speech_config.save_engine_mode') as save:
+        with patch('speech_config.load_engine_mode', return_value='whisper'), \
+                patch('speech_config.save_engine_mode') as save:
             with self.assertRaises(RuntimeError):
                 sotto.persist_engine_and_restart('nemotron', lambda **_: False)
             self.assertEqual([c.args[0] for c in save.call_args_list], ['nemotron', 'whisper'])

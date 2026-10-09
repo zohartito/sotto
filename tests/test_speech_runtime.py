@@ -272,9 +272,12 @@ class SpeechRuntimeTests(unittest.TestCase):
         self.assertIn("if shutdown.requested():\n            shutdown.stop_capture(capture)", source)
         self.assertIn("shutdown.enqueue(jobs, (\"live\"", source)
         self.assertIn("shutdown.enqueue(jobs, (\"retry\"", source)
-        self.assertIn("# A backend may ignore cancellation.", source)
         self.assertIn("transcription_thread.join(APP_DRAIN_TIMEOUT)", source)
-        self.assertIn("finalize_primary_live_delivery(", source)
+        # The post-inference fences live in the worker (transcription.py).
+        from transcription import TranscriptionWorker
+        worker = inspect.getsource(TranscriptionWorker._live)
+        self.assertIn("# A backend may ignore cancellation.", worker)
+        self.assertIn("finalize_primary_live_delivery(", worker)
 
     def test_learning_remove_dependency_revoke_precedes_artifact(self):
         calls = []
