@@ -1007,6 +1007,58 @@ class FailureAndTeardownTest(unittest.TestCase):
         self.assertEqual(hooks[0].starts, 1, logs)
         self.assertNotIn("! keyboard listener died — restarting it", logs)
 
+    def test_a_shutdown_during_the_poll_never_revives_the_stopped_hook(self):
+        # [F35] The poller woke from its wait, found the listener dead, and
+        # started it again although teardown had stopped it in between.
+        import contextlib
+
+        hooks, boundaries, controllers, logs = [], [], [], []
+        FakeWhisper, FakeCapture, FakeHook = _app_fakes(16_000, [], [], hooks, [])
+        polled = threading.Event()
+
+        class DyingHook(FakeHook):
+            """The listener dies while Quit arrives: the shutdown and the
+            teardown's stop both land between the poller's wait and its start."""
+
+            def __init__(self, engine, *, trigger):
+                super().__init__(engine, trigger=trigger)
+                self.starts, self.checks = 0, 0
+                self.stop_event = threading.Event()
+                snapshot = engine.snapshot
+
+                def snapshot_after_the_revive_check():
+                    if self.checks:
+                        polled.set()
+                    return snapshot()
+
+                engine.snapshot = snapshot_after_the_revive_check
+
+            def start(self):
+                self.starts += 1
+
+            def stop(self):
+                super().stop()
+                self.stop_event.set()
+
+            def alive(self):
+                self.checks += 1
+                boundaries[0].request()
+                self.stop_event.wait(10)
+                return False
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-poll-") as temporary:
+            data = Path(temporary)
+            with contextlib.ExitStack() as stack:
+                _patched_run(stack, data, (FakeWhisper, FakeCapture, DyingHook), logs=logs,
+                             boundaries=boundaries, controllers=controllers)
+                sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu")
+                self.assertTrue(polled.wait(10), "the poller finished the poll it was in")
+
+        self.assertTrue(hooks[0].stopped)
+        self.assertEqual(hooks[0].checks, 1)
+        self.assertEqual(hooks[0].starts, 1, logs)
+        self.assertNotIn("! keyboard listener died — restarting it", logs)
+
     def test_a_queued_insertion_never_outlives_its_own_wait(self):
         # [F46] Each queued text got a fresh modifier wait after the ones ahead
         # of it used theirs up, so dictation N could land N waits late.

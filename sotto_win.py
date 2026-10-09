@@ -1061,6 +1061,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
     engine = sotto.GestureEngine(on_start, on_finish, on_discard)
     hook = win_hotkey.TriggerHook(engine, trigger=trigger)
     hook.start()
+    hook_lock = threading.Lock()  # the resync poller's revive vs the teardown's stop
 
     def insert_one(text: str, prefs: DeliveryPrefs, ready_at: float) -> None:
         """Never insert while a modifier key is held — synthetic keystrokes or
@@ -1136,13 +1137,15 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         consecutive polls gets its release synthesized. Hands-free is exempt —
         its key is legitimately up while recording."""
         misses = 0
-        # Waits on the shutdown event, so a hook stopped by Quit or Restart is
-        # never started again behind the teardown.
         while not shutdown.event.wait(1.0):
             capture.tick()
             if not hook.alive():
-                log("! keyboard listener died — restarting it")
-                hook.start()
+                # The teardown requests shutdown before it stops the hook under
+                # this lock, so a hook it stopped is never started again.
+                with hook_lock:
+                    if not shutdown.requested():
+                        log("! keyboard listener died — restarting it")
+                        hook.start()
             recording, hands_free = engine.snapshot()
             if recording and not hands_free and not hook.physically_down:
                 misses += 1
@@ -1186,7 +1189,8 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             shutdown.stop_capture(capture)
             shutdown.discard_queued(jobs)
             shutdown.discard_queued(deliveries)  # their text is already in History
-            hook.stop()
+            with hook_lock:
+                hook.stop()
             transcription_thread.join(sotto.APP_DRAIN_TIMEOUT)
             if transcription_thread.is_alive():
                 log("  an in-flight transcription was abandoned (never pasted or saved)")
