@@ -521,6 +521,8 @@ class DoctorProbeTest(unittest.TestCase):
                          "probe must pin first, then read the INPUT bus — never the output bus")
         self.assertEqual(out.getvalue().strip(), "48000 Hz, 1 ch")
 
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "macOS doctor: patches ApplicationServices.AXIsProcessTrusted")
     def test_doctor_runs_the_probe_through_sotto_not_an_unpinned_output_bus(self):
         logs = []
         completed = types.SimpleNamespace(returncode=0, stdout="48000 Hz, 1 ch\n",
