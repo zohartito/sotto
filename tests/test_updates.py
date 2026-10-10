@@ -84,6 +84,21 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(updates.describe(updates.UpdateCheck("current", version="abc1234"), "x")[0],
                          "Sotto is up to date")
 
+    def test_a_terminal_run_is_given_the_command_instead_of_an_update(self):
+        # [N28] Owner decision 2026-10-09: Check for Updates in a terminal run
+        # refuses and names the manual command; it used to rebuild Sotto.app
+        # for the alpha data folder, which that run may not use.
+        command = updates.mac_manual_update(Path("/Users/someone/my sotto"))
+        self.assertEqual(command, "cd '/Users/someone/my sotto' && scripts/install-mac.sh --update")
+        title, text = updates.describe(updates.UpdateCheck("available", behind=1, changes=("Add A",)),
+                                       command, self_update=False)
+        self.assertEqual(title, "1 update available")
+        self.assertIn("• Add A", text)
+        self.assertIn("started from a terminal", text)
+        self.assertIn(command, text)
+        self.assertNotIn("Update now?", text)
+        self.assertIn("Update now?", updates.describe(updates.UpdateCheck("available", behind=1), command)[1])
+
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
 class RealGitTests(unittest.TestCase):

@@ -407,6 +407,16 @@ class QuitDrainTests(unittest.TestCase):
         body = _closure_source("finish_capture")
         self.assertLess(body.index("capture.end("), body.index('shutdown.enqueue(jobs, ("live"'))
 
+    def test_only_sotto_app_offers_to_update_itself(self):
+        # [N28] A terminal run is told the manual command (updates.describe with
+        # self_update=False); only Sotto.app's own launcher gets "Update Now",
+        # whose installer rebuilds Sotto.app and restarts it.
+        source = _closure_source("action_check_updates")
+        self.assertIn("self_update=app_mode()", source)
+        self.assertIn('result.state == "available" and app_mode()', source)
+        self.assertIn("updates.mac_manual_update(", source)
+        self.assertIn("if not app_mode():", _closure_source("action_apply_update"))
+
     def test_the_update_restart_wait_has_a_deadline(self):
         # The gate is closed while it waits, so a wedged native call (or a paste
         # count that never drops) must not refuse recordings forever.

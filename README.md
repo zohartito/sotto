@@ -70,6 +70,9 @@ never your words) is `logs/sotto.log` in the data folder.
 - Update: **Check for Updates…** in Sotto's menu lists what is new and updates
   a git clone on request, then restarts. It contacts GitHub only when you click
   it. From a terminal: `scripts/install-mac.sh --update`. Your settings stay.
+  When Sotto was started from a terminal (not as Sotto.app), Check for Updates
+  only lists what is new and shows that command for this folder: quit Sotto,
+  then run it.
 - Remove: `scripts/install-mac.sh --uninstall` (removes the app and its login
   item; your data folder stays until you delete it).
 

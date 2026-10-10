@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
@@ -147,15 +148,25 @@ def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run,
     return finished, tail, bool(before and after and before != after)
 
 
-def describe(result: UpdateCheck, manual_update: str) -> tuple[str, str]:
+def mac_manual_update(root: Path) -> str:
+    """The Terminal command that updates the checkout at root by hand."""
+    return f"cd {shlex.quote(str(root))} && scripts/install-mac.sh --update"
+
+
+def describe(result: UpdateCheck, manual_update: str, *, self_update: bool = True) -> tuple[str, str]:
     """Dialog title and text for a check result; manual_update is the
-    platform's command for updating by hand."""
+    platform's command for updating by hand. self_update False (a Mac run
+    not started by Sotto.app) names that command instead of offering the
+    update, whose installer rebuilds and restarts Sotto.app (N28)."""
     if result.state == "current":
         return "Sotto is up to date", f"You have the latest version ({result.version})."
     if result.state == "available":
         count = f"{result.behind} update" + ("s" if result.behind != 1 else "")
         listed = "\n".join(f"• {subject}" for subject in result.changes)
         more = "\n• …" if result.behind > len(result.changes) else ""
+        if not self_update:
+            return f"{count} available", (f"{listed}{more}\n\nSotto was started from a terminal, so it does "
+                                          f"not update itself. Quit it, then run in Terminal:\n{manual_update}")
         return f"{count} available", (f"{listed}{more}\n\nUpdate now? Sotto restarts when it is done, "
                                       "usually within a minute.")
     if result.state in ("local-changes", "diverged"):
