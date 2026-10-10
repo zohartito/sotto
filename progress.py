@@ -79,6 +79,10 @@ def _write(path: Path, totals: dict) -> None:
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump(totals, stream)
+            # On disk before it replaces the old file (N32): a torn stats.json
+            # is never rewritten again under record()'s strict parse (F38).
+            stream.flush()
+            os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
     finally:

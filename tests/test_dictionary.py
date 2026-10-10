@@ -92,6 +92,16 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual([p.name for p in self.path.parent.iterdir()], ["dictionary.txt"])
 
+    def test_a_heard_side_the_file_would_read_as_a_comment_is_refused(self):
+        """N31: "#sotto => Sotto" is a comment line to parse(), so the rule was
+        written, reported as added, and never applied."""
+        self.assertEqual(dictionary.suggest("tag #sotto here", "tag Sotto here"), [])
+        dictionary.add([Rule("sotto", "Sotto")], self.path)
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"#sotto.*comment"):
+            dictionary.add([Rule("iphone", "iPhone"), Rule("  #sotto", "Sotto")], self.path)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before, "nothing is written")
+
     def test_load_rereads_only_after_a_change_and_missing_file_is_empty(self):
         self.assertEqual(dictionary.load(self.path), [])
         dictionary.ensure_file(self.path)

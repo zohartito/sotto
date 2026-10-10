@@ -2532,10 +2532,12 @@ def nonadaptive_revoke_learning(dependency_guard, coordinator, entry_id: str):
 
 
 HISTORY_UNREADABLE_TITLE = "History could not be read"
+LEARNING_UNREADABLE_TITLE = "Learning set could not be read"
 
 
 class UnsavedHistory:
-    """Stands in for LearningCoordinator while history.jsonl cannot be read (F16b).
+    """Stands in for LearningCoordinator while history.jsonl (F16b), or the
+    learning set's learning.jsonl or pending-gold.jsonl (N21), cannot be read.
 
     Dictation keeps working: ``append_live`` hands back an in-memory row so the
     text is still delivered, but nothing (row, audio, learning state) is
@@ -2554,19 +2556,23 @@ class UnsavedHistory:
 
     def __getattr__(self, name: str):
         from history import HistoryUnreadable
-        raise HistoryUnreadable(f"History is unreadable and was left unchanged ({self.history.unreadable})")
+        if self.history.unreadable is not None:
+            raise HistoryUnreadable(f"History is unreadable and was left unchanged ({self.history.unreadable})")
+        raise HistoryUnreadable("History is not changed while the learning set is unreadable "
+                                f"({self.learning.unreadable})")
 
 
 def history_coordinator(store, learning_store):
     """The dictation session's coordinator for ``store``.
 
     A store opened with ``tolerate_unreadable=True`` over an unreadable
-    history.jsonl (F16b) gets an UnsavedHistory instead of a
+    history.jsonl (F16b), or a learning store opened the same way over an
+    unreadable learning set (N21), gets an UnsavedHistory instead of a
     LearningCoordinator, whose startup re-read would raise before the menu
     bar exists; the caller tells the user once with
-    ``history_unreadable_message``. Side effects: a LearningCoordinator
+    ``unreadable_store_alert``. Side effects: a LearningCoordinator
     validates the active learning links against History."""
-    if store.unreadable is not None:
+    if store.unreadable is not None or learning_store.unreadable is not None:
         return UnsavedHistory(store, learning_store)
     from learning import LearningCoordinator
     return LearningCoordinator(store, learning_store)
@@ -2581,6 +2587,25 @@ def history_unreadable_message(store) -> str:
     return (f"Sotto cannot read {store.index} because {cause}. The file and its recordings "
             "were left exactly as they are. Dictation still works, but new dictations are "
             f"not saved to History until the file can be read again: {remedy}, then restart Sotto.")
+
+
+def learning_unreadable_message(learning_store) -> str:
+    # As for History: never suggest moving or deleting the file, which would
+    # make every kept learning recording look like an orphan.
+    return (f"Sotto cannot read {learning_store.unreadable.path} because part of it is damaged. "
+            "Your learning set and History were left exactly as they are. Dictation still works, but "
+            "new dictations are not saved to History until the file can be read again: repair the "
+            "damaged line, then restart Sotto.")
+
+
+def unreadable_store_alert(store, learning_store) -> tuple[str, str] | None:
+    """(title, message) for the one startup alert about an unreadable History
+    or learning set, or None when both read."""
+    if store.unreadable is not None:
+        return HISTORY_UNREADABLE_TITLE, history_unreadable_message(store)
+    if learning_store.unreadable is not None:
+        return LEARNING_UNREADABLE_TITLE, learning_unreadable_message(learning_store)
+    return None
 
 
 def _read_only_json(path: Path) -> dict | None:
@@ -2944,16 +2969,19 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     active_engine = "nemotron" if use_nemotron else "parakeet" if use_parakeet else "whisper"
 
-    # An unreadable history.jsonl must not kill the app before its menu bar
-    # exists (F16b). The adaptive lane's receipts depend on History, so there
-    # it stays fatal.
+    # An unreadable history.jsonl (F16b) or learning set (N21) must not kill
+    # the app before its menu bar exists. The adaptive lane's receipts depend
+    # on both, so there it stays fatal.
     from history import HistoryStore
     from learning import LearningStore
     store = HistoryStore(tolerate_unreadable=not adaptive)
-    learning_store = LearningStore()
+    learning_store = LearningStore(tolerate_unreadable=not adaptive)
     coordinator = history_coordinator(store, learning_store)
     if store.unreadable is not None:
         log(f"! History unreadable ({store.unreadable}): {history_unreadable_message(store)}")
+    elif learning_store.unreadable is not None:
+        log(f"! Learning set unreadable ({learning_store.unreadable}): "
+            f"{learning_unreadable_message(learning_store)}")
     seed_totals(store)
     # Always available, no-model dependency guard: an earlier adaptive session
     # must remain revocation-safe even when this launch is non-adaptive.
@@ -2987,8 +3015,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     pending_deliveries = PendingDeliveries()
     ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
                                                  pending_deliveries)
-    if status_ui is not None and store.unreadable is not None:
-        ui_call(status_ui.show_error, HISTORY_UNREADABLE_TITLE, history_unreadable_message(store))
+    unreadable_alert = unreadable_store_alert(store, learning_store)
+    if status_ui is not None and unreadable_alert is not None:
+        ui_call(status_ui.show_error, *unreadable_alert)
 
     def refresh_history() -> None:
         if status_ui is not None:
