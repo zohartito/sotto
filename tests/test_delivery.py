@@ -83,6 +83,12 @@ class FakePasteboard:
     def setString_forType_(self, text, pb_type):
         self.items = [FakeItem({pb_type: text})]
 
+    def setData_forType_(self, data, pb_type):
+        """Like NSPasteboard: after clearContents, a write lands in the first item."""
+        if not self.items:
+            self.items = [FakeItem()]
+        self.items[0].setData_forType_(data, pb_type)
+
     def writeObjects_(self, items):
         self.items.extend(items)
 
@@ -324,6 +330,7 @@ class DeliveryQueueHarness:
         self.shutdown = False
         self.on_insert = lambda text: None  # runs inside the insert: may raise or request shutdown
         self.delivered, self.undos, self.notes, self.logs = [], [], [], []
+        self.copied: list[str] = []
         self.queue = sotto.DeliveryQueue(
             insert=self._insert, undo_keys=lambda: self.undos.append(round(self.timers.now, 2)),
             keys_held=self.held, recording=lambda: self.held() and self.recording_while_held,
@@ -331,7 +338,8 @@ class DeliveryQueueHarness:
             secure_input=lambda: self.secure, call_after=lambda fn, *args: fn(*args),
             note=lambda title, message: self.notes.append((title, message)), log=self.logs.append,
             shutdown_requested=lambda: self.shutdown, clock=lambda: self.timers.now,
-            timer=self.timers.Timer, **({} if on_done is None else {"on_done": on_done}))
+            timer=self.timers.Timer, copy=self.copied.append,
+            **({} if on_done is None else {"on_done": on_done}))
 
     def held(self):
         return self.timers.now < self.held_until
@@ -664,6 +672,152 @@ class EventTapCallbackTests(unittest.TestCase):
         self.assertEqual(tap.user_keydowns["count"], 2)
         tap.key_down(hotkey_code)                              # a plain "d" is
         self.assertEqual(tap.user_keydowns["count"], 3)
+
+
+# -- round 2: every way a paste can fail to land is told truthfully ---------------
+
+class UndeliveredPasteNoteTests(unittest.TestCase):
+    def test_n16_a_long_hold_drop_of_text_history_did_not_save_does_not_claim_history(self):
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
+        world.queue.paste("result-1 ", in_history=False)     # F16a: the append failed
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(len(world.notes), 1, world.notes)
+        title, message = world.notes[0]
+        self.assertNotIn("kept in History", title + message)
+        self.assertNotIn("Open History", message)
+        self.assertFalse(any("kept in History" in line for line in world.logs), world.logs)
+
+    def test_an_unsaved_dictation_dropped_by_a_long_hold_goes_to_the_clipboard(self):
+        # Owner decision 2026-10-09: History could not save it, so the dropped
+        # text is the only copy; it goes on the clipboard, with a note saying so.
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
+        world.queue.paste("saved one ")
+        world.queue.paste("first unsaved ", in_history=False)
+        world.queue.paste("second unsaved ", in_history=False)
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(world.copied, ["first unsaved \n\nsecond unsaved "])
+        self.assertEqual([title for title, _ in world.notes], ["Dictation copied to the clipboard"])
+        self.assertEqual(world.delivered, [])
+
+    def test_n16_a_long_hold_drop_of_saved_text_still_points_at_history(self):
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
+        world.queue.paste("result-1 ")
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(world.notes, [("Dictation kept in History",
+                                        "A key was held for too long to paste it. "
+                                        "Open History to copy the text.")])
+
+    def test_n16_a_failed_insert_of_unsaved_text_does_not_claim_history(self):
+        world = DeliveryQueueHarness()
+        world.on_insert = lambda text: (_ for _ in ()).throw(RuntimeError("pasteboard busy"))
+        world.queue.paste("result-1 ", in_history=False)
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertNotIn("It is in History", world.notes[0][1])
+
+    def test_n34_a_secure_input_decline_tells_the_user_once(self):
+        world = DeliveryQueueHarness()
+        world.inserts_ok = False                              # a password field had focus
+        world.queue.paste("my dictation")
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertIn("Secure input", world.notes[0][1])
+        self.assertIn("History", world.notes[0][1])
+
+    def test_n34_an_unsaved_decline_does_not_claim_history(self):
+        world = DeliveryQueueHarness()
+        world.inserts_ok = False
+        world.queue.paste("my dictation", in_history=False)
+        self.assertEqual(len(world.notes), 1, world.notes)
+        self.assertNotIn("Open History", world.notes[0][1])
+
+    def test_inject_when_clear_forwards_whether_the_text_is_in_history(self):
+        pasted = []
+        namespace = {"delivery": types.SimpleNamespace(
+            paste=lambda text, in_history=True: pasted.append((text, in_history)))}
+        inject_when_clear = run_closures(["inject_when_clear"], namespace)["inject_when_clear"]
+        inject_when_clear("saved ", 0)
+        inject_when_clear("unsaved ", 0, False)
+        self.assertEqual(pasted, [("saved ", True), ("unsaved ", False)])
+
+
+class OwnAlertInFrontTests(unittest.TestCase):
+    """N24: Sotto's alerts activate Sotto, and callAfter keeps running during
+    their modal loop (repro/N24_repro.py), so a paste must wait instead of
+    posting ⌘V into the alert."""
+
+    def test_n24_nothing_is_pasted_while_sottos_own_window_is_in_front(self):
+        world = DeliveryQueueHarness()
+        world.own_front = True
+        world.queue._own_window_front = lambda: world.own_front
+        world.queue.paste("result-1 ")
+        world.queue.undo()
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S * 3)  # an alert left open for minutes
+        self.assertEqual((world.delivered, world.undos, world.notes), ([], [], []))
+        world.own_front = False                                # the user dismissed it / switched apps
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S * 3 + 1.0)
+        self.assertEqual([text for text, _t, _held in world.delivered], ["result-1 "])
+
+    def test_n24_the_queue_reads_the_real_probe_in_run(self):
+        tree = ast.parse(open(sotto.__file__, encoding="utf-8").read())
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+        call = next(node for node in ast.walk(run) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name) and node.func.id == "DeliveryQueue")
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+        self.assertEqual(keywords.get("own_window_front"), "own_window_without_text_field")
+
+    def probe(self, *, active, text_focused):
+        class FakeText:
+            pass
+
+        class Responder:
+            def isKindOfClass_(self, cls):
+                return text_focused and cls is FakeText
+        window = types.SimpleNamespace(firstResponder=Responder)
+        app = types.SimpleNamespace(isActive=lambda: active, keyWindow=lambda: window)
+        fake = types.SimpleNamespace(NSApp=app, NSText=FakeText)
+        with patch.dict(sys.modules, {"AppKit": fake}):
+            return sotto.own_window_without_text_field()
+
+    def test_n24_probe(self):
+        self.assertFalse(self.probe(active=False, text_focused=False))  # another app is in front
+        self.assertTrue(self.probe(active=True, text_focused=False))    # an OK-only alert
+        self.assertFalse(self.probe(active=True, text_focused=True))    # the correction editor
+
+
+class RetryCopyCountedTests(unittest.TestCase):
+    def test_n19_the_retry_copy_finishes_its_pending_delivery(self):
+        deliveries = sotto.PendingDeliveries()
+        pasteboard = FakePasteboard("ORIGINAL user clipboard")
+        namespace = {"shutdown": types.SimpleNamespace(requested=lambda: False),
+                     "NSPasteboard": pasteboard, "NSPasteboardTypeString": PLAIN_TEXT,
+                     "pending_deliveries": deliveries}
+        copy_text = run_closures(["_copy_text"], namespace)["_copy_text"]
+        deliveries.add()                                       # what deliver_call did
+        copy_text("retried text")
+        self.assertEqual((pasteboard.text(), deliveries.count()), ("retried text", 0))
+        namespace["shutdown"] = types.SimpleNamespace(requested=lambda: True)
+        deliveries.add()
+        copy_text("late")                                      # skipped after shutdown, still finished
+        self.assertEqual((pasteboard.text(), deliveries.count()), ("retried text", 0))
+
+    def test_n19_every_copy_is_scheduled_as_a_counted_delivery(self):
+        tree = ast.parse(open(sotto.__file__, encoding="utf-8").read())
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+        schedulers = [node.func.id for node in ast.walk(run) if isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Name)
+                      and any(isinstance(arg, ast.Name) and arg.id == "_copy_text" for arg in node.args)]
+        self.assertEqual(schedulers, ["deliver_call"])         # History's Copy item; Retry's is in the worker
+
+
+class TransientPasteTests(unittest.TestCase):
+    def test_n33_the_paste_is_marked_transient_for_clipboard_managers(self):
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        types_at_paste = world.pasteboard.items[0].types()
+        self.assertIn("org.nspasteboard.TransientType", types_at_paste)
+        self.assertEqual(world.pasteboard.text(), "dictation ")
+        world.timers.advance_to(sotto.RESTORE_DELAY_S * 2 + 1.0)
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+        self.assertNotIn("org.nspasteboard.TransientType", world.pasteboard.items[0].types())
 
 
 if __name__ == "__main__":

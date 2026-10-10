@@ -386,7 +386,7 @@ class QuitDrainTests(unittest.TestCase):
         # entry (on_done=pending_deliveries.finish) when it delivers, drops or
         # clears it, and posts nothing after shutdown — behaviour pinned in
         # tests/test_delivery.py PendingDeliveriesAccountingTests.
-        self.assertIn("delivery.paste(text)", _closure_source("inject_when_clear"))
+        self.assertIn("delivery.paste(text, in_history)", _closure_source("inject_when_clear"))
         self.assertIn("delivery.undo()", _closure_source("undo_when_clear"))
 
     def test_update_and_engine_restarts_also_wait_for_the_paste(self):
@@ -512,6 +512,85 @@ class AppLogRotationTests(unittest.TestCase):
                 patch.dict(sotto._app_log, {"path": None, "max_bytes": 100}):
             sotto.keep_app_log_small()
         reopen.assert_not_called()
+
+    def test_n35_two_threads_rotating_at_once_neither_raises(self):
+        real_replace, errors, reopened, callers = os.replace, [], [], []
+
+        def slow_replace(source, target):
+            # Both threads saw the oversized log before either moved it; the
+            # second mover is slower, so it finds the first one's fresh log.
+            callers.append(1)
+            time.sleep(0.05 * len(callers) ** 2)
+            real_replace(source, target)
+
+        def reopen(path):
+            reopened.append(path)
+            path.touch()  # what _point_output_at's O_CREAT does
+
+        def write_a_line():
+            try:
+                sotto.log("a line")
+            except Exception as exc:  # what ended the transcription worker
+                errors.append(exc)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sotto.log"
+            path.write_text("x" * 150)
+            with patch.object(sotto, "_point_output_at", reopen), \
+                    patch.dict(sotto._app_log, {"path": path, "max_bytes": 100}), \
+                    patch.object(sotto.os, "replace", slow_replace), \
+                    patch("sys.stderr", new=open(os.devnull, "w")):
+                threads = [threading.Thread(target=write_a_line) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+                sys.stderr.close()
+            rotated = path.with_suffix(".log.1").read_text()
+        self.assertEqual(errors, [])
+        self.assertEqual(reopened, [path])                    # rotated once, not twice
+        self.assertEqual(rotated, "x" * 150)                  # the old log was not overwritten
+
+    def test_n35_a_failing_log_write_never_raises_into_the_caller(self):
+        def disk_full(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sotto.log"
+            path.write_text("x" * 150)
+            with patch.object(sotto, "_point_output_at", disk_full), \
+                    patch.dict(sotto._app_log, {"path": path, "max_bytes": 100}), \
+                    patch("sys.stderr", new=open(os.devnull, "w")):
+                sotto.log("a line")                           # must not raise
+                with patch("builtins.print", disk_full):
+                    sotto.log("another line")
+                sys.stderr.close()
+
+
+class TelemetryTests(unittest.TestCase):
+    def test_n37_importing_sotto_turns_hub_telemetry_off(self):
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {"HF_HUB_DISABLE_TELEMETRY", "DISABLE_TELEMETRY"}}
+        with tempfile.TemporaryDirectory(dir=ROOT.parent) as data:
+            environment["SOTTO_DATA_DIR"] = data
+            result = subprocess.run(
+                [sys.executable, "-c", "import sotto, huggingface_hub.constants as c; "
+                                       "print(c.HF_HUB_DISABLE_TELEMETRY)"],
+                cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.stdout.strip().splitlines()[-1:], ["True"], result.stderr[-800:])
+
+
+class SetupCommandTests(unittest.TestCase):
+    def test_n42_setup_for_parakeet_also_installs_voice_detection(self):
+        import vad
+        installed = []
+        fake_parakeet = types.SimpleNamespace(path="/models/parakeet-snapshot")
+        with patch.object(sys, "argv", ["sotto.py", "setup", "--profile", "parakeet"]), \
+                patch.object(sotto, "LocalParakeet", lambda repo: fake_parakeet), \
+                patch.object(sotto, "LocalWhisper", side_effect=AssertionError("Whisper not asked for")), \
+                patch.object(vad, "install", lambda allow_download: installed.append(allow_download)
+                             or Path("/data/models/silero_vad.onnx")), \
+                patch("builtins.print"):
+            sotto.main()
+        self.assertEqual(len(installed), 1)
 
 
 class SaveAudioNameTests(unittest.TestCase):
