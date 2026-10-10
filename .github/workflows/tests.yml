@@ -1,10 +1,12 @@
 name: Tests
 
-# Runs the unit suite and ruff on a real Mac for every pull request and every
-# push to main. Python comes from Homebrew on the runner, not actions/setup-python,
-# which stays unused until its provenance is reviewed
-# (.github/workflows-disabled/README.md). tests/gesture_check.py is wall-clock
-# timed and stays a local check.
+# Runs the unit suite and ruff on a real Mac, and the unit suite on Windows,
+# for every pull request and every push to main. Python comes from Homebrew on
+# the Mac runner and from the Windows runner image's own tool cache, not
+# actions/setup-python, which stays unused until its provenance is reviewed
+# (.github/workflows-disabled/README.md). Both jobs install the exact pip the
+# installers bootstrap (tests/test_dependency_pins.py keeps them in step).
+# tests/gesture_check.py is wall-clock timed and stays a local check.
 
 on:
   pull_request:
@@ -38,6 +40,7 @@ jobs:
       - name: Pinned packages
         run: |
           "$PYTHON" -m venv venv-alpha
+          venv-alpha/bin/python -m pip install --quiet pip==26.2.1
           venv-alpha/bin/python -m pip install --quiet -r requirements-alpha.txt
           venv-alpha/bin/python -m pip check
 
@@ -45,6 +48,44 @@ jobs:
         env:
           SOTTO_DATA_DIR: ${{ runner.temp }}/sotto-data
         run: venv-alpha/bin/python -m unittest discover -s tests
+
+  windows:
+    name: Unit tests (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The newest 3.13 the image ships in its tool cache (the alpha targets
+      # 64-bit CPython 3.13, docs/windows-alpha.md).
+      - name: Python 3.13 from the runner image
+        run: |
+          $python = Get-ChildItem -Path "$env:RUNNER_TOOL_CACHE\Python\3.13.*\x64\python.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $python) { throw 'The runner image has no Python 3.13 in its tool cache.' }
+          "PYTHON=$($python.FullName)" >> $env:GITHUB_ENV
+
+      # The CPU set: hosted runners have no NVIDIA GPU. Each native step is
+      # checked, since pwsh only fails a step on its last command's exit code.
+      - name: Pinned packages
+        run: |
+          & $env:PYTHON -m venv venv-alpha
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          venv-alpha\Scripts\python -m pip install --quiet pip==26.2.1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          venv-alpha\Scripts\python -m pip install --quiet -r requirements-alpha-windows.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          venv-alpha\Scripts\python -m pip check
+
+      # scripts/test_alpha.py points every Sotto data and cache folder at a
+      # temporary one and runs offline.
+      - name: Unit tests
+        run: venv-alpha\Scripts\python scripts\test_alpha.py
 
   lint:
     name: Lint (ruff)

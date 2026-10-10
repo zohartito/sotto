@@ -55,6 +55,35 @@ MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
 [ "$MACOS_MAJOR" -ge 14 ] || fail "Sotto needs macOS 14 or later (this Mac runs $(sw_vers -productVersion))."
 xcrun --find clang >/dev/null 2>&1 || fail "Install Apple's command line tools first: xcode-select --install"
 
+# A Sotto running from this copy would have its source and packages swapped
+# while in use: a process with this copy's sotto.py on its command line, by its
+# resolved path (what Sotto.app runs) or relative to the process's working
+# directory (a terminal run: venv-alpha/bin/python sotto.py run). Check for
+# Updates runs this from inside Sotto, names itself in SOTTO_UPDATE_FROM_PID
+# and restarts after.
+running_sotto() {
+    local listing pid command words word dir
+    listing="$(ps -axww -o pid= -o command=)" || return 0
+    while read -r pid command; do
+        [ "$pid" != "${SOTTO_UPDATE_FROM_PID:-}" ] || continue
+        case " $command " in *" $ROOT/sotto.py "*) echo "$pid"; return 0 ;; esac
+        read -ra words <<< "$command" || true  # split without globbing
+        for word in ${words[@]+"${words[@]}"}; do
+            case "$word" in sotto.py|*/sotto.py) ;; *) continue ;; esac
+            case "$word" in
+                /*) dir="$(dirname "$word")" ;;
+                *) dir="$(/usr/sbin/lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" || continue
+                   [ -n "$dir" ] || continue
+                   dir="$dir/$(dirname "$word")" ;;
+            esac
+            dir="$(cd "$dir" 2>/dev/null && pwd -P)" || continue
+            [ "$dir/sotto.py" != "$ROOT/sotto.py" ] || { echo "$pid"; return 0; }
+        done
+    done <<< "$listing"
+}
+RUNNING="$(running_sotto)"
+[ -z "$RUNNING" ] || fail "Sotto is running from this copy (process $RUNNING). Quit it from its menu (or update it there with Check for Updates), then run this again."
+
 UPSTREAM=""
 REQUIREMENTS="$ROOT/requirements-alpha.txt"
 if [ "$MODE" = update ]; then
@@ -63,6 +92,8 @@ if [ "$MODE" = update ]; then
         # source, so a failed download leaves this copy's code exactly as it was.
         git -C "$ROOT" fetch --quiet || fail "Could not download the update (git fetch failed); nothing was changed."
         UPSTREAM="$(git -C "$ROOT" rev-parse '@{u}')" || fail "This copy does not follow a GitHub branch."
+        git -C "$ROOT" merge-base --is-ancestor HEAD "$UPSTREAM" \
+            || fail "This copy has its own commits, so it cannot simply move forward; nothing was changed."
         NEXT_REQUIREMENTS="$(mktemp -d)"
         trap 'rm -rf "$NEXT_REQUIREMENTS"' EXIT
         for name in requirements-alpha.txt requirements.txt constraints-alpha.txt; do
@@ -75,12 +106,18 @@ if [ "$MODE" = update ]; then
     fi
 fi
 
+native_python() {  # is $1 a native arm64 Python 3.12?
+    [ "$("$1" -c 'import platform; print(platform.machine())' 2>/dev/null)" = arm64 ] \
+        && [ "$("$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" = 3.12 ]
+}
 if [ -z "$PYTHON" ]; then
+    # The first native one: an Intel Homebrew's python3.12 may come first on PATH.
     for candidate in python3.12 /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12; do
-        if command -v "$candidate" >/dev/null 2>&1; then PYTHON="$(command -v "$candidate")"; break; fi
+        found="$(command -v "$candidate" 2>/dev/null)" || continue
+        if native_python "$found"; then PYTHON="$found"; break; fi
     done
 fi
-[ -n "$PYTHON" ] || fail "Python 3.12 not found. Install it (e.g. brew install python@3.12) or pass --python PATH."
+[ -n "$PYTHON" ] || fail "No native arm64 Python 3.12 found. Install it (e.g. brew install python@3.12) or pass --python PATH."
 [ "$("$PYTHON" -c 'import platform; print(platform.machine())')" = arm64 ] || fail "$PYTHON is not a native arm64 Python."
 [ "$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')" = 3.12 ] || fail "$PYTHON is not Python 3.12."
 
@@ -88,24 +125,55 @@ echo "== Python environment ($VENV)"
 [ -x "$VENV/bin/python" ] || "$PYTHON" -m venv "$VENV"
 # An exact pip, not whatever is newest today (F25); tests/test_dependency_pins.py keeps every copy in step.
 "$VENV/bin/python" -m pip install --quiet pip==26.2.1
-if [ -n "$UPSTREAM" ]; then
-    # pip cannot roll back a half-finished install, so remember the working set.
+if [ -z "$UPSTREAM" ]; then
+    "$VENV/bin/python" -m pip install --quiet -r "$REQUIREMENTS" \
+        || fail "Installing packages failed. Run this script again to retry."
+    "$VENV/bin/python" -m pip check || fail "pip check found broken requirements (see above). Run this script again to retry."
+else
+    # Distribution names in a pip freeze, normalized (PEP 503) and sorted.
+    names() {
+        sed -E -e '/^[[:space:]]*(#|-|$)/d' -e 's/[[:space:]]*[=@<>!~;[].*//' "$1" \
+            | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g' | LC_ALL=C sort -u
+    }
+    # pip cannot undo a half-finished install: put back the set recorded before
+    # it (pip install -r only adds), remove what the update added, then check it.
+    restore_packages() {
+        echo "== Restoring the previous packages"
+        if grep -q '[^[:space:]]' "$PREVIOUS_PACKAGES"; then
+            "$VENV/bin/python" -m pip install --quiet -r "$PREVIOUS_PACKAGES" || return 1
+        fi
+        "$VENV/bin/python" -m pip freeze > "$NEXT_REQUIREMENTS/now-packages.txt" || return 1
+        local added
+        added="$(LC_ALL=C comm -13 <(names "$PREVIOUS_PACKAGES") <(names "$NEXT_REQUIREMENTS/now-packages.txt"))"
+        if [ -n "$added" ]; then
+            echo "== Removing what the update added:" $added
+            # One distribution name per word.
+            # shellcheck disable=SC2086
+            "$VENV/bin/python" -m pip uninstall --quiet --yes $added || return 1
+        fi
+        "$VENV/bin/python" -m pip check
+    }
+    # Any failure between the first package change and the source switch, or a
+    # stop (Ctrl-C, or Check for Updates giving up), puts the packages back. A
+    # second stop interrupts only the rollback's current step.
+    abandon_update() {
+        trap : INT TERM HUP
+        if restore_packages; then
+            fail "$1; the previous packages are back and the source was not switched. Run this script again to retry."
+        fi
+        fail "$1, and the previous packages could not be restored; the source was not switched. Run scripts/install-mac.sh --update again (it needs the network)."
+    }
     PREVIOUS_PACKAGES="$NEXT_REQUIREMENTS/previous-packages.txt"
-    "$VENV/bin/python" -m pip freeze > "$PREVIOUS_PACKAGES"
-fi
-if ! "$VENV/bin/python" -m pip install --quiet -r "$REQUIREMENTS"; then
-    [ -n "$UPSTREAM" ] || fail "Installing packages failed. Run this script again to retry."
-    echo "== Restoring the previous packages"
-    "$VENV/bin/python" -m pip install --quiet -r "$PREVIOUS_PACKAGES" \
-        || fail "Installing the update's packages failed and the previous ones could not be restored; the source was not switched. Run scripts/install-mac.sh --update again (it needs the network)."
-    fail "Installing the update's packages failed; the previous packages are back and the source was not switched. Run this script again to retry."
-fi
-"$VENV/bin/python" -m pip check
-
-if [ -n "$UPSTREAM" ]; then
+    "$VENV/bin/python" -m pip freeze > "$PREVIOUS_PACKAGES" \
+        || fail "Could not list the installed packages (pip freeze failed); nothing was changed."
+    trap 'abandon_update "The update was stopped"' INT TERM HUP
+    "$VENV/bin/python" -m pip install --quiet -r "$REQUIREMENTS" \
+        || abandon_update "Installing the update's packages failed"
+    "$VENV/bin/python" -m pip check || abandon_update "The update's packages do not fit together (pip check, above)"
     echo "== Source"
     git -C "$ROOT" merge --ff-only --quiet "$UPSTREAM" \
-        || fail "git could not move this copy forward (local changes?); the source was not switched."
+        || abandon_update "git could not move this copy forward (local changes?)"
+    trap - INT TERM HUP
 fi
 
 export SOTTO_DATA_DIR="$DATA_DIR"

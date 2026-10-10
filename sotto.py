@@ -4154,6 +4154,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
         def action_apply_update() -> None:
             """Update this checkout with the installer, then restart into it."""
+            if not app_mode():
+                return  # [N28] its installer rebuilds Sotto.app; a terminal run is given the command
             if update_state["running"]:
                 return
             if lifecycle.busy():
@@ -4205,9 +4207,11 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log(f"update check: {result.state}" + (f", {result.behind} behind" if result.behind else ""))
 
                 def present() -> None:
-                    title, text = updates.describe(
-                        result, "run scripts/install-mac.sh --update in Terminal from the Sotto folder.")
-                    if result.state == "available":
+                    # [N28] Only Sotto.app updates itself; a terminal run is given the command.
+                    manual = ("run scripts/install-mac.sh --update in Terminal from the Sotto folder."
+                              if app_mode() else updates.mac_manual_update(Path(__file__).resolve().parent))
+                    title, text = updates.describe(result, manual, self_update=app_mode())
+                    if result.state == "available" and app_mode():
                         if status_ui.ask(title, text, "Update Now", "Later"):
                             action_apply_update()
                     elif result.state == "not-git":

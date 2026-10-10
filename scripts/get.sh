@@ -3,8 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/zohartito/sotto/main/scripts/get.sh | bash
 #
-# Downloads Sotto with git into ~/sotto (or $SOTTO_SOURCE), or updates that
-# copy, then runs its scripts/install-mac.sh and opens Sotto. Nothing needs
+# Downloads Sotto with git into ~/sotto (or $SOTTO_SOURCE) and runs its
+# scripts/install-mac.sh, or updates that copy with install-mac.sh --update
+# (the new packages first, the source only after them), then opens Sotto. Nothing needs
 # sudo. Missing tools are named with the command that installs them.
 # Everything sits inside main(), so a partly downloaded script never runs.
 set -euo pipefail
@@ -23,6 +24,29 @@ same_repo() {
     [ "${normalized[0]}" = "${normalized[1]}" ]
 }
 
+# The first process running the sotto.py in folder $1 (resolved): by that path
+# (what Sotto.app runs) or relative to the process's working directory (a
+# terminal run: venv-alpha/bin/python sotto.py run).
+running_from() {
+    local listing pid command words word dir
+    listing="$(ps -axww -o pid= -o command=)" || return 0
+    while read -r pid command; do
+        case " $command " in *" $1/sotto.py "*) echo "$pid"; return 0 ;; esac
+        read -ra words <<< "$command" || true  # split without globbing
+        for word in ${words[@]+"${words[@]}"}; do
+            case "$word" in sotto.py|*/sotto.py) ;; *) continue ;; esac
+            case "$word" in
+                /*) dir="$(dirname "$word")" ;;
+                *) dir="$(/usr/sbin/lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" || continue
+                   [ -n "$dir" ] || continue
+                   dir="$dir/$(dirname "$word")" ;;
+            esac
+            dir="$(cd "$dir" 2>/dev/null && pwd -P)" || continue
+            [ "$dir/sotto.py" != "$1/sotto.py" ] || { echo "$pid"; return 0; }
+        done
+    done <<< "$listing"
+}
+
 main() {
     local repo="${SOTTO_REPO:-https://github.com/zohartito/sotto.git}"
     local dest="${SOTTO_SOURCE:-$HOME/sotto}"
@@ -36,8 +60,14 @@ main() {
         fail "First install Apple's command line tools: xcode-select --install  (then run this line again)"
     fi
     if [ -z "$python" ]; then
+        # The first native one: an Intel Homebrew's python3.12 may come first on PATH.
+        local candidate found
         for candidate in python3.12 /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12; do
-            if command -v "$candidate" >/dev/null 2>&1; then python="$(command -v "$candidate")"; break; fi
+            found="$(command -v "$candidate" 2>/dev/null)" || continue
+            if [ "$("$found" -c 'import platform; print(platform.machine())' 2>/dev/null)" = arm64 ]; then
+                python="$found"
+                break
+            fi
         done
     fi
     if [ -z "$python" ]; then
@@ -47,13 +77,21 @@ main() {
         fail "Sotto needs Python 3.12: install it from https://www.python.org/downloads/ (then run this line again)"
     fi
 
+    local update=""
     if [ -d "$dest/.git" ]; then
         local origin
         origin="$(git -C "$dest" remote get-url origin 2>/dev/null || true)"
         same_repo "$origin" "$repo" \
             || fail "$dest is a git copy of ${origin:-an unknown project}, not Sotto. Choose another folder with SOTTO_SOURCE=..."
+        # Updating under a running Sotto would swap its source and packages
+        # while they are in use.
+        local running
+        running="$(running_from "$(cd "$dest" && pwd -P)")"
+        [ -z "$running" ] || fail "Sotto is running from $dest (process $running). Quit it from its menu (or update it there with Check for Updates), then run this line again."
         echo "== Updating Sotto in $dest"
-        git -C "$dest" pull --ff-only < /dev/null || fail "Could not update $dest (local changes?)."
+        # install-mac.sh --update fetches, installs the new packages, and moves
+        # the source only after them (putting the packages back on a failure).
+        update="--update"
     elif [ -e "$dest" ]; then
         fail "$dest exists and is not a copy of Sotto. Choose another folder with SOTTO_SOURCE=..."
     else
@@ -62,10 +100,11 @@ main() {
     fi
 
     if [ -n "${SOTTO_GET_DRY_RUN:-}" ]; then
-        echo "dry run: would run $dest/scripts/install-mac.sh --python $python"
+        echo "dry run: would run $dest/scripts/install-mac.sh ${update:+$update }--python $python"
         return 0
     fi
-    bash "$dest/scripts/install-mac.sh" --python "$python" < /dev/null
+    # shellcheck disable=SC2086  # $update is one word or nothing
+    bash "$dest/scripts/install-mac.sh" $update --python "$python" < /dev/null
     open -a Sotto || true
 }
 
