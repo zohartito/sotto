@@ -7,6 +7,31 @@
 # runs its scripts\install-windows.ps1 and starts Sotto.
 # No admin rights. Missing tools are named with the command that installs them.
 
+# A folder has a long name and, on most volumes, an 8.3 short one
+# (C:\Users\RUNNER~1); a running process can use either. Paths are
+# compared by their long names: Windows PowerShell's GetFullPath expands only
+# a path that exists and PowerShell 7's never does, so the part that exists
+# goes through GetLongPathName.
+if (-not ('SottoPaths.Native' -as [type])) {
+  Add-Type -Namespace SottoPaths -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+'@
+}
+function Long-Path([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path)
+  if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+  $existing, $rest = $full, ''
+  while ($existing -and -not ([IO.Directory]::Exists($existing) -or [IO.File]::Exists($existing))) {
+    $rest = '\' + [IO.Path]::GetFileName($existing) + $rest
+    $existing = [IO.Path]::GetDirectoryName($existing)
+  }
+  $buffer = New-Object Text.StringBuilder 32768
+  if (-not $existing -or [SottoPaths.Native]::GetLongPathNameW($existing, $buffer, $buffer.Capacity) -eq 0) { return $full }
+  if ($rest) { return $buffer.ToString().TrimEnd('\') + $rest }
+  return $buffer.ToString()
+}
+
 # Same repository? Ignores https vs either ssh form (git@github.com:... and
 # ssh://git@github.com/...), a trailing .git and a trailing slash.
 function Test-SameRepo([string]$First, [string]$Second) {
@@ -44,11 +69,11 @@ function Install-Sotto {
     }
     # Pulling and reinstalling under a running Sotto would swap its source and
     # packages while they are in use.
-    $prefix = [IO.Path]::GetFullPath($dest).TrimEnd('\') + '\'
+    $prefix = (Long-Path $dest).TrimEnd('\') + '\'
     $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $path = $null
         try { $path = $_.Path } catch { }
-        $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+        $path -and (Long-Path $path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
       })
     if ($running.Count -gt 0) {
       Fail-Install "Sotto is running from $dest (process $($running[0].Id)). Quit it from its tray menu (or update it there with Check for updates), then run this line again."

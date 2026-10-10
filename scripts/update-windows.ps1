@@ -34,10 +34,40 @@ param(
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Continue'
 
-$Root = if ($SourceDir) { [IO.Path]::GetFullPath($SourceDir) } else { Split-Path -Parent $PSScriptRoot }
+# A folder has a long name and, on most volumes, an 8.3 short one
+# (C:\Users\RUNNER~1); a process, shortcut or record can use either. Paths are
+# compared by their long names: Windows PowerShell's GetFullPath expands only
+# a path that exists and PowerShell 7's never does, so the part that exists
+# goes through GetLongPathName.
+if (-not ('SottoPaths.Native' -as [type])) {
+  Add-Type -Namespace SottoPaths -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+'@
+}
+function Long-Path([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path)
+  if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+  $existing, $rest = $full, ''
+  while ($existing -and -not ([IO.Directory]::Exists($existing) -or [IO.File]::Exists($existing))) {
+    $rest = '\' + [IO.Path]::GetFileName($existing) + $rest
+    $existing = [IO.Path]::GetDirectoryName($existing)
+  }
+  $buffer = New-Object Text.StringBuilder 32768
+  if (-not $existing -or [SottoPaths.Native]::GetLongPathNameW($existing, $buffer, $buffer.Capacity) -eq 0) { return $full }
+  if ($rest) { return $buffer.ToString().TrimEnd('\') + $rest }
+  return $buffer.ToString()
+}
+function Same-Path([string]$First, [string]$Second) {
+  return [bool]($First -and $Second) -and [string]::Equals((Long-Path $First), (Long-Path $Second), [StringComparison]::OrdinalIgnoreCase)
+}
+
+$Root = if ($SourceDir) { Long-Path $SourceDir } else { Long-Path (Split-Path -Parent $PSScriptRoot) }
 if (-not $ShortcutDir) { $ShortcutDir = [Environment]::GetFolderPath('Programs') }
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'sotto-alpha' }
 if (-not $VenvDir) { $VenvDir = Join-Path $Root 'venv-alpha' }
+$DataDir = Long-Path $DataDir
+$VenvDir = Long-Path $VenvDir
 $Log = Join-Path $DataDir 'update.log'
 $Status = Join-Path $DataDir 'update-status.txt'
 $Shortcut = Join-Path $ShortcutDir 'Sotto.lnk'
@@ -56,12 +86,22 @@ function Logged([scriptblock]$Block) {
 }
 
 function Running-From-Venv {
-  $prefix = [IO.Path]::GetFullPath($VenvDir).TrimEnd('\') + '\'
+  $prefix = $VenvDir.TrimEnd('\') + '\'
   return @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
       $path = $null
       try { $path = $_.Path } catch { }
-      $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+      $path -and (Long-Path $path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
     })
+}
+
+# Does this command line (a shortcut's arguments) start this copy's launcher?
+# Its paths are quoted only when they contain a space.
+function Points-Here([string]$Command) {
+  foreach ($word in [regex]::Matches("$Command", '"([^"]*)"|(\S+)')) {
+    $path = if ($word.Groups[1].Success) { $word.Groups[1].Value } else { $word.Groups[2].Value }
+    if ($path -match '^([A-Za-z]:\\|\\\\)' -and (Same-Path $path $Launcher)) { return $true }
+  }
+  return $false
 }
 
 # Start this copy again: through the Start Menu shortcut only when it starts
@@ -69,7 +109,7 @@ function Running-From-Venv {
 function Start-Sotto {
   if (Test-Path -LiteralPath $Shortcut -PathType Leaf) {
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($Shortcut)
-    if ($link.Arguments -and $link.Arguments.IndexOf($Launcher, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    if (Points-Here $link.Arguments) {
       Start-Process -FilePath $Shortcut
       return
     }

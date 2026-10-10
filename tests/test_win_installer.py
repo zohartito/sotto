@@ -30,6 +30,18 @@ def _powershell() -> str | None:
     return shutil.which("powershell.exe") if sys.platform == "win32" else None
 
 
+def _long_and_short(path: Path) -> tuple[str, str]:
+    """An existing path's two Windows names: the long one and the 8.3 short one
+    (GitHub's runner gives TEMP as C:\\Users\\RUNNER~1\\...). They are equal on a
+    volume that keeps no short names."""
+    import ctypes
+    names = []
+    for convert in (ctypes.windll.kernel32.GetLongPathNameW, ctypes.windll.kernel32.GetShortPathNameW):
+        buffer = ctypes.create_unicode_buffer(32768)
+        names.append(buffer.value if convert(str(path), buffer, len(buffer)) else str(path))
+    return names[0], names[1]
+
+
 @unittest.skipUnless(_powershell(), "Windows PowerShell is Windows-only")
 class InstallerTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -44,9 +56,10 @@ class InstallerTest(unittest.TestCase):
                        capture_output=True, timeout=60)
         self._tmp.cleanup()
 
-    def ps(self, *args: str, script: Path = SCRIPT) -> subprocess.CompletedProcess:
+    def ps(self, *args: str, script: Path = SCRIPT, venv: str | None = None,
+           data: str | None = None) -> subprocess.CompletedProcess:
         command = [_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                   "-File", str(script), "-VenvDir", str(self.venv), "-DataDir", str(self.data),
+                   "-File", str(script), "-VenvDir", venv or str(self.venv), "-DataDir", data or str(self.data),
                    "-ShortcutDir", str(self.menu), "-RunKey", self.run_key, *args]
         return subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=300)
@@ -69,13 +82,15 @@ class InstallerTest(unittest.TestCase):
         return self.psc(f"(New-Object -ComObject WScript.Shell).CreateShortcut('{path}').Arguments")
 
     @contextmanager
-    def running_from_venv(self):
-        """A program running from the environment, like Sotto's pythonw."""
+    def running_from_venv(self, *, short_name: bool = False):
+        """A program running from the environment, like Sotto's pythonw,
+        started by the long or the 8.3 short name of its path."""
         scripts = self.venv / "Scripts"
         scripts.mkdir(parents=True, exist_ok=True)
         stand_in = scripts / "ping.exe"
         shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stand_in)
-        running = subprocess.Popen([str(stand_in), "-n", "60", "127.0.0.1"],
+        program = _long_and_short(stand_in)[1 if short_name else 0]
+        running = subprocess.Popen([program, "-n", "60", "127.0.0.1"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             yield
@@ -106,11 +121,18 @@ class InstallerTest(unittest.TestCase):
 
     def test_install_refuses_while_sotto_runs_from_the_environment(self) -> None:
         # [F33] Installing under a running Sotto replaced its packages in use.
-        with self.running_from_venv():
-            result = self.ps("-WhatIf", "-Cpu", "-Python", sys.executable)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("still running", result.stdout)
-        self.assertNotIn("Install pinned packages", result.stdout)
+        # Sotto started by one name of the folder and the installer given the
+        # other (long or 8.3 short) is the same environment: GitHub's runner
+        # (short TEMP) went ahead.
+        (self.venv / "Scripts").mkdir(parents=True)
+        long_venv, short_venv = _long_and_short(self.venv)
+        for short_start, venv in ((False, long_venv), (True, long_venv), (False, short_venv)):
+            with self.subTest(started_by_short_name=short_start, venv=venv):
+                with self.running_from_venv(short_name=short_start):
+                    result = self.ps("-WhatIf", "-Cpu", "-Python", sys.executable, venv=venv)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("still running", result.stdout)
+                self.assertNotIn("Install pinned packages", result.stdout)
 
     def test_a_rerun_keeps_the_dependency_set_recorded_at_install(self) -> None:
         # [F34] Every update re-detected the GPU, so a deliberate -Cpu install
@@ -172,17 +194,14 @@ class InstallerTest(unittest.TestCase):
         (self.venv / "sotto-install.json").write_text(json.dumps({"schema": 1, "created_venv": True}),
                                                       encoding="utf-8")
         stand_in = scripts / "ping.exe"  # any program running from the venv, like pythonw
-        shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stand_in)
-        running = subprocess.Popen([str(stand_in), "-n", "60", "127.0.0.1"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            result = self.ps("-Uninstall")
-        finally:
-            running.kill()
-            running.wait(10)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("still running", result.stdout)
-        self.assertTrue(stand_in.exists() and (self.venv / "pyvenv.cfg").exists(), "nothing removed")
+        long_venv, short_venv = _long_and_short(self.venv)
+        for short_start, venv in ((False, long_venv), (True, long_venv), (False, short_venv)):
+            with self.subTest(started_by_short_name=short_start, venv=venv):
+                with self.running_from_venv(short_name=short_start):
+                    result = self.ps("-Uninstall", venv=venv)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("still running", result.stdout)
+                self.assertTrue(stand_in.exists() and (self.venv / "pyvenv.cfg").exists(), "nothing removed")
 
     def test_uninstall_removes_only_what_the_manifest_and_this_launcher_own(self) -> None:
         self.venv.mkdir()
@@ -228,6 +247,40 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
         self.assertFalse(self.data.exists())
         self.assertTrue(self.venv.exists(), "a venv the script did not create stays")
+
+    def test_this_copys_entries_and_data_match_by_either_name_of_a_folder(self) -> None:
+        # A shortcut, login entry or install record written with a folder's 8.3
+        # short name (an install run from GitHub's runner, whose TEMP is
+        # C:\Users\RUNNER~1\...) was taken for another copy's when this copy
+        # was checked by its long name, and the other way round.
+        copy = Path(self._tmp.name) / "this copy"
+        (copy / "scripts").mkdir(parents=True)
+        script = copy / "scripts" / "install-windows.ps1"
+        shutil.copy(SCRIPT, script)
+        (copy / "win_launch.py").write_text("", encoding="utf-8")
+        self.venv.mkdir()
+        (self.venv / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+        self.data.mkdir()
+        (self.data / "history.jsonl").write_text("", encoding="utf-8")
+        self.menu.mkdir()
+        long_launcher, short_launcher = _long_and_short(copy / "win_launch.py")
+        long_data, short_data = _long_and_short(self.data)
+        if long_launcher == short_launcher or long_data == short_data:
+            self.skipTest("this volume keeps no 8.3 short names")
+        (self.venv / "sotto-install.json").write_text(json.dumps({
+            "schema": 1, "created_venv": True, "created_data": True, "data_dir": short_data}), encoding="utf-8")
+        ours = self.shortcut(f'"{short_launcher}" --data-dir "{short_data}"')
+        # win_startup writes the login entry with list2cmdline: no quotes around a path without spaces.
+        self.psc(f"New-Item -Path '{self.run_key}' -Force | Out-Null; "
+                 f"New-ItemProperty -Path '{self.run_key}' -Name Sotto "
+                 f"-Value 'pythonw.exe {short_launcher} --data-dir {short_data}' | Out-Null")
+
+        result = self.ps("-Uninstall", "-RemoveData", script=Path(_long_and_short(script)[0]), data=long_data)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(ours.exists(), result.stdout)
+        self.assertEqual(self.psc(f"(Get-ItemProperty -Path '{self.run_key}').PSObject.Properties.Name "
+                                  "-contains 'Sotto'"), "False", result.stdout)
+        self.assertFalse(self.data.exists(), result.stdout)
 
 
 def _wheel(folder: Path, name: str, version: str, requires=()) -> Path:
@@ -302,12 +355,17 @@ class UpdateScriptTest(unittest.TestCase):
             "schema": 1, "created_venv": True, "created_data": False, "data_dir": str(self.data),
             "flavor": "cpu"}), encoding="utf-8")
         self.menu.mkdir()
-        launcher = self.copy / "win_launch.py"
+        self.data.mkdir()
+        # The entry names this copy by its 8.3 short names (an install run with
+        # GitHub's TEMP, C:\Users\RUNNER~1\...); the update below by its long ones.
+        launcher = _long_and_short(self.copy / "win_launch.py")[1]
         subprocess.run([_powershell(), "-NoProfile", "-Command",
                         f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{self.menu / 'Sotto.lnk'}'); "
                         f"$s.TargetPath = '{self.venv / 'Scripts' / 'pythonw.exe'}'; "
-                        f"$s.Arguments = '\"{launcher}\" --data-dir \"{self.data}\"'; $s.Save()"],
+                        f"$s.Arguments = '\"{launcher}\" --data-dir \"{_long_and_short(self.data)[1]}\"'; "
+                        "$s.Save()"],
                        check=True, capture_output=True, timeout=60)
+        self.copy, self.venv, self.data = (Path(_long_and_short(path)[0]) for path in (self.copy, self.venv, self.data))
 
     def tearDown(self) -> None:
         self._tmp.cleanup()

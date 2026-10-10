@@ -51,17 +51,45 @@ param(
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 
-$Root = Split-Path -Parent $PSScriptRoot
+# A folder has a long name and, on most volumes, an 8.3 short one
+# (C:\Users\RUNNER~1); a process, shortcut or record can use either. Paths are
+# compared by their long names: Windows PowerShell's GetFullPath expands only
+# a path that exists and PowerShell 7's never does, so the part that exists
+# goes through GetLongPathName.
+if (-not ('SottoPaths.Native' -as [type])) {
+  Add-Type -Namespace SottoPaths -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+'@
+}
+function Long-Path([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path)
+  if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+  $existing, $rest = $full, ''
+  while ($existing -and -not ([IO.Directory]::Exists($existing) -or [IO.File]::Exists($existing))) {
+    $rest = '\' + [IO.Path]::GetFileName($existing) + $rest
+    $existing = [IO.Path]::GetDirectoryName($existing)
+  }
+  $buffer = New-Object Text.StringBuilder 32768
+  if (-not $existing -or [SottoPaths.Native]::GetLongPathNameW($existing, $buffer, $buffer.Capacity) -eq 0) { return $full }
+  if ($rest) { return $buffer.ToString().TrimEnd('\') + $rest }
+  return $buffer.ToString()
+}
+function Same-Path([string]$First, [string]$Second) {
+  return [bool]($First -and $Second) -and [string]::Equals((Long-Path $First), (Long-Path $Second), [StringComparison]::OrdinalIgnoreCase)
+}
+
+$Root = Long-Path (Split-Path -Parent $PSScriptRoot)
 if ($SourceDir) {
   if (-not $CheckOnly) { Write-Host 'X -SourceDir goes with -CheckOnly.' -ForegroundColor Red; exit 1 }
-  $Root = [IO.Path]::GetFullPath($SourceDir)
+  $Root = Long-Path $SourceDir
 }
 $Launcher = Join-Path $Root 'win_launch.py'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'sotto-alpha' }
 if (-not $VenvDir) { $VenvDir = Join-Path $Root 'venv-alpha' }
 if (-not $ShortcutDir) { $ShortcutDir = [Environment]::GetFolderPath('Programs') }
-$DataDir = [IO.Path]::GetFullPath($DataDir)
-$VenvDir = [IO.Path]::GetFullPath($VenvDir)
+$DataDir = Long-Path $DataDir
+$VenvDir = Long-Path $VenvDir
 $Shortcut = Join-Path $ShortcutDir 'Sotto.lnk'
 $Manifest = Join-Path $VenvDir 'sotto-install.json'
 $LegacyData = Join-Path $env:APPDATA 'sotto'
@@ -98,8 +126,14 @@ function Write-Manifest([bool]$CreatedVenv, [bool]$CreatedData, [string]$Flavor,
   }
 }
 
+# Does this command line (a shortcut's arguments, a login entry) start this
+# copy's launcher? Its paths are quoted only when they contain a space.
 function Points-Here([string]$Command) {
-  return $Command -and $Command.IndexOf($Launcher, [StringComparison]::OrdinalIgnoreCase) -ge 0
+  foreach ($word in [regex]::Matches("$Command", '"([^"]*)"|(\S+)')) {
+    $path = if ($word.Groups[1].Success) { $word.Groups[1].Value } else { $word.Groups[2].Value }
+    if ($path -match '^([A-Za-z]:\\|\\\\)' -and (Same-Path $path $Launcher)) { return $true }
+  }
+  return $false
 }
 
 function Running-From-Venv {
@@ -107,7 +141,7 @@ function Running-From-Venv {
   return @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
       $path = $null
       try { $path = $_.Path } catch { }
-      $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+      $path -and (Long-Path $path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
     })
 }
 
@@ -144,9 +178,9 @@ if ($Uninstall) {
     Say "kept $VenvDir (this script did not create it)"
   }
   if ($RemoveData) {
-    if (-not ($record -and $record.created_data -and $record.data_dir -eq $DataDir)) {
+    if (-not ($record -and $record.created_data -and (Same-Path $record.data_dir $DataDir))) {
       Say "kept $DataDir (this script did not create it; delete it yourself if you want)"
-    } elseif ($DataDir -eq $LegacyData) {
+    } elseif (Same-Path $DataDir $LegacyData) {
       Say "kept $DataDir (never removed automatically)"
     } elseif ((Test-Path -LiteralPath $DataDir) -and $PSCmdlet.ShouldProcess($DataDir, 'Remove Sotto data: history, recordings, models, dictionary')) {
       Remove-Item -LiteralPath $DataDir -Recurse -Force
@@ -234,7 +268,7 @@ Say "OK dependency set: $flavor ($why)"
 
 # ---------------------------------------------------------------- install
 $createdVenv = [bool]($record -and $record.created_venv)
-$createdData = [bool]($record -and $record.created_data -and $record.data_dir -eq $DataDir)
+$createdData = [bool]($record -and $record.created_data -and (Same-Path $record.data_dir $DataDir))
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvPythonW = Join-Path $VenvDir 'Scripts\pythonw.exe'
 

@@ -38,6 +38,17 @@ def bare_copy_of_this_checkout(folder: Path) -> Path:
     return remote
 
 
+def long_and_short(path: Path) -> tuple[str, str]:
+    """An existing Windows path's long and 8.3 short names (GitHub's runner
+    gives TEMP as C:\\Users\\RUNNER~1\\...); equal where the volume keeps none."""
+    import ctypes
+    names = []
+    for convert in (ctypes.windll.kernel32.GetLongPathNameW, ctypes.windll.kernel32.GetShortPathNameW):
+        buffer = ctypes.create_unicode_buffer(32768)
+        names.append(buffer.value if convert(str(path), buffer, len(buffer)) else str(path))
+    return names[0], names[1]
+
+
 def windows_get_script(folder: Path) -> tuple[Path, Path]:
     """A copy of get.ps1 whose Start Menu folder is a temporary one, so a
     test never reads or starts the real "Sotto" entry."""
@@ -271,16 +282,24 @@ class WindowsInstallerTests(unittest.TestCase):
             scripts.mkdir(parents=True)
             stand_in = scripts / "ping.exe"  # any program running from the copy, like pythonw
             shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stand_in)
-            running = subprocess.Popen([str(stand_in), "-n", "60", "127.0.0.1"],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
-            finally:
-                running.kill()
-                running.wait(10)
-            self.assertIn("Sotto is running from", refused.stdout, refused.stderr)
-            self.assertNotIn("Updating Sotto", refused.stdout)
-            self.assertNotIn("would run", refused.stdout)
+            # Started by one name of the folder (long or 8.3 short) and named by
+            # the other, it is the same copy: GitHub's runner (short TEMP) went ahead.
+            long_program, short_program = long_and_short(stand_in)
+            long_dest, short_dest = long_and_short(dest)
+            for program, source in ((long_program, long_dest), (short_program, long_dest),
+                                    (long_program, short_dest)):
+                with self.subTest(program=program, source=source):
+                    running = subprocess.Popen([program, "-n", "60", "127.0.0.1"],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    try:
+                        refused = subprocess.run(command, env=dict(env, SOTTO_SOURCE=source),
+                                                 capture_output=True, text=True, timeout=120)
+                    finally:
+                        running.kill()
+                        running.wait(10)
+                    self.assertIn("Sotto is running from", refused.stdout, refused.stderr)
+                    self.assertNotIn("Updating Sotto", refused.stdout)
+                    self.assertNotIn("would run", refused.stdout)
 
 
     def test_an_update_its_installer_would_refuse_leaves_the_copy_unchanged(self):
