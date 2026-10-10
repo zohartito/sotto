@@ -83,8 +83,11 @@ RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery 
 QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
 # launchd SIGKILLs Sotto's job 5 s after SIGTERM (`launchctl print` shows
 # "exit timeout = 5"; logout, kickstart -k and rollout all send SIGTERM). The
-# drain and the clipboard restore stay short enough that the teardown still
-# keeps what is left in History before that.
+# drain and the teardown's waits (clipboard restore, a finish short of the
+# queue, an append under way, the worker join) share one deadline that leaves
+# SIGTERM_KEEP_RESERVE_S to keep what is left in History before that.
+LAUNCHD_EXIT_TIMEOUT_S = 5.0
+SIGTERM_KEEP_RESERVE_S = 1.5
 SIGTERM_DRAIN_S = 2.0
 SIGTERM_RESTORE_WAIT_S = 1.0
 DRAIN_POLL_S = 0.1               # how often a Quit/Restart drain re-checks the dictation
@@ -114,6 +117,7 @@ class ShutdownBoundary:
         # the way Quit does, finishing the dictation in flight (F1c).
         self.stop_event = threading.Event()
         self.stop_signal = None
+        self.stop_at = None  # time.monotonic() of that first signal
 
     def requested(self) -> bool:
         return self.event.is_set()
@@ -128,7 +132,18 @@ class ShutdownBoundary:
             self.event.set()
             return
         self.stop_signal = signum
+        self.stop_at = time.monotonic()
         self.stop_event.set()
+
+    def teardown_wait_s(self, cap_s: float, now: float) -> float:
+        """How long a teardown wait capped at ``cap_s`` may take. After
+        SIGTERM every such wait shares one deadline that still leaves
+        SIGTERM_KEEP_RESERVE_S before launchd's SIGKILL, so untranscribed
+        captures reach History (N9); otherwise just ``cap_s``."""
+        if self.stop_signal != signal.SIGTERM or self.stop_at is None:
+            return cap_s
+        keep_by = self.stop_at + LAUNCHD_EXIT_TIMEOUT_S - SIGTERM_KEEP_RESERVE_S
+        return max(0.0, min(cap_s, keep_by - now))
 
     def enqueue(self, jobs: queue.Queue, job: tuple, keep=None) -> bool:
         """Queue work only while live; race with shutdown is discarded below.
@@ -3621,22 +3636,28 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     def keep_untranscribed() -> None:
         """A capture still untranscribed at teardown stays in History with its
         audio (N9), for Retry: every queued live capture, the one the worker
-        is on (given APP_DRAIN_TIMEOUT to finish an append already under way)
-        and any it gave up on because shutdown came first. The worker settles
-        each capture once, so one it saved is never kept again, and a model
-        that returns after this keep saves nothing.
+        is on (whose History append, if already under way, gets
+        APP_DRAIN_TIMEOUT to finish) and any it gave up on because shutdown
+        came first. The worker settles each capture once its append succeeds,
+        so one it saved is never kept again, and a model that returns after
+        this keep saves nothing (shutdown already fences its result).
 
         A finish still holding its audio short of the queue gets
         APP_DRAIN_TIMEOUT to reach it (a refused enqueue keeps it), and the
-        worker the same to file a capture it took just as shutdown came.
+        worker the same, after the running capture is kept, to file a capture
+        it took just as shutdown came. After SIGTERM these waits share one
+        deadline (ShutdownBoundary.teardown_wait_s), so launchd's SIGKILL
+        never comes before the keeps.
 
         Side effects: History rows; may wait and join the worker briefly; logs."""
-        wait_until_idle(lambda: finishing.count() > 0, poll_s=0.02, deadline_s=APP_DRAIN_TIMEOUT)
+        wait_until_idle(lambda: finishing.count() > 0, poll_s=0.02,
+                        deadline_s=shutdown.teardown_wait_s(APP_DRAIN_TIMEOUT, time.monotonic()))
         shutdown.discard_queued(jobs, keep=worker.keep_untranscribed)
         running = worker.current_job
-        transcription_thread.join(APP_DRAIN_TIMEOUT)
         if running is not None and running[0] == "live":
-            worker.keep_untranscribed(running)
+            worker.keep_untranscribed(
+                running, wait_s=shutdown.teardown_wait_s(APP_DRAIN_TIMEOUT, time.monotonic()))
+        transcription_thread.join(shutdown.teardown_wait_s(APP_DRAIN_TIMEOUT, time.monotonic()))
         for job in list(worker.abandoned):
             worker.keep_untranscribed(job)
 
@@ -3651,8 +3672,9 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         shutdown.stop_capture(capture)
         if not restart_drain["kept"]:
             restart_drain["kept"] = True
-            flush_clipboard_restore(SIGTERM_RESTORE_WAIT_S if shutdown.stop_signal == signal.SIGTERM
-                                    else RESTORE_DELAY_S)
+            flush_clipboard_restore(shutdown.teardown_wait_s(
+                SIGTERM_RESTORE_WAIT_S if shutdown.stop_signal == signal.SIGTERM else RESTORE_DELAY_S,
+                time.monotonic()))
             keep_untranscribed()
         shutdown.discard_queued(jobs)
         drained = True

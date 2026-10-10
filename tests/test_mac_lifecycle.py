@@ -6,6 +6,7 @@ these tests compile the real closures against fakes (no AppKit run loop, no
 mic, no model, no clipboard, no exec) and check what they do.
 """
 import ast
+import functools
 import os
 import queue
 import signal
@@ -374,9 +375,15 @@ class WarmupIsNotDictationTests(unittest.TestCase):
 
 class TeardownTests(unittest.TestCase):
     def wire(self, *, foreground=False, exec_error=None, worker_job=None, worker_alive=False,
-             queued=(), abandoned=(), failed_raises=False, on_join=None, finishing=None):
-        self.events, self.exits, self.kept, self.failed = [], [], [], []
+             queued=(), abandoned=(), failed_raises=False, on_join=None, finishing=None,
+             clock=None, sigterm_at=None):
+        """``clock``: a virtual clock the teardown's waits run on (each wait
+        takes its full cap: a restore not yet due, a wedged worker).
+        ``sigterm_at``: the stop came from SIGTERM at that clock time."""
+        self.events, self.exits, self.kept, self.kept_at, self.failed = [], [], [], [], []
         shutdown = sotto.ShutdownBoundary()
+        if sigterm_at is not None:
+            shutdown.stop_signal, shutdown.stop_at = signal.SIGTERM, sigterm_at
         shutdown.request()
         jobs = queue.Queue()
         for job in queued:
@@ -400,12 +407,23 @@ class TeardownTests(unittest.TestCase):
             def join(self, timeout=None):
                 if on_join is not None:
                     on_join(worker)
+                if clock is not None and worker_alive:
+                    clock.now += timeout
 
             def is_alive(self):
                 return worker_alive
 
+        def keep(job, **kwargs):
+            self.kept.append(job)
+            self.kept_at.append(clock() if clock is not None else None)
+
+        def restore(max_wait_s, **kwargs):
+            self.events.append("restore")
+            if clock is not None:
+                clock.now += max_wait_s
+
         worker = types.SimpleNamespace(current_job=worker_job, abandoned=list(abandoned),
-                                       keep_untranscribed=lambda job: self.kept.append(job))
+                                       keep_untranscribed=keep)
         capture = types.SimpleNamespace(abort=lambda: None, shutdown=lambda: None,
                                         wait_released=lambda timeout: True)
         quartz = types.SimpleNamespace(CGEventTapEnable=lambda tap, on: None,
@@ -416,12 +434,14 @@ class TeardownTests(unittest.TestCase):
             "nemotron": None, "transcription_thread": Thread(), "worker": worker,
             "restart_drain": {"deadline": None, "kept": False},
             "APP_DRAIN_TIMEOUT": 1.0, "RESTART_DRAIN_DEADLINE_S": 0.0, "RESTART_RELEASE_WAIT_S": 0.0,
-            "AppHelper": types.SimpleNamespace(callLater=lambda *a: None), "time": time,
+            "AppHelper": types.SimpleNamespace(callLater=lambda *a: None),
+            "time": time if clock is None else types.SimpleNamespace(monotonic=clock, sleep=clock.sleep),
             "log": lambda line: None, "os": types.SimpleNamespace(_exit=self.exits.append),
             "Quartz": quartz, "tap": None, "status_ui": None, "ui_call": lambda *a: None,
-            "flush_clipboard_restore": lambda *a, **k: self.events.append("restore"),
+            "flush_clipboard_restore": restore,
             "signal": signal, "finishing": finishing or sotto.PendingDeliveries(),
-            "wait_until_idle": sotto.wait_until_idle,
+            "wait_until_idle": (sotto.wait_until_idle if clock is None else
+                                functools.partial(sotto.wait_until_idle, sleep=clock.sleep, clock=clock)),
         }
         for name in ("SIGTERM_RESTORE_WAIT_S", "RESTORE_DELAY_S", "RESTART_FAILED_EXIT"):
             namespace[name] = getattr(sotto, name, None)
@@ -489,6 +509,28 @@ class TeardownTests(unittest.TestCase):
         threading.Thread(target=finish_late, daemon=True).start()
         stop()
         self.assertEqual(self.kept, [live], "the teardown ended before the finish kept its audio")
+
+    def test_sigterm_keeps_the_running_capture_before_launchds_sigkill(self):
+        # Codex on #20: after SIGTERM's 2 s drain, a pending clipboard restore
+        # (1 s), a finish still short of the queue (1 s) and the join on a
+        # wedged worker (1 s) put the keep at 5 s, when launchd SIGKILLs.
+        clock = Clock()
+        clock.now = sotto.SIGTERM_DRAIN_S  # SIGTERM came at 0; the drain ran out
+        live = ("live", "raw", 48000.0, 1.0, 2.0, "cap9", None, None)
+        finishing = sotto.PendingDeliveries()
+        finishing.add()  # a finish that never reaches the queue
+        stop, _ = self.wire(worker_job=live, worker_alive=True, finishing=finishing,
+                            clock=clock, sigterm_at=0.0)
+        stop()
+        self.assertEqual(self.kept, [live])
+        self.assertIn("restore", self.events)
+        self.assertLessEqual(self.kept_at[0], 4.0, "kept less than a second before launchd's SIGKILL at 5 s")
+
+    def test_sigterm_records_when_it_came(self):
+        boundary = sotto.ShutdownBoundary()
+        boundary.request_stop(signal.SIGTERM)
+        self.assertIsNotNone(boundary.stop_at)
+        self.assertLessEqual(boundary.stop_at, time.monotonic())
 
     def test_n27_a_failed_exec_exits_so_launchd_starts_sotto_again(self):
         for error in (OSError(7, "Argument list too long"), IndexError("tuple index out of range")):
