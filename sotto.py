@@ -2271,6 +2271,15 @@ def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
         pasteboard.writeObjects_(items)
 
 
+def set_clipboard_text(text: str) -> None:
+    """Replace the general clipboard with ``text`` (main thread only).
+
+    Side effects: rewrites the general pasteboard."""
+    pasteboard = NSPasteboard.generalPasteboard()
+    pasteboard.clearContents()
+    pasteboard.setString_forType_(text, NSPasteboardTypeString)
+
+
 class DeliveryQueue:
     """One FIFO for everything Sotto hands to the frontmost app — finished
     dictations and "scratch that" undos — in capture order, so a newer result
@@ -2298,7 +2307,7 @@ class DeliveryQueue:
     def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
                  secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
                  clock=time.monotonic, timer=threading.Timer, on_done=lambda: None,
-                 own_window_front=lambda: False) -> None:
+                 own_window_front=lambda: False, copy=lambda text: None) -> None:
         self._insert = insert            # (text) -> bool: did the text reach the app?
         self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
         self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
@@ -2314,6 +2323,7 @@ class DeliveryQueue:
         self._timer = timer
         self._on_done = on_done          # () -> None: one item left the queue
         self._own_window_front = own_window_front  # () -> bool: Sotto's alert would get the Cmd-V
+        self._copy = copy                # (text) -> None: put text on the general clipboard
         self._items: list[tuple] = []
         self._poll_armed = False
         self._waiting = False
@@ -2372,13 +2382,17 @@ class DeliveryQueue:
             self._blocked_since = now
         elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
             dropped = sum(1 for item in self._items if item[0] == "paste")
-            unsaved = sum(1 for item in self._items if item[0] == "paste" and not item[2])
+            unsaved = [item[1] for item in self._items if item[0] == "paste" and not item[2]]
             self._discard_all()
             self._blocked_since = None
             self._waiting = False
             self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — {dropped} dictation(s) "
-                      f"not pasted, " + (f"{unsaved} not in History" if unsaved else "kept in History"))
-            if unsaved:
+                      f"not pasted, " + (f"{len(unsaved)} not in History" if unsaved else "kept in History"))
+            if unsaved and self._copy_unsaved(unsaved):
+                self._note("Dictation copied to the clipboard",
+                           "A key was held for too long to paste it, and History could not save it, "
+                           "so the text is on the clipboard.")
+            elif unsaved:
                 self._note("Dictation not pasted",
                            f"A key was held for too long to paste it. {NOT_IN_HISTORY_EITHER}")
             else:
@@ -2389,6 +2403,18 @@ class DeliveryQueue:
             self._waiting = True
             self._log("  paste deferred — a key is still held")
         self._arm_poll()
+
+    def _copy_unsaved(self, texts: list[str]) -> bool:
+        """Put dropped text History could not save on the clipboard: it is the
+        only copy (owner decision 2026-10-09). Returns whether it got there.
+
+        Side effects: replaces the general clipboard; logs a failure."""
+        try:
+            self._copy("\n\n".join(texts))
+            return True
+        except Exception as exc:
+            self._log(f"! could not copy the dropped dictation ({type(exc).__name__})")
+            return False
 
     def _wait_for_own_window(self) -> None:
         """Hold the queue while Sotto's own window is in front (N24); no drop."""
@@ -3174,7 +3200,8 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
         keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
         call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested,
-        on_done=pending_deliveries.finish, own_window_front=own_window_without_text_field)
+        on_done=pending_deliveries.finish, own_window_front=own_window_without_text_field,
+        copy=set_clipboard_text)
 
     # deliver_call counts each of these in pending_deliveries when it schedules
     # it; the queue's on_done finishes that entry once the item is delivered,

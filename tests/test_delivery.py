@@ -330,6 +330,7 @@ class DeliveryQueueHarness:
         self.shutdown = False
         self.on_insert = lambda text: None  # runs inside the insert: may raise or request shutdown
         self.delivered, self.undos, self.notes, self.logs = [], [], [], []
+        self.copied: list[str] = []
         self.queue = sotto.DeliveryQueue(
             insert=self._insert, undo_keys=lambda: self.undos.append(round(self.timers.now, 2)),
             keys_held=self.held, recording=lambda: self.held() and self.recording_while_held,
@@ -337,7 +338,8 @@ class DeliveryQueueHarness:
             secure_input=lambda: self.secure, call_after=lambda fn, *args: fn(*args),
             note=lambda title, message: self.notes.append((title, message)), log=self.logs.append,
             shutdown_requested=lambda: self.shutdown, clock=lambda: self.timers.now,
-            timer=self.timers.Timer, **({} if on_done is None else {"on_done": on_done}))
+            timer=self.timers.Timer, copy=self.copied.append,
+            **({} if on_done is None else {"on_done": on_done}))
 
     def held(self):
         return self.timers.now < self.held_until
@@ -684,6 +686,18 @@ class UndeliveredPasteNoteTests(unittest.TestCase):
         self.assertNotIn("kept in History", title + message)
         self.assertNotIn("Open History", message)
         self.assertFalse(any("kept in History" in line for line in world.logs), world.logs)
+
+    def test_an_unsaved_dictation_dropped_by_a_long_hold_goes_to_the_clipboard(self):
+        # Owner decision 2026-10-09: History could not save it, so the dropped
+        # text is the only copy; it goes on the clipboard, with a note saying so.
+        world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
+        world.queue.paste("saved one ")
+        world.queue.paste("first unsaved ", in_history=False)
+        world.queue.paste("second unsaved ", in_history=False)
+        world.timers.advance_to(sotto.DELIVERY_WAIT_MAX_S + 1.0)
+        self.assertEqual(world.copied, ["first unsaved \n\nsecond unsaved "])
+        self.assertEqual([title for title, _ in world.notes], ["Dictation copied to the clipboard"])
+        self.assertEqual(world.delivered, [])
 
     def test_n16_a_long_hold_drop_of_saved_text_still_points_at_history(self):
         world = DeliveryQueueHarness(held_until=10_000.0, recording_while_held=False)
