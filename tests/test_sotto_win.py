@@ -223,26 +223,56 @@ class RestartTest(unittest.TestCase):
         self.assertFalse(waiting.restart_requested, "Quit wins over a pending restart")
 
     def test_restart_and_speed_change_never_abandon_a_slow_dictation(self):
-        # [F30] A long dictation on the CPU outlasts the old 20 s drain deadline;
-        # Restart and a Speed change must still wait for it (deadline shrunk here).
+        # [F30] A long dictation on the CPU outlasts the Mac's 20 s restart
+        # deadline (sotto.RESTART_DRAIN_DEADLINE_S, which sotto_win never
+        # reads); Restart and a Speed change must still wait for it.  [N44]
+        # This used to patch that unread constant and wait 0.8 s of real
+        # time; it now runs the drain on the controller's virtual clock.
+        slow_s = 3 * sotto.RESTART_DRAIN_DEADLINE_S
         for start in ("restart", "speed"):
             controller, jobs = self.controller(busy=True)
             controller.speed = "accurate"
-            with mock.patch.object(sotto, "RESTART_DRAIN_DEADLINE_S", 0.2), \
-                    mock.patch.object(sotto_win.user_settings, "save"), \
+            stopped_while_busy: list = []
+
+            def on_sleep(now, controller=controller, jobs=jobs, stopped=stopped_while_busy):
+                stopped.append(controller.shutdown.requested())
+                if now >= slow_s and jobs.unfinished_tasks:
+                    jobs.get_nowait()
+                    jobs.task_done()
+
+            clock = self.virtual_clock(controller, on_sleep)
+            with mock.patch.object(sotto_win.user_settings, "save"), \
                     mock.patch.object(sotto_win, "log"):
                 message = controller.restart() if start == "restart" else controller.set_speed("fast")
                 self.assertIn("after the current dictation", message)
-                time.sleep(0.8)
-                self.assertFalse(controller.shutdown.requested(),
-                                 f"{start}: a dictation still transcribing is never abandoned")
+                self.assertTrue(controller.shutdown.event.wait(5), f"{start}: restarts once idle")
+            self.assertTrue(stopped_while_busy, f"{start}: the drain polls the virtual clock")
+            self.assertFalse(any(stopped_while_busy),
+                             f"{start}: a dictation still transcribing is never abandoned")
+            self.assertGreaterEqual(clock["now"], slow_s)
+            self.assertTrue(controller.restart_requested)
+
+    def test_restart_outlasts_the_longest_hands_free_recording_and_its_transcription(self):
+        # [N22] The 300 s cap was shorter than the 600 s hands-free watchdog,
+        # so Restart abandoned a long hands-free dictation still recording.
+        controller, jobs = self.controller(busy=True)
+        slow_s = sotto.HANDS_FREE_MAX_S + 200.0  # recorded to the max, then a slow CPU decode
+        stopped_while_busy = []
+
+        def on_sleep(now):
+            stopped_while_busy.append(controller.shutdown.requested())
+            if now >= slow_s and jobs.unfinished_tasks:
                 jobs.get_nowait()
                 jobs.task_done()
-                deadline = time.monotonic() + 5
-                while not controller.shutdown.requested() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-            self.assertTrue(controller.shutdown.requested(), f"{start}: restarts once idle")
-            self.assertTrue(controller.restart_requested)
+
+        self.virtual_clock(controller, on_sleep)
+        logs: list = []
+        with mock.patch.object(sotto_win, "log", logs.append):
+            controller.restart()
+            self.assertTrue(controller.shutdown.event.wait(5))
+        self.assertFalse(any(stopped_while_busy), "the dictation was abandoned")
+        self.assertFalse([line for line in logs if "abandoned" in line], logs)
+        self.assertGreater(sotto_win.RESTART_DRAIN_CAP_S, sotto.HANDS_FREE_MAX_S)
 
     @staticmethod
     def virtual_clock(controller, on_sleep=lambda now: None) -> dict:
@@ -631,7 +661,7 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
         opened = closed = shutdowns = 0
         active = False
 
-        def begin(self):
+        def begin(self, epoch=None):
             FakeCapture.opened += 1
             FakeCapture.active = True
             return False
@@ -655,6 +685,7 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
         def __init__(self, engine, *, trigger):
             self.engine, self.trigger = engine, trigger
             self.physically_down = self.modifiers_held = self.stopped = False
+            self.keydowns = 0  # the user's own key-downs (TriggerHook.keydowns)
             hooks.append(self)
 
         def start(self): pass
@@ -735,7 +766,7 @@ class RunPipelineTest(unittest.TestCase):
                     mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook), \
                     mock.patch.object(sotto_win.win_inject, "deliver", fake_deliver), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=saved), \
                     mock.patch.object(dictionary, "DICTIONARY_PATH", rules_file), \
@@ -785,6 +816,22 @@ class RunPipelineTest(unittest.TestCase):
     def test_an_unreadable_history_does_not_stop_dictation(self):
         """F16b: a damaged history.jsonl used to raise before the hotkey was
         armed, at every login. Now dictation works and the file is untouched."""
+        delivered, logs = self._dictate_once_with_damaged(
+            "history.jsonl", '{"id": "abc123", "text": "kept"}\n{"id": "def456", "text": "cut of')
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("hello world", delivered[0].lower())
+        self.assertEqual(sum(line.startswith("! History unreadable") for line in logs), 1, logs)
+
+    def test_a_damaged_learning_set_does_not_stop_dictation(self):
+        """N21: a damaged learning.jsonl raised the same way in LearningStore()."""
+        delivered, logs = self._dictate_once_with_damaged("learning/learning.jsonl", '{"sample_id": "cut of')
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("hello world", delivered[0].lower())
+        self.assertEqual(sum(line.startswith("! Learning set unreadable") for line in logs), 1, logs)
+
+    def _dictate_once_with_damaged(self, relative: str, content: str) -> tuple[list, list]:
+        """run() with ``relative`` under the data folder holding ``content``,
+        one dictation, then shutdown; the file must be left byte-for-byte."""
         import numpy as np
         from history import HistoryStore
         from learning import LearningStore
@@ -802,8 +849,9 @@ class RunPipelineTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="sotto-win-unreadable-") as temporary:
             data = Path(temporary)
-            index = data / "history.jsonl"
-            index.write_text('{"id": "abc123", "text": "kept"}\n{"id": "def456", "text": "cut of', encoding="utf-8")
+            index = data / relative
+            index.parent.mkdir(parents=True, exist_ok=True)
+            index.write_text(content, encoding="utf-8")
             before = index.read_bytes()
 
             def drive():
@@ -827,7 +875,7 @@ class RunPipelineTest(unittest.TestCase):
                     mock.patch.object(sotto_win.win_inject, "deliver",
                                       lambda text, **kwargs: delivered.append(text) or kwargs["mode"]), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
                     mock.patch.object(dictionary, "DICTIONARY_PATH", data / "dictionary.txt"), \
@@ -838,10 +886,8 @@ class RunPipelineTest(unittest.TestCase):
                 driver.start()
                 self.assertFalse(sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu"))
                 driver.join(5)
-            self.assertEqual(index.read_bytes(), before, "History is left exactly as it was")
-        self.assertEqual(len(delivered), 1)
-        self.assertIn("hello world", delivered[0].lower())
-        self.assertEqual(sum(line.startswith("! History unreadable") for line in logs), 1, logs)
+            self.assertEqual(index.read_bytes(), before, "the file is left exactly as it was")
+        return delivered, logs
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
@@ -930,7 +976,7 @@ class ControllerTest(unittest.TestCase):
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win, "save_language_mode",
@@ -1051,7 +1097,7 @@ class LifecycleTest(unittest.TestCase):
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
@@ -1095,7 +1141,7 @@ class LifecycleTest(unittest.TestCase):
         results: dict = {}
 
         class SlowStartCapture(FakeCapture):
-            def begin(self):
+            def begin(self, epoch=None):
                 cold = super().begin()
                 begin_entered.set()
                 resume_begin.wait(10)  # the mic is slow to open: on_start is in flight
@@ -1148,7 +1194,7 @@ class LifecycleTest(unittest.TestCase):
                                       lambda text, **kwargs: delivered.append(text)), \
                     mock.patch.object(sotto_win.win_inject, "copy_text", copied.append), \
                     mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)), \
-                    mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)), \
+                    mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)), \
                     mock.patch.object(sotto_win, "Controller", RecordingController), \
                     mock.patch.object(sotto_win, "load_language_mode", return_value="auto"), \
                     mock.patch.object(sotto_win.user_settings, "load", return_value=dict(user_settings.DEFAULTS)), \
@@ -1288,7 +1334,7 @@ def _patched_run(stack, data, fakes, *, logs, boundaries, controllers, settings=
             mock.patch.object(sotto_win.win_capture, "WinCapture", FakeCapture),
             mock.patch.object(sotto_win.win_hotkey, "TriggerHook", FakeHook),
             mock.patch.object(sotto_win, "HistoryStore", lambda **kwargs: HistoryStore(data, **kwargs)),
-            mock.patch.object(sotto_win, "LearningStore", lambda: LearningStore(data)),
+            mock.patch.object(sotto_win, "LearningStore", lambda **kwargs: LearningStore(data, **kwargs)),
             mock.patch.object(sotto_win, "Controller", RecordingController),
             mock.patch.object(sotto_win, "load_language_mode", return_value="auto"),
             mock.patch.object(sotto_win.user_settings, "load",
@@ -1812,6 +1858,308 @@ class ConsoleLogTest(unittest.TestCase):
         self.assertEqual("".join(written), "● recording\n○ 0.98s captured\n")
         print("after drain", file=sink)  # written directly once the writer has stopped
         self.assertTrue("".join(written).endswith("after drain\n"), written)
+
+    def test_a_log_that_grows_past_its_limit_rotates_while_sotto_runs(self):
+        # [N36] sotto.log rotated only at startup, so a long session grew it without bound.
+        line = "○ 0.98s captured · 12 chars\n"
+        with tempfile.TemporaryDirectory(prefix="sotto-win-log-") as temporary, \
+                mock.patch.object(sotto_win, "DATA_DIR", Path(temporary)), \
+                mock.patch.object(sotto_win, "LOG_ROTATE_BYTES", 200), \
+                mock.patch.object(sys, "stderr", None):
+            sink = sotto_win._ConsoleLog()
+            for _ in range(30):  # about 900 bytes
+                print(line, end="", file=sink)
+            sink.drain(timeout=5)
+            sink._file.close()
+            current, rotated = Path(temporary, "sotto.log"), Path(temporary, "sotto.log.1")
+            self.assertTrue(rotated.is_file(), "nothing was rotated while running")
+            self.assertLessEqual(current.stat().st_size, 200 + len(line.encode("utf-8")))
+            self.assertLessEqual(rotated.stat().st_size, 200 + len(line.encode("utf-8")))
+            kept = current.read_text(encoding="utf-8") + rotated.read_text(encoding="utf-8")
+            self.assertTrue(kept and set(kept.splitlines()) == {line.strip()}, kept)
+
+
+def _fake_tray(notes: list):
+    """A tray that records its notifications (win_ui.TrayApp's surface)."""
+    class FakeTray:
+        def __init__(self, *, quit, log):
+            pass
+
+        def start(self): pass
+        def stop(self): pass
+        def set_phase(self, phase): pass
+        def set_state(self, state): pass
+        def attach(self, controller): pass
+
+        def notify(self, text):
+            notes.append(text)
+
+    return FakeTray
+
+
+def _voiced(seconds: float = 1.0):
+    import numpy as np
+    rate = 16_000
+    return (np.sin(np.arange(int(rate * seconds)) / 3) * 0.2).astype(np.float32)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only entry point")
+class RoundTwoRunTest(unittest.TestCase):
+    """Round-2 audit rows against a running ``run`` (fake key, mic, model, tray)."""
+
+    ENGLISH = dict(user_settings.DEFAULTS, languages=["en"]) if sys.platform == "win32" else {}
+
+    def run_app(self, fakes, drive, data, *, settings=None, extra=()):
+        """Run the app until ``drive(results, app)`` returns; returns the
+        results, what was inserted and copied, the tray's notes and the logs."""
+        import contextlib
+        hooks_controllers = {"boundaries": [], "controllers": []}
+        app = {"delivered": [], "copied": [], "notes": [], "logs": [], "hooks": fakes[3],
+               "controllers": hooks_controllers["controllers"]}
+        results: dict = {}
+
+        def guarded():
+            try:
+                _wait_for(lambda: app["controllers"] and app["hooks"], "listening")
+                drive(results, app)
+            except BaseException as exc:
+                results["error"] = exc
+            finally:
+                hooks_controllers["boundaries"][0].request()
+
+        with contextlib.ExitStack() as stack:
+            _patched_run(stack, data, fakes[:3], logs=app["logs"],
+                         boundaries=hooks_controllers["boundaries"],
+                         controllers=app["controllers"], settings=settings)
+            stack.enter_context(mock.patch("win_ui.TrayApp", _fake_tray(app["notes"])))
+            stack.enter_context(mock.patch("win_ui.message_box"))
+            stack.enter_context(mock.patch.object(
+                sotto_win.win_inject, "deliver",
+                lambda text, **kwargs: app["delivered"].append(text) or kwargs["mode"]))
+            stack.enter_context(mock.patch.object(sotto_win.win_inject, "copy_text",
+                                                  app["copied"].append))
+            for patch in extra:
+                stack.enter_context(patch)
+            driver = threading.Thread(target=guarded, daemon=True)
+            driver.start()
+            sotto_win.run("right-ctrl", "auto", None, None, None, 0.0, "cpu", tray=True)
+            driver.join(10)
+        self.assertNotIn("error", results, (results, app["logs"]))
+        return results, app
+
+    @staticmethod
+    def fakes(captures, replies, whisper_calls=None):
+        hooks: list = []
+        return (*_app_fakes(16_000, captures, replies, hooks,
+                            [] if whisper_calls is None else whisper_calls), hooks)
+
+    @staticmethod
+    def dictate(app, settle=True):
+        """Hold the trigger 0.45 s (a hold, not a tap), then wait until the
+        capture is transcribed and delivered."""
+        hook, controller = app["hooks"][0], app["controllers"][0]
+        hook.physically_down = True  # or the resync poller may end the hold early
+        hook.engine.pressed()
+        time.sleep(0.45)
+        hook.physically_down = False
+        hook.engine.released()
+        if settle:
+            _wait_for(lambda: not controller.busy(), "the dictation to settle")
+
+    def test_scratch_that_undoes_only_sottos_own_insert_in_the_same_window(self):
+        # [F7w] Windows sent Ctrl+Z within the minute whatever had happened:
+        # to another window, after the user typed, or after an insert that
+        # inserted nothing.  Now it follows the Mac's rules.
+        steps = [  # (reply, what the insert does, window in front, user typed first)
+            ("first words", "", (101, 7), False),     # nothing was inserted
+            ("scratch that", "", (101, 7), False),     # -> nothing to undo
+            ("second words", "type", (101, 7), False),
+            ("scratch that", "type", (202, 9), False),  # another window in front
+            ("scratch that", "type", (101, 7), True),   # the user typed since
+            ("third words", "type", (101, 7), False),
+            ("scratch that", "type", (101, 7), False),  # -> undone
+            ("scratch that", "type", (101, 7), False),  # nothing left to undo
+            ("fourth words", "type", None, False),      # no window to compare
+            ("scratch that", "type", None, False),
+        ]
+        replies = [reply for reply, *_ in steps]
+        fakes = self.fakes([_voiced() for _ in steps], replies)
+        state = {"inserts": "", "window": None}
+        asked, undos = [], []
+
+        def deliver(text, *, mode, spacing, log):
+            asked.append(text)
+            return state["inserts"]
+
+        def drive(results, app):
+            hook = app["hooks"][0]
+            results["undos_after"] = []
+            for _reply, inserts, window, typed in steps:
+                state["inserts"], state["window"] = inserts, window
+                if typed:
+                    hook.keydowns += 1
+                self.dictate(app)
+                results["undos_after"].append(len(undos))
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-scratch-") as temporary:
+            results, app = self.run_app(fakes, drive, Path(temporary), settings=self.ENGLISH, extra=(
+                mock.patch.object(sotto_win.win_inject, "deliver", deliver),
+                mock.patch.object(sotto_win.win_inject, "send_inputs", undos.append),
+                mock.patch.object(sotto_win.win_inject, "foreground_identity",
+                                  lambda: state["window"], create=True)))
+        self.assertEqual(asked, ["first words", "second words", "third words", "fourth words"])
+        self.assertEqual(results["undos_after"], [0, 0, 0, 0, 0, 0, 1, 1, 1, 1], app["logs"])
+        self.assertEqual(len(undos[0]), 4, "one Ctrl+Z chord")
+        for reason in ("nothing recent to undo", "went to another window",
+                       "you typed since", "window in front is unknown"):
+            self.assertTrue(any(reason in line for line in app["logs"]), (reason, app["logs"]))
+
+    def test_retry_runs_the_same_cleanup_as_live_dictation(self):
+        # [F19w] Windows Retry skipped the English cleanup (fillers, voice
+        # commands) that live dictation and the Mac's Retry apply.
+        from history import HistoryStore
+        fakes = self.fakes([_voiced()], ["first", "Hello, um, world", "scratch that"])
+
+        def drive(results, app):
+            controller = app["controllers"][0]
+            self.dictate(app)
+            entry_id = HistoryStore(data).entries(1)[0]["id"]
+            for count in (1, 2):
+                controller.retry(entry_id)
+                _wait_for(lambda count=count: len(app["copied"]) == count, "the retry")
+            results["row"] = HistoryStore(data).get(entry_id)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-retry-") as temporary:
+            data = Path(temporary)
+            results, app = self.run_app(fakes, drive, data, settings=self.ENGLISH)
+        # Retry never undoes anything: "scratch that" keeps its words.
+        self.assertEqual(app["copied"], ["Hello world", "scratch that"])
+        cleaned = results["row"]["attempts"][-2]["preprocessing"]
+        self.assertEqual(cleaned["voice"], {"asr_text": "Hello, um, world"})
+        self.assertNotIn("voice", results["row"]["attempts"][-1]["preprocessing"])
+
+    def test_a_history_that_cannot_take_the_row_still_delivers_and_says_so(self):
+        # [N1] An append_live that raised (disk full, a locked History) used
+        # to lose the dictation: not inserted, not saved, "could not be
+        # transcribed".  The Mac's F16a: the text is still delivered, one note.
+        from history import HistoryStore
+        fakes = self.fakes([_voiced(), _voiced(), _voiced()],
+                           ["hello world", RuntimeError("CUDA failed with error out of memory"), ""])
+
+        def drive(results, app):
+            for _ in range(3):
+                self.dictate(app)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-append-") as temporary:
+            data = Path(temporary)
+            results, app = self.run_app(fakes, drive, data, extra=(mock.patch(
+                "learning.LearningCoordinator.append_live",
+                side_effect=OSError(28, "No space left on device")),))
+            rows = HistoryStore(data).entries(10)
+        self.assertEqual(app["delivered"], ["hello world"], app["logs"])
+        self.assertEqual(rows, [])
+        self.assertEqual(app["notes"], [
+            "History could not be saved. The text was still delivered, but it is not in History.",
+            "Transcription failed, and the recording could not be saved to History either; "
+            "please dictate again.",
+            "History could not be saved. The held-back text could not be kept in History."])
+
+    def test_a_failed_transcription_with_history_unreadable_does_not_promise_a_retry(self):
+        # [N10] With History unreadable the row is never written, but the
+        # tray said "The recording is in History: choose Retry".
+        fakes = self.fakes([_voiced()], [RuntimeError("CUDA failed with error out of memory")])
+
+        def drive(results, app):
+            self.dictate(app)
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-unreadable-") as temporary:
+            data = Path(temporary)
+            (data / "history.jsonl").write_text('{"id": "abc123", "text": "cut of', encoding="utf-8")
+            results, app = self.run_app(fakes, drive, data)
+        self.assertEqual(app["notes"], [
+            "Transcription failed, and the recording could not be saved to History either; "
+            "please dictate again."])
+
+    def test_a_microphone_that_cannot_open_ends_the_gesture_and_says_so_once(self):
+        # [N2] A failed open only logged: the gesture stayed "recording",
+        # "mic live" was logged, and the release lost the dictation silently.
+        import win_capture
+        real_capture, made, opens = win_capture.WinCapture, [], []
+
+        def failing_stream(**kwargs):
+            opens.append(kwargs)
+            raise OSError("Error opening InputStream: Device unavailable [PaErrorCode -9985]")
+
+        def make_capture():
+            made.append(real_capture(stream_factory=failing_stream, log=lambda message: None))
+            return made[-1]
+
+        def drive(results, app):
+            hook = app["hooks"][0]
+            hook.engine.pressed()
+            _wait_for(lambda: opens and not made[0].is_active(), "the failed open")
+            time.sleep(0.5)  # announce_live polls every 0.05 s
+            results["recording_after_failure"] = hook.engine.snapshot()[0]
+            hook.engine.released()
+            _wait_for(lambda: not app["controllers"][0].busy(), "the release")
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-mic-") as temporary:
+            results, app = self.run_app(self.fakes([], []), drive, Path(temporary), extra=(
+                mock.patch.object(sotto_win.win_capture, "WinCapture", make_capture),))
+        self.assertFalse(results["recording_after_failure"], "the gesture still records")
+        self.assertEqual([note for note in app["notes"] if "Could not start the microphone" in note],
+                         app["notes"])
+        self.assertEqual(len(app["notes"]), 1, app["notes"])
+        self.assertNotIn("● recording (mic live)", app["logs"])
+        self.assertIn("✗ could not start the microphone — dictation cancelled", app["logs"])
+
+    def test_scratch_that_finished_from_the_tray_says_nothing_was_undone(self):
+        # [N20] "scratch that" in a dictation finished from the tray was
+        # dropped without a word: no Ctrl+Z (right), but no note either.
+        fakes = self.fakes([_voiced()], ["scratch that"])
+        undos: list = []
+
+        def drive(results, app):
+            controller = app["controllers"][0]
+            controller.start_now()
+            time.sleep(0.45)
+            controller.finish_now()
+            _wait_for(lambda: not controller.busy(), "the dictation to settle")
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-tray-scratch-") as temporary:
+            results, app = self.run_app(fakes, drive, Path(temporary), settings=self.ENGLISH, extra=(
+                mock.patch.object(sotto_win.win_inject, "send_inputs", undos.append),))
+        self.assertEqual((undos, app["copied"], app["delivered"]), ([], [], []))
+        self.assertEqual(len(app["notes"]), 1, app["notes"])
+        self.assertIn("Nothing was undone", app["notes"][0])
+        self.assertIn("  scratch that: finished from the tray — nothing undone", app["logs"])
+
+    def test_a_retry_that_finds_history_unreadable_is_reported_in_the_tray(self):
+        # [N20, first half: not real] History that turns unreadable after
+        # startup still lists its rows; a Retry then fails with a tray note,
+        # not only a log line.  (Unreadable at startup, History lists nothing,
+        # so there is no Retry to choose.)
+        from history import HistoryStore, HistoryUnreadable
+        fakes = self.fakes([_voiced()], ["hello world", "never reached"])
+
+        def drive(results, app):
+            controller = app["controllers"][0]
+            self.dictate(app)
+            entry_id = controller.entries()[0]["id"]
+            (data / "history.jsonl").write_text('{"id": "abc123", "text": "cut of', encoding="utf-8")
+            results["listed"] = [entry["id"] for entry in controller.entries()]
+            controller.retry(entry_id)
+            _wait_for(lambda: not controller.busy(), "the retry")
+            results["entry_id"] = entry_id
+
+        with tempfile.TemporaryDirectory(prefix="sotto-win-retry-unreadable-") as temporary:
+            data = Path(temporary)
+            results, app = self.run_app(fakes, drive, data)
+            with self.assertRaises(HistoryUnreadable):
+                HistoryStore(data)  # the file really is unreadable
+        self.assertEqual(results["listed"], [results["entry_id"]])
+        self.assertEqual(len(app["notes"]), 1, app["notes"])
+        self.assertEqual(app["copied"], [])
 
 
 if __name__ == "__main__":

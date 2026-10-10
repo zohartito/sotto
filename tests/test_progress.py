@@ -117,6 +117,27 @@ class LifetimeTotalsTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), truncated)
         self.assertIn("progress totals not saved", logged.call_args[0][0])
 
+    def test_the_new_totals_reach_the_disk_before_they_replace_the_old(self):
+        """N32: stats.json was replaced without an fsync, so a crash could
+        leave a malformed file that F38's strict parse then never replaces."""
+        import os
+        from unittest import mock
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            events.append("fsync")
+            return real_fsync(fd)
+
+        def replace(source, target):
+            events.append("replace")
+            return real_replace(source, target)
+
+        with mock.patch.object(progress.os, "fsync", fsync), mock.patch.object(progress.os, "replace", replace):
+            progress.record(self.path, text="two words", seconds=1.0)
+        self.assertEqual(events[:2], ["fsync", "replace"])
+        self.assertEqual(progress.load_totals(self.path), {"dictations": 1, "words": 2, "seconds": 1.0})
+
     def test_time_saved_against_typing_and_the_menu_line(self):
         totals = {"dictations": 300, "words": 12_400, "seconds": 3_600.0}
         self.assertAlmostEqual(progress.saved_minutes(totals), 12_400 / 40 - 60)

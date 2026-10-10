@@ -51,10 +51,30 @@ def _fsync_dir(path: Path) -> None:
         pass
 
 
+# str.splitlines() also ends a line at these, and json.dumps(ensure_ascii=False)
+# leaves them raw inside strings: a transcript containing one made every reader
+# that split on them (this one before N4, and older Sotto versions after a
+# rollback) see a broken row. Written escaped, they are ordinary JSON text.
+_LINE_BREAKS_JSON_LEAVES_RAW = ("\u2028", "\u2029", "\u0085")
+
+
+def _jsonl_line(row: dict[str, Any]) -> str:
+    line = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    for char in _LINE_BREAKS_JSON_LEAVES_RAW:
+        line = line.replace(char, f"\\u{ord(char):04x}")
+    return line + "\n"
+
+
+def _jsonl_rows(text: str) -> list[str]:
+    """Split JSONL on "\\n" only: a row may hold a raw U+2028, U+2029 or U+0085
+    written before N4, and str.splitlines() would cut it in two."""
+    return text.split("\n")
+
+
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     ensure_private_directory(path.parent)
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    payload = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    payload = "".join(_jsonl_line(row) for row in rows)
     try:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -218,7 +238,7 @@ class HistoryStore:
             text = self.index.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise HistoryUnreadable("history metadata is malformed; refusing to sweep artifacts") from exc
-        for line_number,line in enumerate(text.splitlines(),start=1):
+        for line_number,line in enumerate(_jsonl_rows(text),start=1):
             if not line.strip():
                 continue
             try:
@@ -328,7 +348,12 @@ class HistoryStore:
                 entry["audio"]["inference"].get("format") == "pcm_s16le_mono_16000"):
             entry["silver_enqueue"] = {"history_revision": 0, "state": "pending"}
         self._entries.append(entry)
-        self._save_locked()
+        try:
+            self._save_locked()
+        except Exception:
+            # Never on disk, so never in entries() either (N29).
+            self._entries.pop()
+            raise
         self._prune_locked()
         return dict(entry)
 
@@ -600,6 +625,13 @@ class HistoryStore:
     def _sweep_orphans(self) -> None:
         with self._lock:
             known = set()
+            # Rows are untrusted input (F16c): delete only what no row could
+            # own. A row's recordings can only ever be named after its id, so
+            # regular files with those names are kept even when its "audio"
+            # metadata is null or names another file; a spooled row with no
+            # usable digest could own any Silver evidence file, so then none
+            # is swept.
+            named_by_row, sweep_evidence = set(), True
             for entry in self._entries:
                 for kind, directory in (("inference", self.audio_dir), ("raw", self.raw_audio_dir)):
                     path = self._entry_audio_path(entry, kind)
@@ -608,6 +640,10 @@ class HistoryStore:
                 if entry.get("silver_spooled") is True:
                     path=self._entry_audio_path(entry,"inference")
                     if path is not None: known.add(path)
+                    else: sweep_evidence = False
+                else:
+                    named_by_row.update({self.audio_dir / f"{entry['id']}.wav",
+                                         self.raw_audio_dir / f"{entry['id']}.wav"})
             for directory in (self.audio_dir, self.raw_audio_dir, self.silver_evidence_dir):
                 if not self._owned_audio_root(directory):
                     # Refuse to treat an untrusted root as empty: otherwise a
@@ -626,7 +662,9 @@ class HistoryStore:
                         continue
                     if not stat.S_ISREG(mode):
                         continue
-                    if path.suffix == ".tmp" or path not in known:
+                    orphan = (path not in known and path not in named_by_row and
+                              (sweep_evidence or directory != self.silver_evidence_dir))
+                    if path.suffix == ".tmp" or orphan:
                         path.unlink(missing_ok=True)
             for temp in self.base_dir.glob(".history.jsonl.*.tmp"):
                 temp.unlink(missing_ok=True)

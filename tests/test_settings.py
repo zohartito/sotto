@@ -43,6 +43,34 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((loaded["spacing"], loaded["speed"]), (settings.DEFAULTS["spacing"], "fast"))
         self.assertNotIn("extra", loaded)
 
+    def test_save_never_resets_settings_it_could_not_read(self):
+        """N23: save() started from load(), which falls back to the defaults
+        when the file cannot be read, so one change reset every other setting."""
+        from unittest import mock
+        settings.save({"trigger": "right-cmd", "insert_mode": "type"}, self.path)
+        kept = self.path.read_bytes()
+        for name, damage in {"damaged": lambda: self.path.write_text('{"trigger": "right-cmd", "ins',
+                                                                     encoding="utf-8"),
+                             "not an object": lambda: self.path.write_text("[]", encoding="utf-8"),
+                             "locked": lambda: None}.items():
+            with self.subTest(name):
+                self.path.write_bytes(kept)
+                damage()
+                before = self.path.read_bytes()
+
+                def locked(path, *args, real_read=Path.read_text, is_locked=name == "locked", **kwargs):
+                    if is_locked and Path(path) == self.path:
+                        raise PermissionError(13, "The process cannot access the file", str(path))
+                    return real_read(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "read_text", locked):
+                    with self.assertRaisesRegex(ValueError, "could not be read"):
+                        settings.save({"speed": "fast"}, self.path)
+                self.assertEqual(self.path.read_bytes(), before, "the file is left as it was")
+                self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["settings.json"])
+        self.path.unlink()
+        self.assertEqual(settings.save({"speed": "fast"}, self.path)["speed"], "fast")  # missing: defaults
+
 
 class IgnoredValueReportTests(unittest.TestCase):
     """An ignored setting is reported once in the log, never silently."""

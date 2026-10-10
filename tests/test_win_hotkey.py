@@ -69,6 +69,18 @@ class TriggerHookTest(unittest.TestCase):
         self.assertEqual(self.engine.chord_count, 2)
         self.assertEqual((self.engine.press_count, self.engine.release_count), (1, 1))
 
+    def test_the_users_key_downs_count_but_not_the_trigger_or_modifiers(self) -> None:
+        # [F7w] Typing after an insert means "scratch that" must not undo it.
+        self.hook._on_press(kb.Key.ctrl_r)  # the trigger itself
+        self.hook._on_press(kb.Key.ctrl_r)  # its auto-repeat
+        self.hook._on_release(kb.Key.ctrl_r)
+        for modifier in (kb.Key.shift_l, kb.Key.ctrl_l, kb.Key.alt_l, kb.Key.cmd, kb.Key.alt_gr):
+            self.hook._on_press(modifier)
+        self.assertEqual(self.hook.keydowns, 0)
+        self.hook._on_press(kb.KeyCode.from_char("z"))
+        self.hook._on_press(kb.Key.backspace)
+        self.assertEqual(self.hook.keydowns, 2)
+
     def test_release_without_press_is_ignored(self) -> None:
         self.hook._on_release(kb.Key.ctrl_r)
         self.assertEqual((self.engine.press_count, self.engine.release_count), (0, 0))

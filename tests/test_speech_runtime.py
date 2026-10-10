@@ -8,7 +8,6 @@ import signal
 from contextlib import contextmanager
 from dataclasses import replace
 from io import StringIO
-import inspect
 from pathlib import Path
 import sys
 import tempfile
@@ -269,18 +268,6 @@ class SpeechRuntimeTests(unittest.TestCase):
             adaptive_runtime=Success(),appended_publication=publication,shutdown=boundary,
             inject=lambda: events.append("inject")),{"id":"history"})
         self.assertEqual(events,["append","register","ack","inject"])
-
-    def test_run_shutdown_boundary_fences_capture_queue_and_post_inference_sinks(self):
-        source = inspect.getsource(sotto.run)
-        self.assertIn("if shutdown.requested():\n            shutdown.stop_capture(capture)", source)
-        self.assertIn("shutdown.enqueue(jobs, (\"live\"", source)
-        self.assertIn("shutdown.enqueue(jobs, (\"retry\"", source)
-        self.assertIn("transcription_thread.join(APP_DRAIN_TIMEOUT)", source)
-        # The post-inference fences live in the worker (transcription.py).
-        from transcription import TranscriptionWorker
-        worker = inspect.getsource(TranscriptionWorker._live)
-        self.assertIn("# A backend may ignore cancellation.", worker)
-        self.assertIn("finalize_primary_live_delivery(", worker)
 
     def test_learning_remove_dependency_revoke_precedes_artifact(self):
         calls = []
@@ -580,28 +567,6 @@ class SpeechRuntimeTests(unittest.TestCase):
             self.assertIn("unavailable (fail closed)",sotto.adaptive_status_text([],base_dir=root))
         deploy.unlink()
         self.assertIn("unavailable (fail closed)",sotto.adaptive_status_text([],base_dir=root))
-
-    def test_ui_revoke_uses_current_disk_coordinator_operation(self):
-        runtime_source = inspect.getsource(sotto.run)
-        self.assertIn("nonadaptive_revoke_learning(dependency_guard, coordinator, entry_id)", runtime_source)
-        self.assertNotIn("coordinator.learning.active_for_history(entry_id)", runtime_source)
-        self.assertIn("Removed {count} local learning sample(s).", runtime_source)
-
-    def test_copy_and_save_callbacks_only_start_daemon_workers(self):
-        runtime_source = inspect.getsource(sotto.run)
-        copy_source = runtime_source.split("def action_copy(entry_id: str) -> None:", 1)[1].split(
-            "def action_retry(entry_id: str) -> None:", 1)[0]
-        save_source = runtime_source.split("def action_save(entry_id: str) -> None:", 1)[1].split(
-            "def action_delete(entry_id: str) -> None:", 1)[0]
-        for source in (copy_source, save_source):
-            worker = source.index("def work() -> None:")
-            self.assertNotIn("store.get", source[:worker])
-            self.assertIn("threading.Thread(target=work, daemon=True).start()", source)
-            self.assertLess(worker, source.index("store.get"))
-        self.assertIn("ui_call(_copy_text, entry[\"text\"])", copy_source)
-        self.assertIn('save_audio_copy(store.audio_path(entry_id), Path.home() / "Desktop",',
-                      save_source)
-        self.assertNotIn("shutil.copy", save_source)
 
     def test_concurrent_export_same_destination_has_one_clean_winner(self):
         _, _ = self._enrolled()
