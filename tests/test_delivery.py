@@ -274,6 +274,39 @@ class RestoreWindowTests(unittest.TestCase):
         self.assertGreaterEqual(sotto.RESTORE_DELAY_S, 2.0)
         self.assertLessEqual(sotto.RESTORE_DELAY_S, 5.0)
 
+    def test_n6_shutdown_puts_the_clipboard_back_after_the_app_could_read_it(self):
+        # Quit or a restart right after a paste: the restore timer dies with
+        # the process, so the teardown runs the restore itself.
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        waited = []
+        sotto.flush_clipboard_restore(sleep=waited.append)
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+        self.assertEqual(len(waited), 1)
+        self.assertAlmostEqual(waited[0], sotto.RESTORE_DELAY_S, delta=0.5)  # due, not at once
+        world.timers.advance_to(sotto.RESTORE_DELAY_S + 1.0)  # the timer, if it still fires
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+
+    def test_n6_shutdown_restore_waits_at_most_its_cap(self):
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        waited = []
+        sotto.flush_clipboard_restore(sotto.SIGTERM_RESTORE_WAIT_S, sleep=waited.append)
+        self.assertEqual(waited, [sotto.SIGTERM_RESTORE_WAIT_S])
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+
+    def test_n6_a_user_copy_still_wins_at_shutdown(self):
+        world = patch_insertion(self)
+        sotto.inject("dictation")
+        world.pasteboard.user_copies("USER COPY")
+        sotto.flush_clipboard_restore(sleep=lambda seconds: None)
+        self.assertEqual(world.pasteboard.text(), "USER COPY")
+
+    def test_n6_nothing_pending_is_a_no_op(self):
+        world = patch_insertion(self)
+        sotto.flush_clipboard_restore(sleep=lambda seconds: self.fail("slept with nothing to restore"))
+        self.assertEqual(world.pasteboard.text(), "ORIGINAL user clipboard")
+
     def test_restore_still_checks_change_count_at_restore_time(self):
         world = patch_insertion(self)
         sotto.inject("dictation")

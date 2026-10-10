@@ -438,7 +438,7 @@ class FailedMicStartTest(unittest.TestCase):
                                               enqueue=lambda q, job: q.put(job) or True,
                                               stop_capture=lambda c: None),
             "capture_gate": types.SimpleNamespace(starting=starting),
-            "pending_deliveries": sotto.PendingDeliveries(),
+            "pending_deliveries": sotto.PendingDeliveries(), "finishing": sotto.PendingDeliveries(),
             "use_nemotron": False, "capture": capture, "jobs": jobs,
             "model_rewarm_due": lambda *a, **k: False,
             "model_activity": {"last_finished": 0.0, "rewarming": False},
