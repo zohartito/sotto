@@ -661,7 +661,7 @@ def _app_fakes(rate, captures, replies, hooks, whisper_calls):
         opened = closed = shutdowns = 0
         active = False
 
-        def begin(self):
+        def begin(self, epoch=None):
             FakeCapture.opened += 1
             FakeCapture.active = True
             return False
@@ -1126,7 +1126,7 @@ class LifecycleTest(unittest.TestCase):
         results: dict = {}
 
         class SlowStartCapture(FakeCapture):
-            def begin(self):
+            def begin(self, epoch=None):
                 cold = super().begin()
                 begin_entered.set()
                 resume_begin.wait(10)  # the mic is slow to open: on_start is in flight

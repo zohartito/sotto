@@ -1225,7 +1225,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             return
         with capture_gate.starting() as may_start:
             if may_start:
-                cold = capture.begin()
+                cold = capture.begin(epoch=engine.epoch())
         if not may_start:
             # A restart, update or Quit is draining: a new capture would
             # keep it waiting and then be cut off.  The mic stays closed, and
@@ -1290,12 +1290,14 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("○ tap ignored")
         ui_state()
 
-    def on_mic_failed() -> None:
+    def on_mic_failed(epoch: int | None = None) -> None:
         """The newest capture's stream never opened (device busy or gone, or
         the previous stream still closing): end the gesture, so nothing
         pretends to record, and say so once — the Mac's on_mic_failed.
-        Runs on the capture's opening thread, never on the keyboard hook."""
-        if engine.force_finish():
+        Runs on the capture's opening thread, never on the keyboard hook.
+        Bound to the key epoch the capture began under, so a failure that
+        lands after a newer press can never end that newer gesture."""
+        if engine.force_finish(if_epoch=epoch):
             log("✗ could not start the microphone — dictation cancelled")
         if ui is not None:
             ui.notify(MIC_FAILED_TEXT)

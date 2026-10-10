@@ -69,8 +69,10 @@ class WinCapture:
         # and says so once, as the Mac's CaptureService.on_start_failed does.
         self.on_start_failed = None
 
-    def begin(self) -> bool:
-        """Open the stream off-thread; returns True (always a cold start)."""
+    def begin(self, epoch: int | None = None) -> bool:
+        """Open the stream off-thread; returns True (always a cold start).
+        ``epoch`` is the gesture engine's key epoch this capture began under;
+        a failed open hands it back to on_start_failed."""
         with self._lock:
             if self._closed or self._active:
                 return False
@@ -79,7 +81,7 @@ class WinCapture:
             self._waking = True
             self._generation += 1
             generation = self._generation
-        threading.Thread(target=self._open_stream, args=(generation,),
+        threading.Thread(target=self._open_stream, args=(generation, epoch),
                          daemon=True).start()
         return True
 
@@ -114,7 +116,7 @@ class WinCapture:
             thread.join(max(0.0, deadline - time.monotonic()))
         return not any(thread.is_alive() for thread in closing)
 
-    def _fail_start(self, generation: int, reason: str) -> None:
+    def _fail_start(self, generation: int, reason: str, epoch: int | None = None) -> None:
         """Side effects: ends this capture; calls on_start_failed unless a
         newer capture has begun since (a press that was released before
         its open failed is still lost, so it is still reported)."""
@@ -125,14 +127,14 @@ class WinCapture:
             newest = self._generation == generation
         self._log(f"! mic open failed: {reason[:120]}")
         if newest and self.on_start_failed is not None:
-            self.on_start_failed()
+            self.on_start_failed(epoch)  # the app ends only the gesture of that epoch
 
-    def _open_stream(self, generation: int) -> None:
+    def _open_stream(self, generation: int, epoch: int | None = None) -> None:
         # Runs on the thread begin() started, never on the keyboard hook.
         if not self._wait_closed(self._close_wait_s):
             # Two streams must never hold the mic: this press fails instead.
             self._fail_start(generation, "the previous stream is still closing (slow audio driver); "
-                                         "press again in a moment")
+                                         "press again in a moment", epoch)
             return
 
         def _callback(indata, frame_count, time_info, status) -> None:
@@ -153,7 +155,7 @@ class WinCapture:
             )
             stream.start()
         except Exception as exc:
-            self._fail_start(generation, str(exc))
+            self._fail_start(generation, str(exc), epoch)
             if stream is not None:
                 stream.close()
             return

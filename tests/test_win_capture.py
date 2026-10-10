@@ -284,6 +284,23 @@ class WinCaptureTest(unittest.TestCase):
             release.set()
         self._wait_closed(streams[0])
 
+    def test_a_failed_open_reports_the_gesture_epoch_it_began_under(self) -> None:
+        # [#19 review] The failure names the key epoch its capture began under,
+        # so the app can refuse to end a newer gesture with it.
+        reported: list = []
+
+        def factory(**kwargs):
+            raise OSError("Error opening InputStream: Device unavailable")
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=lambda line: None)
+        capture.on_start_failed = reported.append
+        self.assertTrue(capture.begin(epoch=42))
+        for _ in range(500):  # up to 5 s
+            if reported:
+                break
+            time.sleep(0.01)
+        self.assertEqual(reported, [42])
+
     def test_a_failed_open_is_reported_once_to_the_app(self) -> None:
         # [N2] A failed open only logged: the app went on "recording" a
         # capture that could not exist.
@@ -294,7 +311,7 @@ class WinCaptureTest(unittest.TestCase):
             raise OSError("Error opening InputStream: Device unavailable")
 
         capture = win_capture.WinCapture(stream_factory=factory, log=logs.append)
-        capture.on_start_failed = lambda: failures.append(capture.is_active())
+        capture.on_start_failed = lambda epoch=None: failures.append(capture.is_active())
         self.assertTrue(capture.begin())
         for _ in range(500):  # up to 5 s
             if failures:
