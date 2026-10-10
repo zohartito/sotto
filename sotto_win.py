@@ -69,7 +69,7 @@ INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History
 RESTART_TRANSCRIBE_S = 300.0  # a long CPU dictation transcribes well inside this
 RESTART_DRAIN_CAP_S = sotto.HANDS_FREE_MAX_S + RESTART_TRANSCRIBE_S
 # Quit finishes the dictation in flight, up to this long: the Mac's
-# sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
+# sotto.QUIT_DRAIN_S, the owner's choice for both.
 QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
 UNREAD_PASTE = "a paste the app has not read yet"  # in_flight()'s words for it
@@ -869,15 +869,19 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("stopped before listening")
         return False
 
-    # An unreadable history.jsonl must not stop the app at every login (F16b):
-    # dictation keeps working, History is left untouched, the user is told once.
+    # An unreadable history.jsonl (F16b) or learning set (N21) must not stop
+    # the app at every login: dictation keeps working, both are left
+    # untouched, the user is told once.
     store = HistoryStore(tolerate_unreadable=True)
-    coordinator = sotto.history_coordinator(store, LearningStore())
-    if store.unreadable is not None:
-        message = sotto.history_unreadable_message(store)
-        log(f"! History unreadable ({store.unreadable}): {message}")
+    learning_store = LearningStore(tolerate_unreadable=True)
+    coordinator = sotto.history_coordinator(store, learning_store)
+    unreadable_alert = sotto.unreadable_store_alert(store, learning_store)
+    if unreadable_alert is not None:
+        title, message = unreadable_alert
+        what = "History" if store.unreadable is not None else "Learning set"
+        log(f"! {what} unreadable ({store.unreadable or learning_store.unreadable}): {message}")
         if ui is not None:  # a toast truncates this long a message; the box blocks only its thread
-            threading.Thread(target=win_ui.message_box, args=(sotto.HISTORY_UNREADABLE_TITLE, message),
+            threading.Thread(target=win_ui.message_box, args=(title, message),
                              kwargs={"error": True}, daemon=True).start()
     sotto.seed_totals(store)
     from adaptive_learning import AdaptiveLearning
