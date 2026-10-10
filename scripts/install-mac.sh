@@ -55,14 +55,31 @@ MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
 [ "$MACOS_MAJOR" -ge 14 ] || fail "Sotto needs macOS 14 or later (this Mac runs $(sw_vers -productVersion))."
 xcrun --find clang >/dev/null 2>&1 || fail "Install Apple's command line tools first: xcode-select --install"
 
-# A Sotto running from this copy (its sotto.py on the command line) would have
-# its source and packages swapped while in use. Check for Updates runs this
-# from inside Sotto, names itself in SOTTO_UPDATE_FROM_PID and restarts after.
+# A Sotto running from this copy would have its source and packages swapped
+# while in use: a process with this copy's sotto.py on its command line, by its
+# resolved path (what Sotto.app runs) or relative to the process's working
+# directory (a terminal run: venv-alpha/bin/python sotto.py run). Check for
+# Updates runs this from inside Sotto, names itself in SOTTO_UPDATE_FROM_PID
+# and restarts after.
 running_sotto() {
-    local listing
+    local listing pid command words word dir
     listing="$(ps -axww -o pid= -o command=)" || return 0
-    printf '%s\n' "$listing" | awk -v script="$ROOT/sotto.py" -v self="${SOTTO_UPDATE_FROM_PID:-}" \
-        '$1 != self && index($0 " ", " " script " ") && !found { found = $1 } END { print found }'
+    while read -r pid command; do
+        [ "$pid" != "${SOTTO_UPDATE_FROM_PID:-}" ] || continue
+        case " $command " in *" $ROOT/sotto.py "*) echo "$pid"; return 0 ;; esac
+        read -ra words <<< "$command" || true  # split without globbing
+        for word in ${words[@]+"${words[@]}"}; do
+            case "$word" in sotto.py|*/sotto.py) ;; *) continue ;; esac
+            case "$word" in
+                /*) dir="$(dirname "$word")" ;;
+                *) dir="$(/usr/sbin/lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" || continue
+                   [ -n "$dir" ] || continue
+                   dir="$dir/$(dirname "$word")" ;;
+            esac
+            dir="$(cd "$dir" 2>/dev/null && pwd -P)" || continue
+            [ "$dir/sotto.py" != "$ROOT/sotto.py" ] || { echo "$pid"; return 0; }
+        done
+    done <<< "$listing"
 }
 RUNNING="$(running_sotto)"
 [ -z "$RUNNING" ] || fail "Sotto is running from this copy (process $RUNNING). Quit it from its menu (or update it there with Check for Updates), then run this again."

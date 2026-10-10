@@ -377,17 +377,34 @@ class UpdateOrderTests(unittest.TestCase):
 
     def test_an_update_refuses_while_sotto_runs_from_this_copy(self):
         # [N26] A re-run swapped source and packages under the running app.
-        # The app runs the resolved path (install_app.py ROOT).
-        running = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", str(self.user.resolve() / "sotto.py")])
+        # The app runs the resolved path (install_app.py ROOT); a terminal run
+        # (venv-alpha/bin/python sotto.py run) a path relative to its working
+        # directory, which the check missed [PR21 review].
+        other = self.user.parent / "another-copy"
+        other.mkdir()
+        elsewhere = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", "sotto.py", "run"], cwd=other)
+        self.addCleanup(elsewhere.wait)
+        self.addCleanup(elsewhere.kill)
+        for arguments, cwd in (([str(self.user.resolve() / "sotto.py")], None), (["sotto.py", "run"], self.user),
+                               (["./sotto.py", "run"], self.user), (["../sotto.py"], self.user / "scripts")):
+            with self.subTest(arguments=arguments, cwd=cwd):
+                running = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", *arguments], cwd=cwd)
+                try:
+                    time.sleep(0.2)
+                    refused = self.update()
+                finally:
+                    running.kill()
+                    running.wait()
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn(f"Sotto is running from this copy (process {running.pid})", refused.stderr)
+                self.assertFalse(self.log.exists())  # no package install ran
+                self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.old)
+        # Check for Updates runs the installer from inside that Sotto, which then restarts.
+        # A sotto.py in another folder (still running) is not this copy.
+        running = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", "sotto.py", "run"], cwd=self.user)
         self.addCleanup(running.wait)
         self.addCleanup(running.kill)
         time.sleep(0.2)
-        refused = self.update()
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn(f"Sotto is running from this copy (process {running.pid})", refused.stderr)
-        self.assertFalse(self.log.exists())  # no package install ran
-        self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.old)
-        # Check for Updates runs the installer from inside that Sotto, which then restarts.
         from_app = self.update(SOTTO_UPDATE_FROM_PID=str(running.pid))
         self.assertEqual(from_app.returncode, 0, from_app.stderr)
         self.assertEqual(self.git(self.user, "rev-parse", "HEAD"), self.new)

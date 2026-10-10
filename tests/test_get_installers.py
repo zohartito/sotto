@@ -178,17 +178,21 @@ class MacInstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             env, dest, before = self.installed_copy(folder)
-            running = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", str(dest.resolve() / "sotto.py")])
-            try:
-                time.sleep(0.2)
-                refused = self.run_piped(env)
-            finally:
-                running.kill()
-                running.wait()
-            self.assertNotEqual(refused.returncode, 0)
-            self.assertIn(f"Sotto is running from {dest} (process {running.pid})", refused.stderr)
-            self.assertNotIn("would run", refused.stdout)
-            self.assertEqual(self.git(dest, "rev-parse", "HEAD"), before)
+            # Sotto.app runs the resolved path; a terminal run (venv-alpha/bin/python
+            # sotto.py run) one relative to its working directory [PR21 review].
+            for arguments, cwd in (([str(dest.resolve() / "sotto.py")], None), (["sotto.py", "run"], dest)):
+                with self.subTest(arguments=arguments):
+                    running = subprocess.Popen(["/bin/bash", "-c", "sleep 60; true", *arguments], cwd=cwd)
+                    try:
+                        time.sleep(0.2)
+                        refused = self.run_piped(env)
+                    finally:
+                        running.kill()
+                        running.wait()
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn(f"Sotto is running from {dest} (process {running.pid})", refused.stderr)
+                    self.assertNotIn("would run", refused.stdout)
+                    self.assertEqual(self.git(dest, "rev-parse", "HEAD"), before)
 
     @unittest.skipUnless(any(Path(p).is_file() for p in ("/opt/homebrew/bin/python3.12", "/usr/local/bin/python3.12")),
                          "needs a native Python 3.12 in /opt/homebrew or /usr/local")

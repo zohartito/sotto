@@ -24,6 +24,29 @@ same_repo() {
     [ "${normalized[0]}" = "${normalized[1]}" ]
 }
 
+# The first process running the sotto.py in folder $1 (resolved): by that path
+# (what Sotto.app runs) or relative to the process's working directory (a
+# terminal run: venv-alpha/bin/python sotto.py run).
+running_from() {
+    local listing pid command words word dir
+    listing="$(ps -axww -o pid= -o command=)" || return 0
+    while read -r pid command; do
+        case " $command " in *" $1/sotto.py "*) echo "$pid"; return 0 ;; esac
+        read -ra words <<< "$command" || true  # split without globbing
+        for word in ${words[@]+"${words[@]}"}; do
+            case "$word" in sotto.py|*/sotto.py) ;; *) continue ;; esac
+            case "$word" in
+                /*) dir="$(dirname "$word")" ;;
+                *) dir="$(/usr/sbin/lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" || continue
+                   [ -n "$dir" ] || continue
+                   dir="$dir/$(dirname "$word")" ;;
+            esac
+            dir="$(cd "$dir" 2>/dev/null && pwd -P)" || continue
+            [ "$dir/sotto.py" != "$1/sotto.py" ] || { echo "$pid"; return 0; }
+        done
+    done <<< "$listing"
+}
+
 main() {
     local repo="${SOTTO_REPO:-https://github.com/zohartito/sotto.git}"
     local dest="${SOTTO_SOURCE:-$HOME/sotto}"
@@ -61,12 +84,9 @@ main() {
         same_repo "$origin" "$repo" \
             || fail "$dest is a git copy of ${origin:-an unknown project}, not Sotto. Choose another folder with SOTTO_SOURCE=..."
         # Updating under a running Sotto would swap its source and packages
-        # while they are in use. The app runs its sotto.py by resolved path.
-        local script listing running
-        script="$(cd "$dest" && pwd -P)/sotto.py"
-        listing="$(ps -axww -o pid= -o command=)" || listing=""
-        running="$(printf '%s\n' "$listing" | awk -v script="$script" \
-            'index($0 " ", " " script " ") && !found { found = $1 } END { print found }')"
+        # while they are in use.
+        local running
+        running="$(running_from "$(cd "$dest" && pwd -P)")"
         [ -z "$running" ] || fail "Sotto is running from $dest (process $running). Quit it from its menu (or update it there with Check for Updates), then run this line again."
         echo "== Updating Sotto in $dest"
         # install-mac.sh --update fetches, installs the new packages, and moves
