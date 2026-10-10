@@ -645,6 +645,26 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                        'undone': 0}}
 
 
+class AdvisoryVadStandInTests(unittest.TestCase):
+    def test_overlapping_stand_ins_leave_the_real_module_in_place(self):
+        # A run_jobs on a thread can outlive its test, so two stand-ins can
+        # overlap: B entered while A is in, A left first. B used to snapshot
+        # sys.modules with A's stand-in in it and put it back on leaving, and
+        # test_vad_gate then imported a "vad" without install (GitHub's
+        # Windows runner, PR21).
+        import vad
+        real = sys.modules["vad"]
+        first, second = advisory_vad_stand_in(), advisory_vad_stand_in()
+        first.__enter__()
+        second.__enter__()
+        self.assertIsNot(sys.modules["vad"], real)
+        first.__exit__(None, None, None)
+        self.assertIsNot(sys.modules["vad"], real, "the later stand-in is still in use")
+        second.__exit__(None, None, None)
+        self.assertIs(sys.modules["vad"], real)
+        self.assertIs(vad.install, real.install)
+
+
 class TemporaryUserFiles:
     """Point the dictionary and settings at a temp folder for each test."""
 
@@ -824,26 +844,6 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         h = holder["harness"] = Harness(says("Please call me back at four"), append=disk_full_after_shutdown)
         h.run_jobs(h.live_job(speech(2.0)))
         self.assertEqual((h.injected, h.status_ui.errors), ([], []))
-
-
-class AdvisoryVadStandInTests(unittest.TestCase):
-    def test_overlapping_stand_ins_leave_the_real_module_in_place(self):
-        # A run_jobs on a thread can outlive its test, so two stand-ins can
-        # overlap: B entered while A is in, A left first. B used to snapshot
-        # sys.modules with A's stand-in in it and put it back on leaving, and
-        # test_vad_gate then imported a "vad" without install (GitHub's
-        # Windows runner, PR21).
-        import vad
-        real = sys.modules["vad"]
-        first, second = advisory_vad_stand_in(), advisory_vad_stand_in()
-        first.__enter__()
-        second.__enter__()
-        self.assertIsNot(sys.modules["vad"], real)
-        first.__exit__(None, None, None)
-        self.assertIsNot(sys.modules["vad"], real, "the later stand-in is still in use")
-        second.__exit__(None, None, None)
-        self.assertIs(sys.modules["vad"], real)
-        self.assertIs(vad.install, real.install)
 
 
 if __name__ == "__main__":
