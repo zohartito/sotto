@@ -19,7 +19,7 @@ from typing import Any, Iterator
 
 from audio_codec import AudioIdentity, PreparedAudio, read_canonical_wav, read_pcm16_wav
 from comparator_spool import ComparatorSpool
-from history import HistoryStore, STORE_DIR, _atomic_jsonl, _fsync_dir
+from history import HistoryStore, STORE_DIR, _atomic_jsonl, _fsync_dir, _jsonl_rows
 from storage_lock import advisory_lock, ensure_private_directory, ensure_private_file
 
 LEARNING_SCHEMA_VERSION = 1
@@ -180,21 +180,35 @@ def _snapshot_from_paths(audio_dir: Path, raw_dir: Path, record: dict[str, Any])
     )
 
 
+class LearningUnreadable(RuntimeError):
+    """``path`` (learning.jsonl or pending-gold.jsonl) cannot be trusted: a
+    damaged row, a duplicate id or undecodable bytes. Recovery, revocation and
+    every save refuse against a partial view of the learning set."""
+    def __init__(self, message: str, path: Path) -> None:
+        super().__init__(message)
+        self.path = path
+
+
 def _read_records(index: Path) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     if not index.exists():
         return records
-    for line in index.read_text(encoding="utf-8").splitlines():
+    malformed = "learning metadata is malformed; refusing artifact recovery"
+    try:
+        text = index.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise LearningUnreadable(malformed, index) from exc
+    for line in _jsonl_rows(text):
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("learning metadata is malformed; refusing artifact recovery") from exc
+            raise LearningUnreadable(malformed, index) from exc
         if not isinstance(row, dict) or not isinstance(row.get("sample_id"), str) or not row["sample_id"]:
-            raise RuntimeError("learning metadata is malformed; refusing artifact recovery")
+            raise LearningUnreadable(malformed, index)
         if row["sample_id"] in records:
-            raise RuntimeError("learning metadata has duplicate ids; refusing artifact recovery")
+            raise LearningUnreadable("learning metadata has duplicate ids; refusing artifact recovery", index)
         records[row["sample_id"]] = row
     return records
 
@@ -223,8 +237,18 @@ def _artifacts_valid_at(audio_dir: Path, raw_dir: Path, record: dict[str, Any]) 
 
 
 class LearningStore:
-    """Atomic metadata and copied artifacts for separately enrolled samples."""
-    def __init__(self, base_dir: Path | str | None = None) -> None:
+    """Atomic metadata and copied artifacts for separately enrolled samples.
+
+    A damaged index raises :class:`LearningUnreadable`. The plain dictation
+    app passes ``tolerate_unreadable=True`` instead, so the damage cannot stop
+    it launching (N21): ``unreadable`` then holds the error, the store is
+    empty, startup recovery is skipped and every save refuses, so nothing in
+    ``learning/`` is rewritten, moved or deleted. The adaptive lane stays
+    strict.
+    """
+    unreadable: LearningUnreadable | None = None
+
+    def __init__(self, base_dir: Path | str | None = None, *, tolerate_unreadable: bool = False) -> None:
         parent = Path(base_dir) if base_dir is not None else STORE_DIR
         self.store_root = parent
         self.base_dir = parent / "learning"
@@ -237,8 +261,14 @@ class LearningStore:
             for directory in (self.base_dir, self.audio_dir, self.raw_dir, self.staging_dir):
                 ensure_private_directory(directory)
             ensure_private_file(self.index); ensure_private_file(self.pending_index)
-            self._records = _read_records(self.index)
-            self._pending_gold = _read_records(self.pending_index)
+            try:
+                self._records = _read_records(self.index)
+                self._pending_gold = _read_records(self.pending_index)
+            except LearningUnreadable as exc:
+                if not tolerate_unreadable:
+                    raise
+                self.unreadable, self._records, self._pending_gold = exc, {}, {}
+                return
             self.recover_filesystem()
 
     @classmethod
@@ -295,10 +325,17 @@ class LearningStore:
             history_id = row.get("history_id") if isinstance(row, dict) else None
             return history_id if isinstance(history_id, str) else None
 
+    def _refuse_if_unreadable(self) -> None:
+        if self.unreadable is not None:
+            raise LearningUnreadable(f"learning set is unreadable and was left unchanged ({self.unreadable})",
+                                     self.unreadable.path)
+
     def _save(self) -> None:
+        self._refuse_if_unreadable()
         _atomic_jsonl(self.index, list(self._records.values()))
 
     def _save_pending(self) -> None:
+        self._refuse_if_unreadable()
         _atomic_jsonl(self.pending_index, list(self._pending_gold.values()))
 
     def mark_pending_gold(self, history_id: str, code: str) -> None:

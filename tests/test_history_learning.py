@@ -668,5 +668,125 @@ class HistoryLearningTests(unittest.TestCase):
         self.assertEqual([entry["text"] for entry in store.entries()], ["kept words"])
         self.assertNotIsInstance(sotto.history_coordinator(store, LearningStore(root)), sotto.UnsavedHistory)
 
+    def test_unicode_line_separators_never_split_a_row(self):
+        """N4: str.splitlines() also breaks on U+2028, U+2029 and U+0085. One
+        transcript or correction containing them used to make History and
+        learning.jsonl unreadable for good, including files already written
+        with the character raw by an earlier version."""
+        for char in (" ", " ", "\u0085"):
+            with self.subTest(f"U+{ord(char):04X}"):
+                root = self.root / f"separator-{ord(char):04x}"
+                coordinator = LearningCoordinator(HistoryStore(root), LearningStore(root))
+                row = coordinator.append_live(f"first{char}second", np.array([-1.0, 0, 1.0], np.float32),
+                                              .5, "model")
+                coordinator.correct(row["id"], f"fixed{char}text")
+                self.assertIsNotNone(coordinator.enroll(row["id"]))
+                indexes = (coordinator.history.index, coordinator.learning.index)
+                for index in indexes:
+                    self.assertNotIn(char, index.read_text(encoding="utf-8"), f"{index.name} is written escaped")
+                    # An earlier version wrote the character raw; that file must read too.
+                    escaped = json.dumps(char)[1:-1]
+                    index.write_text(index.read_text(encoding="utf-8").replace(escaped, char), encoding="utf-8")
+                    self.assertIn(char, index.read_text(encoding="utf-8"))
+                reopened = HistoryStore(root)
+                self.assertEqual(reopened.get(row["id"])["hypothesis"], f"first{char}second")
+                learning = LearningStore(root)
+                self.assertEqual([record["corrected_text"] for record in learning.active()], [f"fixed{char}text"])
+
+    def _rewrite_row(self, store: HistoryStore, entry_id: str, **fields) -> None:
+        rows = [json.loads(line) for line in store.index.read_text(encoding="utf-8").split("\n") if line]
+        for row in rows:
+            if row["id"] == entry_id:
+                row.update(fields)
+        store.index.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def test_orphan_sweep_keeps_recordings_of_rows_with_unusable_audio_metadata(self):
+        """F16c: a v2 row whose "audio" is null (or names no usable path) is
+        still a row; startup used to sweep its recordings as orphans while
+        History reported itself readable."""
+        cases = {"audio null": None, "audio a list": [],
+                 "inference null": {"inference": None, "raw": None},
+                 "foreign path": {"inference": {"path": "audio/someone-else.wav"}, "raw": {"path": "x"}}}
+        for name, audio in cases.items():
+            with self.subTest(name):
+                root = self.root / name.replace(" ", "-")
+                store = HistoryStore(root)
+                row = LearningCoordinator(store, LearningStore(root)).append_live(
+                    "kept words", np.array([-1.0, 0, 1.0], np.float32), .5, "model",
+                    raw_samples=np.array([-.5, .5], np.float32), raw_sample_rate=22_050)
+                wav, raw = store.audio_path(row["id"]), store.raw_audio_path(row["id"])
+                self.assertTrue(wav.exists() and raw.exists())
+                orphan = store.audio_dir / "0123456789ab.wav"
+                orphan.write_bytes(b"orphan")
+                self._rewrite_row(store, row["id"], audio=audio)
+                reopened = HistoryStore(root)
+                self.assertIsNone(reopened.unreadable)
+                self.assertEqual([entry["id"] for entry in reopened.entries()], [row["id"]])
+                self.assertTrue(wav.exists(), "the row's recording survives the sweep")
+                self.assertTrue(raw.exists(), "the row's raw recording survives the sweep")
+                self.assertFalse(orphan.exists(), "a recording no row names is still swept")
+
+    def test_orphan_sweep_keeps_silver_evidence_when_a_spooled_row_names_none(self):
+        """F16c: a spooled row whose audio metadata is unusable could own any
+        file in the Silver spool, so none of them is provably orphaned."""
+        store = HistoryStore(self.root / "spooled")
+        evidence = store.silver_evidence_dir / f"{'a' * 64}.wav"
+        evidence.write_bytes(b"evidence")
+        row = {"schema_version": 2, "id": "spooled00001", "revision": 0, "correction": None,
+               "audio": None, "adaptive": True, "language": "en", "silver_spooled": True,
+               "silver_enqueue": {"history_revision": 0, "state": "queued"}}
+        store.index.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        HistoryStore(store.base_dir)
+        self.assertTrue(evidence.exists())
+
+    def test_a_failed_history_save_leaves_no_phantom_row(self):
+        """N29: append_live used to add the row in memory before saving, so a
+        failed save left a row in entries() that was never on disk."""
+        kept = self.live("kept")
+        with patch("history._atomic_jsonl", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.live("never saved")
+        self.assertEqual([entry["id"] for entry in self.history.entries()], [kept["id"]])
+
+    def test_a_damaged_learning_index_does_not_stop_the_app(self):
+        """N21: a damaged learning.jsonl or pending-gold.jsonl used to make
+        LearningStore() raise before the menu bar existed, at every login.
+        The app now opens it read-only (dictation works, nothing is saved or
+        swept, the user is told once); every other caller stays strict."""
+        import sotto
+        from history import HistoryUnreadable
+        for name in ("learning.jsonl", "pending-gold.jsonl"):
+            with self.subTest(name):
+                root = self.root / name
+                coordinator = LearningCoordinator(HistoryStore(root), LearningStore(root))
+                row = coordinator.append_live("kept words", np.array([-1.0, 0, 1.0], np.float32), .5, "model")
+                coordinator.correct(row["id"], "human words")
+                self.assertIsNotNone(coordinator.enroll(row["id"]))
+                damaged = root / "learning" / name
+                kept = damaged.read_text(encoding="utf-8") if damaged.exists() else ""
+                damaged.write_text(kept + '{"sample_id": "cut of\n', encoding="utf-8")
+                before = {path: path.read_bytes() for path in (root / "learning").rglob("*") if path.is_file()}
+                with self.assertRaisesRegex(RuntimeError, "malformed"):
+                    LearningStore(root)
+                learning = LearningStore(root, tolerate_unreadable=True)
+                self.assertIsNotNone(learning.unreadable)
+                with self.assertRaises(RuntimeError):
+                    learning.mark_pending_gold(row["id"], "code")
+                store = HistoryStore(root, tolerate_unreadable=True)
+                app = sotto.history_coordinator(store, learning)
+                self.assertIsInstance(app, sotto.UnsavedHistory)
+                delivered = app.append_live("please call me back", prepare_canonical(np.zeros(1600, np.float32)),
+                                            .1, "model", ts=5.0, provenance="live", adaptive=False)
+                self.assertEqual((delivered["text"], delivered["saved"]), ("please call me back", False))
+                with self.assertRaises(HistoryUnreadable):
+                    app.clear()
+                after = {path: path.read_bytes() for path in (root / "learning").rglob("*") if path.is_file()}
+                self.assertEqual(after, before, "the learning set is left exactly as it was")
+                title, message = sotto.unreadable_store_alert(store, learning)
+                self.assertEqual(title, sotto.LEARNING_UNREADABLE_TITLE)
+                self.assertIn(str(damaged), message)
+                self.assertIn("not saved to History", message)
+                self.assertEqual([entry["id"] for entry in HistoryStore(root).entries()], [row["id"]])
+
 if __name__ == "__main__":
     unittest.main()
