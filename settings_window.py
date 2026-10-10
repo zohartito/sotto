@@ -240,7 +240,8 @@ class SettingsController(AppKit.NSObject):
     def _apply(self, key, value):
         error = self.model.change(key, value)
         if error:
-            alert = AppKit.NSAlert.alloc().init()
+            import ui
+            alert = ui.new_alert()
             alert.setMessageText_("Could not change that setting")
             alert.setInformativeText_(str(error)[:200])
             alert.runModal()

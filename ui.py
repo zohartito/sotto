@@ -100,11 +100,27 @@ def live_snippet(text: str, limit: int = LIVE_CHARS) -> str:
     return "…" + tail
 
 
+_app_icon = {"image": None}  # Sotto.app's icon once use_app_icon found it
+
+
 def use_app_icon(icon_path) -> None:
-    """Sotto.app runs Python as a child, so dialogs would show Python's icon."""
+    """Sotto.app runs Python as a child, so dialogs would show Python's icon.
+
+    Side effects: sets the application icon and remembers it for new_alert();
+    AppKit can put Python's bundle icon back when the app finishes launching,
+    so every dialog also carries it itself."""
     image = AppKit.NSImage.alloc().initWithContentsOfFile_(str(icon_path)) if icon_path else None
     if image is not None:
+        _app_icon["image"] = image
         AppKit.NSApplication.sharedApplication().setApplicationIconImage_(image)
+
+
+def new_alert():
+    """An NSAlert showing Sotto's icon (when Sotto.app started this process)."""
+    alert = AppKit.NSAlert.alloc().init()
+    if _app_icon["image"] is not None:
+        alert.setIcon_(_app_icon["image"])
+    return alert
 
 
 class _PermissionWait(AppKit.NSObject):
@@ -138,7 +154,7 @@ def permission_dialog(title: str, message: str, url: str, *, granted=None, regis
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     use_app_icon(icon_path)
     app.activateIgnoringOtherApps_(True)
-    alert = AppKit.NSAlert.alloc().init()
+    alert = new_alert()
     alert.setMessageText_(title)
     alert.setInformativeText_(message)
     settings = alert.addButtonWithTitle_("Open System Settings")
@@ -571,7 +587,7 @@ class StatusUI:
     def correct_transcript(self, entry_id: str, current_text: str, revision: int | None = None,
                            adaptive_eligible: bool = False) -> None:
         """Present the native multi-line correction editor on the main thread."""
-        alert = AppKit.NSAlert.alloc().init()
+        alert = new_alert()
         alert.setMessageText_("Correct transcript")
         alert.setInformativeText_(correction_disclosure(self.adaptive_mode and adaptive_eligible))
         alert.addButtonWithTitle_("Save Correction")
@@ -599,7 +615,7 @@ class StatusUI:
 
     def offer_dictionary_rules(self, rules: list, saved_message: str) -> None:
         """After a correction, offer its substitutions as dictionary rules."""
-        alert = AppKit.NSAlert.alloc().init()
+        alert = new_alert()
         alert.setMessageText_("Correction saved. Always write these your way?")
         alert.setInformativeText_(
             saved_message + "\n\nChecked rules go into your dictionary and apply to every "
@@ -627,7 +643,7 @@ class StatusUI:
 
     def confirm_enrollment(self, entry_id: str) -> None:
         """Legacy manual enrollment control for existing callers."""
-        alert = AppKit.NSAlert.alloc().init()
+        alert = new_alert()
         alert.setMessageText_("Add corrected sample to learning set?")
         alert.setInformativeText_(
             "The corrected transcript and audio will be copied into Sotto's "
@@ -639,7 +655,7 @@ class StatusUI:
 
     def confirm_revocation(self, entry_id: str) -> None:
         """Confirm removal of the local copied learning audio."""
-        alert = AppKit.NSAlert.alloc().init()
+        alert = new_alert()
         alert.setMessageText_("Remove from learning set?")
         alert.setInformativeText_(
             "The local copied learning audio for this sample will be deleted.")
@@ -662,7 +678,7 @@ class StatusUI:
 
     def ask(self, title: str, message: str, yes: str, no: str) -> bool:
         """A two-button question on the main thread; True for the first button."""
-        alert = AppKit.NSAlert.alloc().init()
+        alert = new_alert()
         alert.setMessageText_(title)
         alert.setInformativeText_(message)
         alert.addButtonWithTitle_(yes)
@@ -672,7 +688,7 @@ class StatusUI:
 
     @staticmethod
     def _alert(style, title: str, message: str) -> None:
-        alert = AppKit.NSAlert.alloc().init()
+        alert = new_alert()
         alert.setAlertStyle_(style)
         alert.setMessageText_(title)
         alert.setInformativeText_(message)

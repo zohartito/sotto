@@ -107,5 +107,35 @@ class OverlayPlacementTests(unittest.TestCase):
         self.assertEqual(messages, ["! overlay recovery failed — panel still hidden"])
 
 
+class AlertIconTests(unittest.TestCase):
+    """Sotto.app runs Python as a child, and AppKit loads Python's bundle icon
+    when the app finishes launching, so dialogs showed Python's rocket even
+    after use_app_icon. Every dialog carries Sotto's icon itself."""
+
+    def test_every_dialog_is_built_with_sottos_icon(self):
+        import tempfile
+        from pathlib import Path
+        import ui
+        with tempfile.TemporaryDirectory() as folder:
+            icon = Path(folder) / "Sotto.png"
+            image = AppKit.NSImage.alloc().initWithSize_((16, 16))
+            image.lockFocus(); AppKit.NSColor.orangeColor().set()
+            AppKit.NSBezierPath.fillRect_(((0, 0), (16, 16))); image.unlockFocus()
+            rep = AppKit.NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation())
+            rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {}).writeToFile_atomically_(
+                str(icon), True)
+            ui.use_app_icon(icon)
+        alert = ui.new_alert()
+        self.assertIsNotNone(alert.icon())
+        self.assertEqual(tuple(alert.icon().size()), (16.0, 16.0))
+
+    def test_no_dialog_is_built_without_it(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        counts = {name: (root / name).read_text(encoding="utf-8").count("NSAlert.alloc().init()")
+                  for name in ("ui.py", "settings_window.py")}
+        self.assertEqual(counts, {"ui.py": 1, "settings_window.py": 0}, "only new_alert() builds an NSAlert")
+
+
 if __name__ == "__main__":
     unittest.main()
