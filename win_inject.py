@@ -675,6 +675,17 @@ def paste_settling() -> bool:
     return current is not None and current.settling()
 
 
+def foreground_identity() -> tuple[int, int] | None:
+    """(window handle, process id) of the foreground window — where a
+    keystroke lands — or None when there is none ("scratch that" checks it)."""
+    window = _user32.GetForegroundWindow()
+    if not window:
+        return None
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+    return (window, pid.value) if pid.value else None
+
+
 def copy_text(text: str) -> None:
     """Put ``text`` on the clipboard (History Copy, Retry); never uploaded to the cloud."""
     paster().clipboard.write([_text_item(text)], COPY_MARKERS)

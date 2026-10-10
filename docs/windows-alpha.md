@@ -166,8 +166,10 @@ Right-click the tray icon (left-click opens Settings):
 - **Speed** — Accurate or Fast; switching restarts Sotto once the current
   dictation is done.
 - **Progress** — see below. **Dictionary** — opens your dictionary in Notepad.
-- **Settings…**, **Restart** (finishes a dictation in flight first, however
-  long the model takes, and ignores new presses meanwhile), **Quit**.
+- **Settings…**, **Restart** (finishes a dictation in flight first and ignores
+  new presses meanwhile; it waits up to 15 minutes, enough for the longest
+  hands-free recording, 10 minutes, and its transcription on the CPU, then
+  restarts anyway and logs what it abandoned), **Quit**.
 - **Check for updates…** — compares this git copy with GitHub. **Update**
   waits for Sotto to quit, installs the new version's pinned packages (the CPU
   or CUDA set recorded at install) before it switches the source, and puts the
@@ -179,6 +181,14 @@ Right-click the tray icon (left-click opens Settings):
 Opening the tray menu takes the focus away from the app you were dictating
 into, so a dictation finished with **Finish dictation** is copied to the
 clipboard (a notification says so) instead of being inserted.
+
+Voice commands work as on the Mac (English dictation, Settings can turn them
+off): "new line", "new paragraph", and **"scratch that"** said on its own,
+which undoes your last dictation with the app's own Ctrl+Z. It only undoes
+Sotto's own insert: within a minute of it, while the same window is still in
+front, and only if you have not typed since; otherwise nothing happens and
+`sotto.log` says why. A "scratch that" finished from the tray undoes nothing
+(the menu has the focus), and a notification says so.
 
 ## Settings
 
@@ -422,8 +432,9 @@ History copies are separate.
 - **`✗ microphone`:** pick a default input in **Settings → System → Sound**
   and check the microphone privacy switch for desktop apps. Sotto records from
   the Windows default input through PortAudio's default host API (MME), which
-  converts to 16 kHz. `! mic open failed` in the log usually means another app
-  holds the device exclusively.
+  converts to 16 kHz. `! mic open failed` in the log (and a "Could not start
+  the microphone" notification; the press is cancelled) usually means another
+  app holds the device exclusively.
 - **`! cuda (float16) unavailable … falling back to CPU`:** expected on a
   CPU-only install. For the GPU, run the installer with `-Cuda` (or install
   `requirements-alpha-windows-cuda.txt`) and update the NVIDIA driver;

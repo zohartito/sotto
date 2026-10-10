@@ -1972,15 +1972,25 @@ class GestureEngine:
         self._drain()
         return True
 
-    def force_finish(self, finish=None) -> bool:
+    def epoch(self) -> int:
+        """The key-decision counter: it moves on every press, release and forced end."""
+        with self._lock:
+            return self._epoch
+
+    def force_finish(self, finish=None, if_epoch: int | None = None) -> bool:
         """Menu escape hatch: end any in-flight recording as a normal finish.
 
         `finish` replaces on_finish for this one decision. It may run after
         this returns (another thread is draining), so anything the caller
         wants that finish to know must travel inside it — never in state the
-        caller sets around this call."""
+        caller sets around this call. `if_epoch` ties the finish to the
+        gesture current at that epoch(): after any later key decision nothing
+        changes and False is returned, so a late failure of an older capture
+        can never end a newer gesture."""
         fires = []
         with self._lock:
+            if if_epoch is not None and self._epoch != if_epoch:
+                return False
             self._epoch += 1
             self._tap_pending = False
             was_recording = self._recording

@@ -228,5 +228,23 @@ class OrderedActionTests(EngineHarness):
         self.assertEqual(order, ["start", "finish"])
 
 
+# -- #19 review: a stale mic failure never ends a newer gesture -----------------
+
+class EpochBoundFinishTests(EngineHarness):
+    def test_a_finish_bound_to_an_older_epoch_leaves_the_gesture_alone(self):
+        self.arm_hands_free()
+        stale = self.engine.epoch()     # the capture whose open later fails began here
+        self.engine.pressed()           # a newer key decision before the failure lands
+        self.assertFalse(self.engine.force_finish(if_epoch=stale))
+        self.assertEqual(self.engine.snapshot()[0], True, "the newer gesture keeps recording")
+        self.assertEqual(self.events, ["start"])
+
+    def test_a_finish_bound_to_the_current_epoch_still_ends_it(self):
+        self.arm_hands_free()
+        self.assertTrue(self.engine.force_finish(if_epoch=self.engine.epoch()))
+        self.assertEqual(self.engine.snapshot(), (False, False))
+        self.assertEqual(self.events, ["start", "finish"])
+
+
 if __name__ == "__main__":
     unittest.main()
