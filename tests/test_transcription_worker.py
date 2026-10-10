@@ -9,6 +9,7 @@ reproduce them exactly.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import queue
 import re
@@ -127,6 +128,40 @@ def snapshot(samples, revision=3):
 
 # --- harness -----------------------------------------------------------------
 
+_FAKE_VAD = types.ModuleType("vad")
+_FAKE_VAD.analyze = lambda samples: (1.0, [])
+_FAKE_VAD.trim_to_speech = lambda samples, spans: samples
+_fake_vad_users = {"count": 0, "saved": None}
+_fake_vad_lock = threading.Lock()
+
+
+@contextmanager
+def advisory_vad_stand_in():
+    """Advisory VAD would load Silero; a neutral stand-in keeps the tests fast.
+
+    Shared and counted, and only sys.modules["vad"] is touched: run_jobs can
+    run on a thread that outlives its test, and with patch.dict an overlapping
+    run snapshotted sys.modules with the other's stand-in in it and put that
+    back on leaving (test_vad_gate then imported a "vad" without install).
+    """
+    with _fake_vad_lock:
+        if _fake_vad_users["count"] == 0:
+            _fake_vad_users["saved"] = sys.modules.get("vad")
+            sys.modules["vad"] = _FAKE_VAD
+        _fake_vad_users["count"] += 1
+    try:
+        yield _FAKE_VAD
+    finally:
+        with _fake_vad_lock:
+            _fake_vad_users["count"] -= 1
+            if _fake_vad_users["count"] == 0:
+                saved, _fake_vad_users["saved"] = _fake_vad_users["saved"], None
+                if saved is None:
+                    sys.modules.pop("vad", None)
+                else:
+                    sys.modules["vad"] = saved
+
+
 class Harness:
     """Build the worker with fakes and run jobs through it."""
 
@@ -197,11 +232,7 @@ class Harness:
         return ("retry", entry_id, time.monotonic(), "cap0002", self.config)
 
     def run_jobs(self, *jobs, timeout=20.0):
-        # Advisory VAD would load Silero; a neutral stand-in keeps the test fast.
-        fake_vad = types.ModuleType("vad")
-        fake_vad.analyze = lambda samples: (1.0, [])
-        fake_vad.trim_to_speech = lambda samples, spans: samples
-        with patch.dict(sys.modules, {"vad": fake_vad}):
+        with advisory_vad_stand_in():
             thread = threading.Thread(target=self.run, daemon=True)
             thread.start()
             for job in jobs:
@@ -793,6 +824,26 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         h = holder["harness"] = Harness(says("Please call me back at four"), append=disk_full_after_shutdown)
         h.run_jobs(h.live_job(speech(2.0)))
         self.assertEqual((h.injected, h.status_ui.errors), ([], []))
+
+
+class AdvisoryVadStandInTests(unittest.TestCase):
+    def test_overlapping_stand_ins_leave_the_real_module_in_place(self):
+        # A run_jobs on a thread can outlive its test, so two stand-ins can
+        # overlap: B entered while A is in, A left first. B used to snapshot
+        # sys.modules with A's stand-in in it and put it back on leaving, and
+        # test_vad_gate then imported a "vad" without install (GitHub's
+        # Windows runner, PR21).
+        import vad
+        real = sys.modules["vad"]
+        first, second = advisory_vad_stand_in(), advisory_vad_stand_in()
+        first.__enter__()
+        second.__enter__()
+        self.assertIsNot(sys.modules["vad"], real)
+        first.__exit__(None, None, None)
+        self.assertIsNot(sys.modules["vad"], real, "the later stand-in is still in use")
+        second.__exit__(None, None, None)
+        self.assertIs(sys.modules["vad"], real)
+        self.assertIs(vad.install, real.install)
 
 
 if __name__ == "__main__":
