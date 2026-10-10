@@ -21,6 +21,8 @@ INSERT_MODES = ("paste", "type")
 SPACING_MODES = ("smart", "trailing", "none")
 SPEEDS = ("accurate", "fast")
 MAX_LANGUAGES = 12
+UNREADABLE_SAVE = ("settings.json could not be read, so nothing was changed and the file was "
+                   "left as it is; fix or remove it, then try again")
 DEFAULTS = {
     # macOS keeps the documented right-Option default; Windows the right Ctrl
     # the Windows alpha has always used.
@@ -73,15 +75,19 @@ def _report_once(problem: str, message: str) -> None:
 def load(path: Path | str = SETTINGS_PATH) -> dict:
     """Defaults overlaid with every valid saved value; bad values are ignored
     and reported once in the log."""
-    settings = {key: (list(value) if isinstance(value, list) else value) for key, value in DEFAULTS.items()}
     try:
         saved = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return settings
+        saved = {}
     except (OSError, ValueError) as exc:
         _report_once("unreadable", f"! settings.json could not be read ({type(exc).__name__}); "
                                    "using the defaults")
-        return settings
+        saved = {}
+    return _overlay(saved)
+
+
+def _overlay(saved) -> dict:
+    settings = {key: (list(value) if isinstance(value, list) else value) for key, value in DEFAULTS.items()}
     if isinstance(saved, dict):
         for key in DEFAULTS:
             if key in saved:
@@ -94,11 +100,24 @@ def load(path: Path | str = SETTINGS_PATH) -> dict:
 
 
 def save(updates: dict, path: Path | str = SETTINGS_PATH) -> dict:
-    """Validate and persist changes atomically (owner-only); returns the result."""
+    """Validate and persist changes atomically (owner-only); returns the result.
+    A file that exists but cannot be read or parsed raises ValueError and is
+    left exactly as it is."""
     unknown = sorted(set(updates) - set(DEFAULTS))
     if unknown:
         raise ValueError(f"Unknown setting: {unknown[0]}")
-    settings = load(path)
+    # load() falls back to the defaults on a file it cannot read, which is
+    # right for a launch but would turn this one change into a reset of every
+    # other setting (N23): only a missing file starts from the defaults.
+    try:
+        saved = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        saved = {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{UNREADABLE_SAVE} ({type(exc).__name__})") from exc
+    if not isinstance(saved, dict):
+        raise ValueError(UNREADABLE_SAVE)
+    settings = _overlay(saved)
     for key, value in updates.items():
         checked = _valid(key, value)
         if checked is None:

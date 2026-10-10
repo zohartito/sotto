@@ -37,6 +37,11 @@ import win_inject
 VK_SHIFT, VK_CONTROL, VK_MENU = 0x10, 0x11, 0x12  # either side of each pair
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 MODIFIER_VKS = (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN)
+# Modifier keys alone type nothing, so they never count as the user typing
+# (the Mac counts key-downs, and its modifiers arrive as flag changes).
+MODIFIER_KEYS = frozenset((kb.Key.shift, kb.Key.shift_l, kb.Key.shift_r, kb.Key.ctrl,
+                           kb.Key.ctrl_l, kb.Key.ctrl_r, kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r,
+                           kb.Key.alt_gr, kb.Key.cmd, kb.Key.cmd_l, kb.Key.cmd_r))
 
 # settings name -> (pynput key, virtual key for GetAsyncKeyState, menu label)
 TRIGGERS: dict[str, tuple[object, int, str]] = {
@@ -78,6 +83,10 @@ class TriggerHook:
         self._engine = engine
         self._mask_menu = mask_menu
         self._down = False
+        # The user's own key-downs so far (Sotto's injected keys never reach
+        # the callbacks): typing after an insert means "scratch that" must
+        # not undo it.  Read from other threads; only the hook thread writes.
+        self.keydowns = 0
         self._listener: kb.Listener | None = None
         self._lock = threading.Lock()
         self._set(trigger)
@@ -120,6 +129,8 @@ class TriggerHook:
 
     def _on_press(self, key, _injected=False) -> None:
         if key != self._key:
+            if key not in MODIFIER_KEYS:
+                self.keydowns += 1  # one integer bump: nothing slow on the hook thread
             # Any other key during a trigger hold (Ctrl-C, Alt-Tab, the other
             # Ctrl) makes it a shortcut, not dictation — same rule as the Mac.
             if self._down:

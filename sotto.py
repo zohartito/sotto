@@ -68,14 +68,33 @@ HANDS_FREE_MAX_S = 600.0        # watchdog: force-finish a forgotten open mic
 # still runs only if changeCount is unchanged (a user ⌘C in the window wins),
 # and overlapping pastes carry the original forward (see inject()).
 RESTORE_DELAY_S = 3.0
+# nspasteboard.org marker on Sotto's own paste write: clipboard managers skip
+# it, so dictations do not pile up in their history (the restore is untouched).
+TRANSIENT_PASTEBOARD_TYPE = "org.nspasteboard.TransientType"
 DELIVERY_POLL_S = 0.15           # re-check a held key this often before pasting
 DELIVERY_WAIT_MAX_S = 30.0       # key held, no recording: give up, the text stays in History
+# The drop note for a dictation History could not keep (F16a/F16b, N16).
+NOT_IN_HISTORY_EITHER = "History could not save it either; please dictate again."
 SOTTO_EVENT_TAG = 0x534F5454     # "SOTT" in kCGEventSourceUserData on every key event Sotto posts
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 HISTORY_KEEP = 200   # every stored transcript is listed; the menu scrolls
 APP_DRAIN_TIMEOUT = 1.0
 RESTART_DRAIN_DEADLINE_S = 20.0  # a wedged native call must not block recovery forever
 QUIT_DRAIN_S = 10.0              # Quit finishes the dictation in progress, up to this long
+# launchd SIGKILLs Sotto's job 5 s after SIGTERM (`launchctl print` shows
+# "exit timeout = 5"; logout, kickstart -k and rollout all send SIGTERM). The
+# drain and the teardown's waits (clipboard restore, a finish short of the
+# queue, an append under way, the worker join) share one deadline that leaves
+# SIGTERM_KEEP_RESERVE_S to keep what is left in History before that.
+LAUNCHD_EXIT_TIMEOUT_S = 5.0
+SIGTERM_KEEP_RESERVE_S = 1.5
+SIGTERM_DRAIN_S = 2.0
+SIGTERM_RESTORE_WAIT_S = 1.0
+DRAIN_POLL_S = 0.1               # how often a Quit/Restart drain re-checks the dictation
+# A foreground restart that cannot exec exits with this status, never 0:
+# KeepAlive {SuccessfulExit: false} (the login item, the sealed LaunchAgent)
+# then starts Sotto again instead of leaving the user without it.
+RESTART_FAILED_EXIT = 75         # EX_TEMPFAIL
 # An installed update restarts once dictation is done: the longest recording
 # (the hands-free watchdog) plus time to transcribe and paste it, then anyway.
 UPDATE_DRAIN_DEADLINE_S = HANDS_FREE_MAX_S + 120.0
@@ -94,6 +113,11 @@ class ShutdownBoundary:
 
     def __init__(self) -> None:
         self.event = threading.Event()
+        # Set by the first SIGINT/SIGTERM: Lifecycle.watch_signals then stops
+        # the way Quit does, finishing the dictation in flight (F1c).
+        self.stop_event = threading.Event()
+        self.stop_signal = None
+        self.stop_at = None  # time.monotonic() of that first signal
 
     def requested(self) -> bool:
         return self.event.is_set()
@@ -101,27 +125,57 @@ class ShutdownBoundary:
     def request(self, *_unused) -> None:
         self.event.set()
 
-    def enqueue(self, jobs: queue.Queue, job: tuple) -> bool:
-        """Queue work only while live; race with shutdown is discarded below."""
+    def request_stop(self, signum=None, _frame=None) -> None:
+        """SIGINT/SIGTERM handler, event-only: the first one asks for Quit's
+        drained stop; another one while that drains stops at once."""
+        if self.stop_event.is_set():
+            self.event.set()
+            return
+        self.stop_signal = signum
+        self.stop_at = time.monotonic()
+        self.stop_event.set()
+
+    def teardown_wait_s(self, cap_s: float, now: float) -> float:
+        """How long a teardown wait capped at ``cap_s`` may take. After
+        SIGTERM every such wait shares one deadline that still leaves
+        SIGTERM_KEEP_RESERVE_S before launchd's SIGKILL, so untranscribed
+        captures reach History (N9); otherwise just ``cap_s``."""
+        if self.stop_signal != signal.SIGTERM or self.stop_at is None:
+            return cap_s
+        keep_by = self.stop_at + LAUNCHD_EXIT_TIMEOUT_S - SIGTERM_KEEP_RESERVE_S
+        return max(0.0, min(cap_s, keep_by - now))
+
+    def enqueue(self, jobs: queue.Queue, job: tuple, keep=None) -> bool:
+        """Queue work only while live; race with shutdown is discarded below.
+        ``keep`` is handed a live capture that is refused or discarded, as in
+        discard_queued, so its audio can stay in History (N9)."""
         if self.requested():
+            if keep is not None and job[0] == "live":
+                keep(job)
             return False
         jobs.put(job)
         if self.requested():
-            self.discard_queued(jobs)
+            self.discard_queued(jobs, keep=keep)
             return False
         return True
 
     @staticmethod
-    def discard_queued(jobs: queue.Queue) -> int:
-        """Drain queued work with matching task accounting, never executing it."""
+    def discard_queued(jobs: queue.Queue, keep=None) -> int:
+        """Drain queued work with matching task accounting, never executing it.
+        ``keep`` is handed each queued live capture first, so its audio can
+        stay in History (N9)."""
         discarded = 0
         while True:
             try:
-                jobs.get_nowait()
+                job = jobs.get_nowait()
             except queue.Empty:
                 return discarded
             else:
-                jobs.task_done()
+                try:
+                    if keep is not None and job[0] == "live":
+                        keep(job)
+                finally:
+                    jobs.task_done()
                 discarded += 1
 
     def stop_capture(self, capture) -> None:
@@ -139,12 +193,13 @@ class ShutdownBoundary:
 
 @contextmanager
 def shutdown_signal_handlers(boundary: ShutdownBoundary):
-    """Install event-only SIGTERM/SIGINT handlers and restore embedded callers."""
+    """Install event-only SIGTERM/SIGINT handlers and restore embedded callers.
+    The first signal asks for a drained stop (see ShutdownBoundary.request_stop)."""
     previous: dict[int, object] = {}
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.getsignal(sig)
-            signal.signal(sig, boundary.request)
+            signal.signal(sig, boundary.request_stop)
     try:
         yield boundary
     finally:
@@ -192,6 +247,9 @@ from sotto_paths import MODEL_CACHE_DIR
 SOTTO_HF_HOME = MODEL_CACHE_DIR
 os.environ["HF_HOME"] = str(SOTTO_HF_HOME)
 os.environ["HF_HUB_CACHE"] = str(SOTTO_HF_HOME / "hub")
+# No telemetry (README): the Hub client otherwise adds the torch version and
+# the calling agent to the user agent of every model download.
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 # trigger name -> (modifier flag mask, virtual keycode, per-side device bit).
 # The NX_DEVICE*KEYMASK bits identify WHICH side of a paired modifier is down —
@@ -273,8 +331,13 @@ def parse_hotkey(spec: str) -> tuple[int, int] | None:
 
 
 def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
-    keep_app_log_small()
+    """Never raises: the transcription worker logs from inside its own error
+    handler, so a full disk or a rotation race must not end the thread (N35)."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+        keep_app_log_small()
+    except (OSError, ValueError):
+        pass
 
 
 LAUNCHD_LABEL = "com.zohartito.sotto.app"  # must match launchd/ and scripts/rollout.sh
@@ -286,6 +349,7 @@ def app_mode() -> bool:
 
 
 _app_log: dict = {"path": None, "max_bytes": 0}  # set once logs are routed to a file
+_app_log_lock = threading.Lock()  # every thread logs; one of them rotates at a time
 
 
 def route_app_logs(data_dir: Path, max_bytes: int = 2_000_000) -> Path:
@@ -320,8 +384,11 @@ def keep_app_log_small() -> None:
     """Rotate a routed log that grew past its limit while Sotto runs; the old
     file keeps the open descriptors, so point output at a fresh one."""
     path = _app_log["path"]
-    if path is not None and _rotate_if_large(path, _app_log["max_bytes"]):
-        _point_output_at(path)
+    if path is None:
+        return
+    with _app_log_lock:
+        if _rotate_if_large(path, _app_log["max_bytes"]):
+            _point_output_at(path)
 
 
 def sotto_icon_path() -> Path | None:
@@ -599,10 +666,12 @@ def wait_until_idle(busy, *, poll_s: float = 0.5, sleep=time.sleep,
     return True
 
 
-def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries) -> bool:
+def dictation_in_flight(capture, jobs, deliveries: PendingDeliveries, *, warming: bool = False) -> bool:
     """Whether a dictation is still recording, transcribing, or waiting to be
-    pasted — the three stages Quit lets finish before shutting down."""
-    return capture.is_active() or jobs.unfinished_tasks > 0 or deliveries.count() > 0
+    pasted — the three stages Quit lets finish before shutting down.
+    ``warming``: the one queued or running model rewarm is not a dictation (N40)."""
+    return (capture.is_active() or jobs.unfinished_tasks > int(warming)
+            or deliveries.count() > 0)
 
 
 def end_capture_now(engine, capture, on_finish) -> str | None:
@@ -693,6 +762,133 @@ class CaptureGate:
     def reopen(self) -> None:
         with self._lock:
             self._open = True
+
+
+class Lifecycle:
+    """Who holds the capture gate closed, and the drained stop.
+
+    Quit, the menu Restart, an installed update and an engine switch close
+    the gate for a reason; ``closed`` names it ("quitting", "restarting",
+    "updating", "switching engines") and is None while Sotto runs normally.
+    A reason reopens the gate only while it still holds it; Quit takes over
+    from any other reason.
+
+    Quit, the menu Restart and the first SIGINT/SIGTERM stop the same way
+    (F1c, N12): refuse new recordings, end the one in progress as a normal
+    finish, wait until it is transcribed and pasted — at most QUIT_DRAIN_S,
+    SIGTERM_DRAIN_S for SIGTERM — then shut down or restart. What is still
+    untranscribed past that wait is kept in History at teardown (N9).
+    """
+
+    def __init__(self, shutdown: ShutdownBoundary, capture_gate: CaptureGate, *,
+                 end_recording, busy, clock=time.monotonic, sleep=time.sleep) -> None:
+        self.shutdown = shutdown
+        self.capture_gate = capture_gate
+        self.end_recording = end_recording  # -> "gesture" | "orphan" | None (end_capture_now)
+        self.busy = busy                    # -> whether a dictation is in flight
+        self.clock, self.sleep = clock, sleep
+        self.closed: str | None = None
+        self._quit_by = 0.0
+        self._lock = threading.Lock()
+
+    def close(self, reason: str) -> bool:
+        """Refuse new recordings for ``reason``. False (and nothing changes)
+        when Sotto is stopping or the gate is already closed for a reason."""
+        with self._lock:
+            if self.shutdown.requested() or self.closed is not None:
+                return False
+            self.closed = reason
+            self.capture_gate.close()
+            return True
+
+    def reopen(self, reason: str) -> None:
+        """Undo close(reason), unless another reason (a Quit) has taken over."""
+        with self._lock:
+            if self.closed == reason and not self.shutdown.requested():
+                self.closed = None
+                self.capture_gate.reopen()
+
+    def run_if_open(self, action) -> str | None:
+        """Run ``action`` unless the gate is closed; returns why it was refused.
+        Checked and run under the lock, so a drain that closes the gate
+        afterwards sees whatever ``action`` queued as in flight."""
+        with self._lock:
+            if self.shutdown.requested():
+                return "stopping"
+            if self.closed is not None:
+                return self.closed
+            action()
+            return None
+
+    def quit(self, deadline_s: float = QUIT_DRAIN_S) -> bool:
+        """Stop once the dictation in flight is done, waiting at most
+        ``deadline_s``. Returns at once; False when already quitting.
+
+        Side effects: closes the gate as "quitting"; ends the recording in
+        progress; requests shutdown from a thread once idle or out of time."""
+        with self._lock:
+            if self.shutdown.requested():
+                return False
+            stop_by = self.clock() + deadline_s
+            if self.closed == "quitting":
+                # Already draining: a SIGTERM after the menu's Quit must still
+                # stop inside launchd's window, so the sooner deadline wins.
+                self._quit_by = min(self._quit_by, stop_by)
+                return False
+            self.closed = "quitting"
+            self._quit_by = stop_by
+            self.capture_gate.close()
+        self._finish_recording("quitting")
+        self._drain_then("quitting", lambda: self._quit_by, self.shutdown.request)
+        return True
+
+    def restart(self, request_restart) -> bool:
+        """The menu Restart: drain like Quit, then call
+        ``request_restart(after_failure=...)``, which reopens the gate if the
+        restart does not happen. False when the gate is already closed."""
+        if not self.close("restarting"):
+            return False
+        self._finish_recording("restarting")
+
+        def restart_unless_quitting() -> None:
+            if self.closed == "restarting":
+                request_restart(after_failure=lambda: self.reopen("restarting"))
+        stop_by = self.clock() + QUIT_DRAIN_S
+        self._drain_then("restarting", lambda: stop_by, restart_unless_quitting)
+        return True
+
+    def watch_signals(self) -> None:
+        """Thread target: the first SIGINT/SIGTERM quits as the menu's Quit
+        does (the handler itself only sets an event)."""
+        self.shutdown.stop_event.wait()
+        self.quit(SIGTERM_DRAIN_S if self.shutdown.stop_signal == signal.SIGTERM else QUIT_DRAIN_S)
+
+    def _finish_recording(self, verb: str) -> None:
+        try:
+            ended = self.end_recording()
+        except Exception as exc:
+            ended = None
+            log(f"! could not finish the recording before {verb}: {str(exc)[:160]}")
+        if ended:
+            log(f"● finishing the {'orphan capture' if ended == 'orphan' else 'recording'} before {verb}")
+
+    def _drain_then(self, verb: str, stop_by, then) -> None:
+        """From a thread: wait while busy, until the clock reaches ``stop_by()``
+        (re-read every poll), then call ``then``."""
+        def work() -> None:
+            started = self.clock()
+            try:
+                while self.busy() and not self.shutdown.requested():
+                    if self.clock() >= stop_by():
+                        log(f"! dictation still running after {self.clock() - started:.0f}s — "
+                            f"{verb} anyway; its audio stays in History")
+                        break
+                    self.sleep(DRAIN_POLL_S)
+            except Exception as exc:
+                log(f"! {verb} without waiting: {str(exc)[:160]}")
+            finally:
+                then()
+        threading.Thread(target=work, daemon=True, name=f"sotto-{verb}").start()
 
 
 def choose_language(probabilities: dict, allowed) -> str:
@@ -1955,15 +2151,25 @@ class GestureEngine:
         self._drain()
         return True
 
-    def force_finish(self, finish=None) -> bool:
+    def epoch(self) -> int:
+        """The key-decision counter: it moves on every press, release and forced end."""
+        with self._lock:
+            return self._epoch
+
+    def force_finish(self, finish=None, if_epoch: int | None = None) -> bool:
         """Menu escape hatch: end any in-flight recording as a normal finish.
 
         `finish` replaces on_finish for this one decision. It may run after
         this returns (another thread is draining), so anything the caller
         wants that finish to know must travel inside it — never in state the
-        caller sets around this call."""
+        caller sets around this call. `if_epoch` ties the finish to the
+        gesture current at that epoch(): after any later key decision nothing
+        changes and False is returned, so a late failure of an older capture
+        can never end a newer gesture."""
         fires = []
         with self._lock:
+            if if_epoch is not None and self._epoch != if_epoch:
+                return False
             self._epoch += 1
             self._tap_pending = False
             was_recording = self._recording
@@ -2047,7 +2253,7 @@ class GestureEngine:
 # -- clipboard injection (main thread only) ---------------------------------
 
 _restore_generation = 0
-_pending_restore: dict | None = None  # {"own_count", "snapshot"} of the restore not yet run
+_pending_restore: dict | None = None  # {"own_count", "snapshot", "due"} of the restore not yet run
 
 
 _NO_SPACE_AFTER = "([{\"'“‘/-\n\t"
@@ -2165,6 +2371,25 @@ def frontmost_pid() -> int | None:
         return None
 
 
+def own_window_without_text_field() -> bool:
+    """Is Sotto itself the active app with no text field to take a paste?
+
+    Sotto's alerts activate it (ui._alert), and callAfter still runs during
+    their modal loop, so a Cmd-V would land on an OK-only alert and vanish
+    (N24). The correction editor's text view still takes dictation. Main
+    thread only; an unavailable probe reports False rather than blocking."""
+    try:
+        import AppKit
+        app = AppKit.NSApp
+        if app is None or not app.isActive():
+            return False
+        window = app.keyWindow()
+        responder = window.firstResponder() if window is not None else None
+        return responder is None or not responder.isKindOfClass_(AppKit.NSText)
+    except Exception:
+        return False
+
+
 def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") -> bool:
     """Insert at the cursor. "paste": full-pasteboard snapshot, synthetic
     cmd-V, then a changeCount-guarded restore so a user copy in the window
@@ -2174,7 +2399,7 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
     declined it — only a real insert may arm "scratch that"."""
     global _restore_generation, _pending_restore
     if secure_input_active():
-        log("! secure input active — not inserting; transcript kept in history")
+        log("! secure input active — not inserting")
         return False
 
     text = compose_insertion(text, spacing, character_before_caret() if spacing == "smart" else None)
@@ -2195,12 +2420,14 @@ def inject(text: str, *, insert_mode: str = "paste", spacing: str = "trailing") 
             snapshot.append([(t, item.dataForType_(t)) for t in item.types()])
     pasteboard.clearContents()
     pasteboard.setString_forType_(text, NSPasteboardTypeString)
+    pasteboard.setData_forType_(b"", TRANSIENT_PASTEBOARD_TYPE)
     own_count = pasteboard.changeCount()
     post_command_key(9)  # ⌘V
 
     _restore_generation += 1
     generation = _restore_generation
-    _pending_restore = {"own_count": own_count, "snapshot": snapshot}
+    _pending_restore = {"own_count": own_count, "snapshot": snapshot,
+                        "due": time.monotonic() + RESTORE_DELAY_S}
 
     def queue_restore() -> None:
         from PyObjCTools import AppHelper
@@ -2234,6 +2461,34 @@ def _restore_clipboard(generation: int, own_count: int, snapshot: list) -> None:
         pasteboard.writeObjects_(items)
 
 
+def flush_clipboard_restore(max_wait_s: float = RESTORE_DELAY_S, *, clock=time.monotonic,
+                            sleep=time.sleep) -> None:
+    """Run a clipboard restore that is still pending, before the process ends
+    (N6): its timer would otherwise die with it, leaving the dictation on the
+    clipboard and the user's own copy lost. Waits until the restore is due,
+    at most ``max_wait_s``, so the app can still read the paste; the restore
+    keeps its changeCount guard, so a user copy since the paste still wins.
+
+    Side effects: may sleep; may rewrite the general pasteboard. Main thread
+    only, like _restore_clipboard."""
+    pending = _pending_restore
+    if pending is None:
+        return
+    wait_s = min(max(pending["due"] - clock(), 0.0), max_wait_s)
+    if wait_s > 0:
+        sleep(wait_s)
+    _restore_clipboard(_restore_generation, pending["own_count"], pending["snapshot"])
+
+
+def set_clipboard_text(text: str) -> None:
+    """Replace the general clipboard with ``text`` (main thread only).
+
+    Side effects: rewrites the general pasteboard."""
+    pasteboard = NSPasteboard.generalPasteboard()
+    pasteboard.clearContents()
+    pasteboard.setString_forType_(text, NSPasteboardTypeString)
+
+
 class DeliveryQueue:
     """One FIFO for everything Sotto hands to the frontmost app — finished
     dictations and "scratch that" undos — in capture order, so a newer result
@@ -2245,7 +2500,9 @@ class DeliveryQueue:
     chop the live dictation. The head of the queue waits as long as a
     recording is active (the release delivers it); with no recording, a key
     held longer than DELIVERY_WAIT_MAX_S drops the pending text — it is already
-    in History — with one note.
+    in History — with one note. While Sotto's own alert is in front
+    (own_window_front), the head waits without a bound: a Cmd-V there would
+    land nowhere, and the user's next app switch or click on OK delivers it.
 
     Every method runs on the main thread (deliver_call / AppHelper.callAfter);
     the poll timer only bounces back there, so there is no lock.
@@ -2258,7 +2515,8 @@ class DeliveryQueue:
 
     def __init__(self, *, insert, undo_keys, keys_held, recording, frontmost_pid, keydowns,
                  secure_input, call_after, note, log=log, shutdown_requested=lambda: False,
-                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None) -> None:
+                 clock=time.monotonic, timer=threading.Timer, on_done=lambda: None,
+                 own_window_front=lambda: False, copy=lambda text: None) -> None:
         self._insert = insert            # (text) -> bool: did the text reach the app?
         self._undo_keys = undo_keys      # () -> None: press the app's own ⌘Z
         self._keys_held = keys_held      # () -> bool: trigger or modifier physically down
@@ -2273,14 +2531,18 @@ class DeliveryQueue:
         self._clock = clock
         self._timer = timer
         self._on_done = on_done          # () -> None: one item left the queue
+        self._own_window_front = own_window_front  # () -> bool: Sotto's alert would get the Cmd-V
+        self._copy = copy                # (text) -> None: put text on the general clipboard
         self._items: list[tuple] = []
         self._poll_armed = False
         self._waiting = False
         self._blocked_since: float | None = None
         self.last_delivery: dict | None = None  # the insert "scratch that" may undo
 
-    def paste(self, text: str) -> None:
-        self._items.append(("paste", text))
+    def paste(self, text: str, in_history: bool = True) -> None:
+        """in_history is False when History could not keep this dictation
+        (F16a/F16b): then no note may send the user to History for it."""
+        self._items.append(("paste", text, in_history))
         self._pump()
 
     def undo(self) -> None:
@@ -2295,19 +2557,23 @@ class DeliveryQueue:
             if self._keys_held():
                 self._wait_or_drop()
                 return
+            if self._own_window_front():
+                self._wait_for_own_window()
+                return
             self._blocked_since = None
             self._waiting = False
             item = self._items.pop(0)
             try:
                 if item[0] == "paste":
-                    self._deliver(item[1])
+                    self._deliver(item[1], item[2])
                 else:
                     self._undo()
             except Exception as exc:  # one failed insert must not strand the items behind it
                 self._log(f"! {item[0]} failed ({type(exc).__name__}: {str(exc)[:160]})")
                 if item[0] == "paste":
                     self._note("Could not paste the dictation",
-                               "It is in History. Open History to copy the text.")
+                               "It is in History. Open History to copy the text." if item[2]
+                               else NOT_IN_HISTORY_EITHER)
             finally:
                 self._on_done()
 
@@ -2325,17 +2591,49 @@ class DeliveryQueue:
             self._blocked_since = now
         elif now - self._blocked_since > DELIVERY_WAIT_MAX_S:
             dropped = sum(1 for item in self._items if item[0] == "paste")
+            unsaved = [item[1] for item in self._items if item[0] == "paste" and not item[2]]
             self._discard_all()
             self._blocked_since = None
             self._waiting = False
-            self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — "
-                      f"{dropped} dictation(s) not pasted, kept in History")
-            self._note("Dictation kept in History",
-                       "A key was held for too long to paste it. Open History to copy the text.")
+            self._log(f"! a key stayed held for {DELIVERY_WAIT_MAX_S:.0f}s — {dropped} dictation(s) "
+                      f"not pasted, " + (f"{len(unsaved)} not in History" if unsaved else "kept in History"))
+            if unsaved and self._copy_unsaved(unsaved):
+                self._note("Dictation copied to the clipboard",
+                           "A key was held for too long to paste it, and History could not save it, "
+                           "so the text is on the clipboard.")
+            elif unsaved:
+                self._note("Dictation not pasted",
+                           f"A key was held for too long to paste it. {NOT_IN_HISTORY_EITHER}")
+            else:
+                self._note("Dictation kept in History",
+                           "A key was held for too long to paste it. Open History to copy the text.")
             return
         if not self._waiting:
             self._waiting = True
             self._log("  paste deferred — a key is still held")
+        self._arm_poll()
+
+    def _copy_unsaved(self, texts: list[str]) -> bool:
+        """Put dropped text History could not save on the clipboard: it is the
+        only copy (owner decision 2026-10-09). Returns whether it got there.
+
+        Side effects: replaces the general clipboard; logs a failure."""
+        try:
+            self._copy("\n\n".join(texts))
+            return True
+        except Exception as exc:
+            self._log(f"! could not copy the dropped dictation ({type(exc).__name__})")
+            return False
+
+    def _wait_for_own_window(self) -> None:
+        """Hold the queue while Sotto's own window is in front (N24); no drop."""
+        self._blocked_since = None
+        if not self._waiting:
+            self._waiting = True
+            self._log("  paste deferred — Sotto's own window is in front")
+        self._arm_poll()
+
+    def _arm_poll(self) -> None:
         if not self._poll_armed:
             self._poll_armed = True
             timer = self._timer(DELIVERY_POLL_S, self._call_after, (self._resume,))
@@ -2346,10 +2644,14 @@ class DeliveryQueue:
         self._poll_armed = False
         self._pump()
 
-    def _deliver(self, text: str) -> None:
+    def _deliver(self, text: str, in_history: bool = True) -> None:
         pid, keydowns = self._frontmost_pid(), self._keydowns()  # the paste target, before ⌘V
         if self._insert(text):  # a secure-input decline inserted nothing: arm no undo
             self.last_delivery = {"at": self._clock(), "pid": pid, "keydowns": keydowns}
+        else:  # N34: every other drop path tells the user, so this one does too
+            self._note("Dictation not pasted",
+                       "Secure input is on (a password field may have focus), so Sotto did not "
+                       "paste. " + ("Open History to copy the text." if in_history else NOT_IN_HISTORY_EITHER))
 
     def _undo(self) -> None:
         """'scratch that': the app's own ⌘Z, only for Sotto's own recent insert —
@@ -2439,10 +2741,12 @@ def nonadaptive_revoke_learning(dependency_guard, coordinator, entry_id: str):
 
 
 HISTORY_UNREADABLE_TITLE = "History could not be read"
+LEARNING_UNREADABLE_TITLE = "Learning set could not be read"
 
 
 class UnsavedHistory:
-    """Stands in for LearningCoordinator while history.jsonl cannot be read (F16b).
+    """Stands in for LearningCoordinator while history.jsonl (F16b), or the
+    learning set's learning.jsonl or pending-gold.jsonl (N21), cannot be read.
 
     Dictation keeps working: ``append_live`` hands back an in-memory row so the
     text is still delivered, but nothing (row, audio, learning state) is
@@ -2461,19 +2765,23 @@ class UnsavedHistory:
 
     def __getattr__(self, name: str):
         from history import HistoryUnreadable
-        raise HistoryUnreadable(f"History is unreadable and was left unchanged ({self.history.unreadable})")
+        if self.history.unreadable is not None:
+            raise HistoryUnreadable(f"History is unreadable and was left unchanged ({self.history.unreadable})")
+        raise HistoryUnreadable("History is not changed while the learning set is unreadable "
+                                f"({self.learning.unreadable})")
 
 
 def history_coordinator(store, learning_store):
     """The dictation session's coordinator for ``store``.
 
     A store opened with ``tolerate_unreadable=True`` over an unreadable
-    history.jsonl (F16b) gets an UnsavedHistory instead of a
+    history.jsonl (F16b), or a learning store opened the same way over an
+    unreadable learning set (N21), gets an UnsavedHistory instead of a
     LearningCoordinator, whose startup re-read would raise before the menu
     bar exists; the caller tells the user once with
-    ``history_unreadable_message``. Side effects: a LearningCoordinator
+    ``unreadable_store_alert``. Side effects: a LearningCoordinator
     validates the active learning links against History."""
-    if store.unreadable is not None:
+    if store.unreadable is not None or learning_store.unreadable is not None:
         return UnsavedHistory(store, learning_store)
     from learning import LearningCoordinator
     return LearningCoordinator(store, learning_store)
@@ -2488,6 +2796,25 @@ def history_unreadable_message(store) -> str:
     return (f"Sotto cannot read {store.index} because {cause}. The file and its recordings "
             "were left exactly as they are. Dictation still works, but new dictations are "
             f"not saved to History until the file can be read again: {remedy}, then restart Sotto.")
+
+
+def learning_unreadable_message(learning_store) -> str:
+    # As for History: never suggest moving or deleting the file, which would
+    # make every kept learning recording look like an orphan.
+    return (f"Sotto cannot read {learning_store.unreadable.path} because part of it is damaged. "
+            "Your learning set and History were left exactly as they are. Dictation still works, but "
+            "new dictations are not saved to History until the file can be read again: repair the "
+            "damaged line, then restart Sotto.")
+
+
+def unreadable_store_alert(store, learning_store) -> tuple[str, str] | None:
+    """(title, message) for the one startup alert about an unreadable History
+    or learning set, or None when both read."""
+    if store.unreadable is not None:
+        return HISTORY_UNREADABLE_TITLE, history_unreadable_message(store)
+    if learning_store.unreadable is not None:
+        return LEARNING_UNREADABLE_TITLE, learning_unreadable_message(learning_store)
+    return None
 
 
 def _read_only_json(path: Path) -> dict | None:
@@ -2851,16 +3178,19 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     active_engine = "nemotron" if use_nemotron else "parakeet" if use_parakeet else "whisper"
 
-    # An unreadable history.jsonl must not kill the app before its menu bar
-    # exists (F16b). The adaptive lane's receipts depend on History, so there
-    # it stays fatal.
+    # An unreadable history.jsonl (F16b) or learning set (N21) must not kill
+    # the app before its menu bar exists. The adaptive lane's receipts depend
+    # on both, so there it stays fatal.
     from history import HistoryStore
     from learning import LearningStore
     store = HistoryStore(tolerate_unreadable=not adaptive)
-    learning_store = LearningStore()
+    learning_store = LearningStore(tolerate_unreadable=not adaptive)
     coordinator = history_coordinator(store, learning_store)
     if store.unreadable is not None:
         log(f"! History unreadable ({store.unreadable}): {history_unreadable_message(store)}")
+    elif learning_store.unreadable is not None:
+        log(f"! Learning set unreadable ({learning_store.unreadable}): "
+            f"{learning_unreadable_message(learning_store)}")
     seed_totals(store)
     # Always available, no-model dependency guard: an earlier adaptive session
     # must remain revocation-safe even when this launch is non-adaptive.
@@ -2892,10 +3222,12 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                                     enabled=not adaptive and not use_nemotron and not use_parakeet)
 
     pending_deliveries = PendingDeliveries()
+    finishing = PendingDeliveries()  # captures ended but not yet queued (see on_finish)
     ui_call, deliver_call = main_thread_dispatch(status_ui is not None, AppHelper.callAfter,
                                                  pending_deliveries)
-    if status_ui is not None and store.unreadable is not None:
-        ui_call(status_ui.show_error, HISTORY_UNREADABLE_TITLE, history_unreadable_message(store))
+    unreadable_alert = unreadable_store_alert(store, learning_store)
+    if status_ui is not None and unreadable_alert is not None:
+        ui_call(status_ui.show_error, *unreadable_alert)
 
     def refresh_history() -> None:
         if status_ui is not None:
@@ -2935,11 +3267,16 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     model_activity = {"last_finished": time.monotonic(), "rewarming": False}
 
     def _copy_text(text: str) -> None:
-        if shutdown.requested():
-            return
-        pasteboard = NSPasteboard.generalPasteboard()
-        pasteboard.clearContents()
-        pasteboard.setString_forType_(text, NSPasteboardTypeString)
+        """Retry's clipboard copy. The worker schedules it with deliver_call,
+        so it finishes its PendingDeliveries entry like a paste (N19)."""
+        try:
+            if shutdown.requested():
+                return
+            pasteboard = NSPasteboard.generalPasteboard()
+            pasteboard.clearContents()
+            pasteboard.setString_forType_(text, NSPasteboardTypeString)
+        finally:
+            pending_deliveries.finish()
 
     # Gesture callbacks mark the capture boundary. The audio engine starts and
     # stops off-thread; the ASR model stays resident independently.
@@ -2947,14 +3284,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         with capture_gate.starting() as allowed:
             if shutdown.requested():
                 return
-            if not allowed:
-                log("● an update is restarting Sotto; dictation resumes in a moment")
-                return
-            stream = None
-            if use_nemotron:
-                from streaming_audio import StreamingCapture
-                stream = StreamingCapture(nemotron)
-            cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
+            if allowed:
+                stream = None
+                if use_nemotron:
+                    from streaming_audio import StreamingCapture
+                    stream = StreamingCapture(nemotron)
+                cold = capture.begin(stream=stream, enqueue=lambda job: shutdown.enqueue(jobs, job))
+        if not allowed:
+            # Quit, Restart, an update or an engine switch is draining (N3,
+            # the Mac side of Windows F70): the mic stays closed, and the
+            # gesture ends too, as on_mic_failed does, or it would believe it
+            # is recording and a hands-free orb would stay up with no mic.
+            log(f"○ Sotto is {lifecycle.closed or 'restarting'} — this press is ignored")
+            hands_free = engine.snapshot()[1]  # a menu start: its orb shows next
+            engine.force_finish(finish=hide_refused_start if hands_free else (lambda: None))
+            return
         now = time.monotonic()
         if model_rewarm_due(model_activity["last_finished"], now,
                             rewarming=bool(model_activity["rewarming"]),
@@ -2988,11 +3332,14 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     def on_finish() -> None:
         # In flight from before the capture ends until its job is queued, so
-        # Quit's drain never sees an idle gap between the two.
+        # Quit's drain never sees an idle gap between the two; ``finishing``
+        # lets the teardown wait for that audio too (N9).
         pending_deliveries.add()
+        finishing.add()
         try:
             finish_capture()
         finally:
+            finishing.finish()
             pending_deliveries.finish()
 
     def finish_capture() -> None:
@@ -3014,8 +3361,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             return
         if status_ui:
             ui_call(status_ui.show_transcribing)
+        # Shutdown may come while the audio is in hand: keep it in History (N9).
         shutdown.enqueue(jobs, ("live", raw, capture.native_rate, captured_ts,
-                                released_at, uuid.uuid4().hex, current_speech_config(), stream))
+                                released_at, uuid.uuid4().hex, current_speech_config(), stream),
+                         keep=worker.keep_untranscribed)
 
     def on_discard() -> None:
         capture.abort()
@@ -3027,6 +3376,13 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     def on_hands_free() -> None:
         if status_ui:
             ui_call(status_ui.show_hands_free, hands_free_hint(binding["trigger"]))
+
+    def hide_refused_start() -> None:
+        """The finish of a hands-free start the closed gate refused: there is
+        no capture, so only its orb goes away. A refused key press shows no
+        orb, and hiding then would hide a draining dictation's one."""
+        if status_ui:
+            ui_call(status_ui.hide)
 
     def on_mic_failed() -> None:
         """The engine never started under this capture (device busy or gone).
@@ -3045,6 +3401,10 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
 
     engine = GestureEngine(on_start, on_finish, on_discard, on_hands_free=on_hands_free)
     capture.on_start_failed = on_mic_failed
+    lifecycle = Lifecycle(
+        shutdown, capture_gate, end_recording=lambda: end_capture_now(engine, capture, on_finish),
+        busy=lambda: dictation_in_flight(capture, jobs, pending_deliveries,
+                                         warming=bool(model_activity["rewarming"])))
     hotkey = parse_hotkey(hotkey_spec) if hotkey_spec else None
     hotkey_state: dict = {"pressed_at": None, "skip_up": False}
     if hotkey_spec and hotkey is None:
@@ -3102,14 +3462,15 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         recording=lambda: engine.snapshot()[0], frontmost_pid=frontmost_pid,
         keydowns=lambda: user_keydowns["count"], secure_input=secure_input_active,
         call_after=AppHelper.callAfter, note=delivery_note, shutdown_requested=shutdown.requested,
-        on_done=pending_deliveries.finish)
+        on_done=pending_deliveries.finish, own_window_front=own_window_without_text_field,
+        copy=set_clipboard_text)
 
     # deliver_call counts each of these in pending_deliveries when it schedules
     # it; the queue's on_done finishes that entry once the item is delivered,
     # dropped or cleared, so Quit and the update restart wait for the paste.
-    def inject_when_clear(text: str, _attempts: int = 0) -> None:
+    def inject_when_clear(text: str, _attempts: int = 0, in_history: bool = True) -> None:
         """Queue a finished dictation for the cursor (worker call shape kept)."""
-        delivery.paste(text)
+        delivery.paste(text, in_history)
 
     def undo_when_clear(_attempts: int = 0) -> None:
         """Queue a 'scratch that' behind whatever is still waiting to paste."""
@@ -3270,11 +3631,51 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
     Quartz.CGEventTapEnable(tap, True)
     threading.Thread(target=resync_poller, daemon=True).start()
 
-    restart_drain = {"deadline": None}
+    restart_drain = {"deadline": None, "kept": False}
+
+    def keep_untranscribed() -> None:
+        """A capture still untranscribed at teardown stays in History with its
+        audio (N9), for Retry: every queued live capture, the one the worker
+        is on (whose History append, if already under way, gets
+        APP_DRAIN_TIMEOUT to finish) and any it gave up on because shutdown
+        came first. The worker settles each capture once its append succeeds,
+        so one it saved is never kept again, and a model that returns after
+        this keep saves nothing (shutdown already fences its result).
+
+        A finish still holding its audio short of the queue gets
+        APP_DRAIN_TIMEOUT to reach it (a refused enqueue keeps it), and the
+        worker the same, after the running capture is kept, to file a capture
+        it took just as shutdown came. After SIGTERM these waits share one
+        deadline (ShutdownBoundary.teardown_wait_s), so launchd's SIGKILL
+        never comes before the keeps.
+
+        Side effects: History rows; may wait and join the worker briefly; logs."""
+        wait_until_idle(lambda: finishing.count() > 0, poll_s=0.02,
+                        deadline_s=shutdown.teardown_wait_s(APP_DRAIN_TIMEOUT, time.monotonic()))
+        shutdown.discard_queued(jobs, keep=worker.keep_untranscribed)
+        running = worker.current_job
+        if running is not None and running[0] == "live":
+            worker.keep_untranscribed(
+                running, wait_s=shutdown.teardown_wait_s(APP_DRAIN_TIMEOUT, time.monotonic()))
+        transcription_thread.join(shutdown.teardown_wait_s(APP_DRAIN_TIMEOUT, time.monotonic()))
+        for job in list(worker.abandoned):
+            worker.keep_untranscribed(job)
 
     def stop_runtime_on_main() -> None:
-        """Main-loop teardown after the event-only signal handler fires."""
+        """Main-loop teardown once shutdown is requested (Quit and the signal
+        drain have already waited for the dictation in flight).
+
+        Side effects: the first pass puts back a pending clipboard restore
+        (N6) and keeps untranscribed captures in History (N9); then ends the
+        process — exec for a foreground restart, exit status
+        RESTART_FAILED_EXIT if that exec fails (N27)."""
         shutdown.stop_capture(capture)
+        if not restart_drain["kept"]:
+            restart_drain["kept"] = True
+            flush_clipboard_restore(shutdown.teardown_wait_s(
+                SIGTERM_RESTORE_WAIT_S if shutdown.stop_signal == signal.SIGTERM else RESTORE_DELAY_S,
+                time.monotonic()))
+            keep_untranscribed()
         shutdown.discard_queued(jobs)
         drained = True
         if restart.foreground_pending or nemotron is not None:
@@ -3309,9 +3710,19 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log("! microphone teardown still running — restarting anyway")
             try:
                 restart.exec_foreground()
-            except OSError as exc:
+            except Exception as exc:
+                # Shutdown is one-way, so this process cannot carry on. Exit
+                # non-zero: KeepAlive (the login item, the LaunchAgent) starts
+                # Sotto again; exit 0 would be a Quit it leaves alone, and an
+                # alert queued now would never be shown.
                 restart.foreground_pending = False
-                restart.failed(f"foreground restart failed ({str(exc)[:120]}); run the command again")
+                try:
+                    restart.failed(f"foreground restart failed ({type(exc).__name__}: {str(exc)[:120]})")
+                except Exception as callback_exc:
+                    log(f"! restart failure handling failed: {str(callback_exc)[:120]}")
+                log(f"! exiting with status {RESTART_FAILED_EXIT} so launchd can start Sotto again; "
+                    "from a terminal, run the command again")
+                os._exit(RESTART_FAILED_EXIT)
         if status_ui is not None:
             ui_call(status_ui.hide)
             try:
@@ -3336,6 +3747,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             shutdown.discard_queued(jobs)
 
     threading.Thread(target=shutdown_watcher, daemon=True).start()
+    threading.Thread(target=lifecycle.watch_signals, daemon=True, name="sotto-signals").start()
 
     if status_ui is not None:
         # menu actions + system lifecycle hooks
@@ -3351,14 +3763,21 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 try:
                     entry = store.get(entry_id)
                     if entry:
-                        ui_call(_copy_text, entry["text"])
+                        deliver_call(_copy_text, entry["text"])  # _copy_text finishes its count
                 except Exception as exc:
                     ui_call(status_ui.show_error, "Could not copy transcript", str(exc)[:160])
             threading.Thread(target=work, daemon=True).start()
 
         def action_retry(entry_id: str) -> None:
-            shutdown.enqueue(jobs, ("retry", entry_id, time.monotonic(), uuid.uuid4().hex,
-                                    current_speech_config()))
+            """Refused while Quit, Restart, an update or an engine switch
+            drains (N18, the Mac side of F73): new work would keep it waiting."""
+            refused = lifecycle.run_if_open(
+                lambda: shutdown.enqueue(jobs, ("retry", entry_id, time.monotonic(), uuid.uuid4().hex,
+                                                current_speech_config())))
+            if refused:
+                log(f"○ Sotto is {refused} — Retry refused")
+                ui_call(status_ui.show_error, "Not retried",
+                        f"Sotto is {refused}. Retry once it is running again.")
 
         def action_set_language(mode: str) -> None:
             if adaptive or use_nemotron or use_parakeet:
@@ -3375,24 +3794,31 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
         def action_set_engine(mode: str) -> None:
             if adaptive or not engine_switching or mode == active_engine:
                 return
-            if dictation_in_flight(capture, jobs, pending_deliveries):
+            if lifecycle.busy():
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Switch engines after the current recording and transcription finish.")
                 return
+            # The restart discards a capture in progress: refuse new ones
+            # first, then check again, as the update restart does (N8).
+            if not lifecycle.close("switching engines"):
+                ui_call(status_ui.show_error, "Could not change engine",
+                        f"Sotto is {lifecycle.closed or 'stopping'}.")
+                return
+
+            def failed(message: str) -> None:
+                lifecycle.reopen("switching engines")
+                ui_call(status_ui.show_error, "Could not change engine", message[:160])
             try:
                 if mode == "nemotron":
                     from nemotron_backend import installation
                     installation()  # verify before persisting a restart choice
                 if mode == "parakeet" and not parakeet_cached():
                     raise RuntimeError("Download Parakeet first: Settings → Download Parakeet.")
-                if dictation_in_flight(capture, jobs, pending_deliveries):
+                if lifecycle.busy():
                     raise RuntimeError("Finish the current dictation before switching engines.")
-                persist_engine_and_restart(
-                    mode, restart.request,
-                    on_failure=lambda message: ui_call(
-                        status_ui.show_error, "Could not change engine", message[:160]))
+                persist_engine_and_restart(mode, restart.request, on_failure=failed)
             except Exception as exc:
-                ui_call(status_ui.show_error, "Could not change engine", str(exc)[:160])
+                failed(str(exc))
 
         def action_save(entry_id: str) -> None:
             def work() -> None:
@@ -3552,12 +3978,25 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 log("● orphan capture finished via menu")
 
         def action_start_now() -> None:
+            """Hands-free from the menu; refused while the gate is closed (N3).
+            A start that races the gate closing is refused by on_start."""
             if shutdown.requested():
+                return
+            if lifecycle.closed:
+                log(f"○ Sotto is {lifecycle.closed} — dictation not started")
                 return
             if engine.force_start():
                 log("● dictation started via menu (hands-free)")
 
-        def action_restart(after_failure=None) -> None:
+        def action_restart() -> None:
+            """The menu's Restart: finish the dictation in flight like Quit,
+            then restart (N12)."""
+            if lifecycle.restart(restart_now):
+                log("● restart requested from the menu — after the current dictation")
+            else:
+                log(f"○ Sotto is {lifecycle.closed or 'stopping'} — restart not requested")
+
+        def restart_now(after_failure=None) -> None:
             """Restart this foreground process or its own sealed supervisor.
             after_failure runs if the restart does not happen."""
             def failed(message: str) -> None:
@@ -3567,27 +4006,17 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
             try:
                 if not restart.request(on_failure=failed):
                     raise RuntimeError("Sotto is already shutting down")
-                log("● restart requested from the menu")
+                log("● restarting Sotto")
             except Exception as exc:
                 failed(str(exc))
 
         def action_quit() -> None:
             """Quit once the dictation in progress is done, waiting at most
-            QUIT_DRAIN_S. Side effects: refuses new recordings, ends the
-            recording in progress (even one the gesture engine lost), waits
-            until it is pasted, then requests shutdown."""
-            if shutdown.requested():
-                return
-            capture_gate.close()
-            if end_capture_now(engine, capture, on_finish):
-                log("● finishing the recording before quitting")
-
-            def work() -> None:
-                if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
-                                       deadline_s=QUIT_DRAIN_S):
-                    log(f"! dictation still running after {QUIT_DRAIN_S:.0f}s — quitting anyway")
-                shutdown.request()
-            threading.Thread(target=work, daemon=True).start()
+            QUIT_DRAIN_S (Lifecycle.quit; Ctrl-C and SIGTERM stop the same
+            way). Side effects: refuses new recordings, ends the recording in
+            progress (even one the gesture engine lost), waits until it is
+            pasted, then requests shutdown."""
+            lifecycle.quit()
 
         settings_view = {"controller": None, "installing": False, "parakeet_installing": False}
 
@@ -3729,7 +4158,7 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                 return  # [N28] its installer rebuilds Sotto.app; a terminal run is given the command
             if update_state["running"]:
                 return
-            if dictation_in_flight(capture, jobs, pending_deliveries):
+            if lifecycle.busy():
                 ui_call(status_ui.show_error, "Finish dictation first",
                         "Update after the current recording and transcription finish.")
                 return
@@ -3747,12 +4176,15 @@ def run(trigger: str, model: str | None = None, overlay: bool = True,
                     # A restart discards any recording or transcription in progress,
                     # and the user may have dictated while the update ran. Refuse new
                     # recordings first, then drain, so none can start in between.
-                    capture_gate.close()
-                    if not wait_until_idle(lambda: dictation_in_flight(capture, jobs, pending_deliveries),
+                    if not lifecycle.close("updating"):
+                        log(f"○ Sotto is {lifecycle.closed or 'stopping'}; the update applies at the next start")
+                        return
+                    if not wait_until_idle(lambda: lifecycle.busy() and lifecycle.closed == "updating",
                                            deadline_s=UPDATE_DRAIN_DEADLINE_S):
                         log(f"! dictation still running after {UPDATE_DRAIN_DEADLINE_S:.0f}s — "
                             "restarting into the update anyway")
-                    action_restart(after_failure=capture_gate.reopen)
+                    if lifecycle.closed == "updating":  # else a Quit took over
+                        restart_now(after_failure=lambda: lifecycle.reopen("updating"))
                 elif source_changed:
                     log("! update installed but its setup did not finish (see logs/update.log)")
                     ui_call(status_ui.show_error, "Update not finished",
@@ -3944,14 +4376,13 @@ def main() -> None:
         try:
             if args.profile == "parakeet":
                 from speech_config import MODEL_PROFILES
-                path = LocalParakeet(MODEL_PROFILES["parakeet"].repo).path
-                print(f"✓ Parakeet model ready ({Path(path).name[:12]}) in {SOTTO_HF_HOME}")
-                return
-            path = LocalWhisper(None, DEFAULT_MODEL).path
+                engine, path = "Parakeet", LocalParakeet(MODEL_PROFILES["parakeet"].repo).path
+            else:
+                engine, path = "Whisper", LocalWhisper(None, DEFAULT_MODEL).path
         except ModelUnavailable as exc:
             print(f"✗ {exc}")
             sys.exit(1)
-        print(f"✓ Whisper model ready ({Path(path).name[:12]}) in {SOTTO_HF_HOME}")
+        print(f"✓ {engine} model ready ({Path(path).name[:12]}) in {SOTTO_HF_HOME}")
         from offline_runtime import offline_requested
         import vad
         try:

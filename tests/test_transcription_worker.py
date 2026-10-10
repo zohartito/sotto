@@ -29,6 +29,7 @@ import settings
 import sotto
 from audio_codec import prepare_canonical
 from speech_config import resolve_speech_config
+import transcription
 from transcription import TranscriptionWorker
 
 WHISPER = resolve_speech_config("auto", language="en")
@@ -75,6 +76,9 @@ class FakeStream:
 
     def close(self):
         self.closed += 1
+
+
+WAIT_S = 5.0
 
 
 class FakeCoordinator:
@@ -186,7 +190,7 @@ class Harness:
             self.copied.append(text)
         copy_text.__name__ = "_copy_text"
 
-        def inject_when_clear(text, attempts):
+        def inject_when_clear(text, attempts, in_history=True):
             self.injected.append(text)
 
         def undo_when_clear(attempts):
@@ -518,7 +522,8 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
  'g1_retry_copied': {'appends': [],
                      'asr_calls': 1,
                      'copied': ['Please call me back at four'],
-                     'delivered': [],
+                     # N19: the Retry copy is a counted delivery, not a UI call.
+                     'delivered': ['_copy_text'],
                      'errors': [],
                      'injected': [],
                      'log': ['↻ retried · 27 chars'],
@@ -542,7 +547,7 @@ EXPECTED: dict[str, dict] = {'a_whisper_live_normal': {'appends': [{'adaptive': 
                                           'span_count': None,
                                           'speech_fraction': None}}],
                      'totals': [],
-                     'ui': ['_copy_text', 'hide_if_transcribing'],
+                     'ui': ['hide_if_transcribing'],
                      'undone': 0},
  'g2_retry_held': {'appends': [],
                    'asr_calls': 1,
@@ -844,6 +849,286 @@ class FailureHandlingTests(TemporaryUserFiles, unittest.TestCase):
         h = holder["harness"] = Harness(says("Please call me back at four"), append=disk_full_after_shutdown)
         h.run_jobs(h.live_job(speech(2.0)))
         self.assertEqual((h.injected, h.status_ui.errors), ([], []))
+
+
+class UntranscribedAtShutdownTests(TemporaryUserFiles, unittest.TestCase):
+    """N9: a capture Sotto stops before transcribing stays in History with its
+    audio (Quit, Restart and SIGTERM waited as long as they may)."""
+
+    def test_the_teardown_keeps_the_capture_for_retry(self):
+        h, raw = Harness(says("never called")), speech(2.0)
+        h.shutdown.request()
+        h.worker.keep_untranscribed(h.live_job(raw))
+        self.assertEqual(len(h.coordinator.appended), 1, h.logs)
+        row = h.coordinator.appended[0]
+        self.assertEqual((row["provenance"], row["text"], row["adaptive"]),
+                         ("live_suspect", "[not transcribed: Sotto stopped]", False))
+        self.assertIs(row["raw_samples"], raw)
+        self.assertEqual(row["preprocessing"]["outcome"], "suspect")
+        self.assertEqual((h.injected, h.status_ui.errors, h.whisper.calls), ([], [], 0))
+        self.assertTrue(any("kept in History" in line for line in h.logs), h.logs)
+
+    def test_a_failed_keep_is_logged_never_raised(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        h = Harness(append=disk_full)
+        h.shutdown.request()
+        h.worker.keep_untranscribed(h.live_job(speech(1.0)))
+        self.assertTrue(any("not saved" in line and "OSError" in line for line in h.logs), h.logs)
+
+    def test_a_capture_taken_just_as_shutdown_came_is_kept(self):
+        h, raw = Harness(says("never called")), speech(2.0)
+
+        class ShutdownOnGet(queue.Queue):
+            def get(self, *args, **kwargs):
+                job = super().get(*args, **kwargs)
+                h.shutdown.request()  # shutdown lands between the get and the check
+                return job
+        h.jobs = h.worker.jobs = ShutdownOnGet()
+        job = h.live_job(raw)
+        h.jobs.put(job)
+        h.run()
+        self.assertEqual(h.worker.abandoned, [job])  # the teardown keeps it
+        self.assertEqual((h.jobs.unfinished_tasks, h.worker.current_job), (0, None))
+
+    def test_a_result_fenced_by_shutdown_is_left_for_the_teardown_to_keep(self):
+        holder: dict = {}
+
+        def finish_then_shutdown(samples, **kwargs):
+            holder["harness"].shutdown.request()
+            return {"text": "Please call me back at four", "segments": []}
+        h = holder["harness"] = Harness(finish_then_shutdown)
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        self.assertEqual(h.coordinator.appended, [])      # nothing committed after shutdown
+        self.assertEqual(h.worker.abandoned, [job])
+        h.worker.keep_untranscribed(job)
+        self.assertEqual([row["text"] for row in h.coordinator.appended],
+                         ["[not transcribed: Sotto stopped]"])
+
+    def test_a_saved_capture_is_never_kept_again(self):
+        h = Harness(says("Please call me back at four"))
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        h.worker.keep_untranscribed(job)  # the teardown hands it over anyway
+        self.assertEqual([row["text"] for row in h.coordinator.appended], ["Please call me back at four"])
+
+    def test_a_kept_capture_is_never_saved_again_by_a_late_model(self):
+        h = Harness(says("Please call me back at four"))
+        job = h.live_job(speech(2.0))
+        h.worker.keep_untranscribed(job)  # the teardown kept it while the model ran
+        h.run_jobs(job)
+        self.assertEqual([row["text"] for row in h.coordinator.appended],
+                         ["[not transcribed: Sotto stopped]"])
+        self.assertEqual(h.injected, [])
+
+    def test_a_failed_append_does_not_stop_the_teardown_from_keeping_it(self):
+        calls = []
+        holder: dict = {}
+
+        def fails_once(text, prepared, seconds, model, **kw):
+            calls.append(text)
+            if len(calls) == 1:
+                holder["harness"].shutdown.request()
+                raise OSError(28, "No space left on device")
+            return {"id": "row2", "text": text, "provenance": kw.get("provenance")}
+        h = holder["harness"] = Harness(says("Please call me back at four"), append=fails_once)
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        self.assertEqual(h.worker.abandoned, [job])
+        h.worker.keep_untranscribed(job)
+        self.assertEqual(calls, ["Please call me back at four", "[not transcribed: Sotto stopped]"])
+
+    def blocked_append(self, outcome):
+        """A Harness whose first History append blocks until released, then
+        ``outcome``s: "fails" raises, "saves" saves. Later appends save."""
+        started, release, calls = threading.Event(), threading.Event(), []
+
+        def append(text, prepared, seconds, model, **kw):
+            calls.append(text)
+            if len(calls) == 1:
+                started.set()
+                release.wait(WAIT_S)
+                if outcome == "fails":
+                    raise OSError(28, "No space left on device")
+            return {"id": f"row{len(calls)}", "text": text, "provenance": kw.get("provenance")}
+        h = Harness(says("Please call me back at four"), append=append)
+        job = h.live_job(speech(2.0))
+        threading.Thread(target=h.run_jobs, args=(job,), daemon=True).start()
+        self.assertTrue(started.wait(WAIT_S), "the worker never reached its History append")
+        h.shutdown.request()  # Quit's drain ran out while the append was under way
+        keeper = threading.Thread(target=h.worker.keep_untranscribed, args=(job,), daemon=True)
+        keeper.start()
+        return keeper, release, calls
+
+    def test_the_teardown_waits_for_an_append_under_way_and_keeps_the_capture_if_it_fails(self):
+        # Codex on #20: settling before the append let the teardown refuse a
+        # capture whose append then failed, losing audio and transcript.
+        keeper, release, calls = self.blocked_append("fails")
+        time.sleep(0.1)
+        self.assertTrue(keeper.is_alive(), "the teardown did not wait for the append under way")
+        release.set()
+        keeper.join(WAIT_S)
+        self.assertEqual(calls, ["Please call me back at four", "[not transcribed: Sotto stopped]"])
+
+    def test_the_teardown_waits_for_an_append_under_way_and_never_keeps_it_twice(self):
+        keeper, release, calls = self.blocked_append("saves")
+        time.sleep(0.1)
+        release.set()
+        keeper.join(WAIT_S)
+        self.assertEqual(calls, ["Please call me back at four"])
+
+    def test_the_teardown_wait_for_an_append_under_way_is_bounded(self):
+        keeper, release, calls = self.blocked_append("fails")
+        keeper.join(transcription.APPEND_WAIT_S + 2.0)
+        self.assertFalse(keeper.is_alive(), "a wedged append held the teardown")
+        release.set()
+        self.assertEqual(calls, ["Please call me back at four"])  # never two rows racing
+
+    def test_a_suppressed_adaptive_append_discards_its_staged_audio(self):
+        h = Harness(says("unused"))
+        history = object()
+        h.worker.adaptive_runtime = types.SimpleNamespace(history=history)
+        h.worker._live_id = "cap9"
+        h.worker.keep_untranscribed(h.live_job(speech(1.0))[:5] + ("cap9",) + h.live_job(speech(1.0))[6:])
+        with patch("transcription.discard_staged_adaptive_live_audio") as discard:
+            self.assertIsNone(h.worker._append_live("text", None, 1.0, "m"))
+        discard.assert_called_once_with(history, "cap9")
+
+    def test_the_running_job_is_visible_to_the_teardown(self):
+        seen = {}
+        holder: dict = {}
+
+        def look(samples, **kwargs):
+            seen["job"] = holder["harness"].worker.current_job
+            return {"text": "Please call me back at four", "segments": []}
+        h = holder["harness"] = Harness(look)
+        job = h.live_job(speech(2.0))
+        h.run_jobs(job)
+        self.assertIs(seen["job"], job)
+        self.assertIsNone(h.worker.current_job)
+
+
+def read_only_history():
+    """What History hands back while history.jsonl is unreadable (F16b)."""
+    return sotto.UnsavedHistory(types.SimpleNamespace(unreadable="damaged line 3"), None).append_live
+
+
+class RoundTwoWorkerTests(TemporaryUserFiles, unittest.TestCase):
+    """F4b, N10, N16, N17 and N19: a live job or a Retry that fails anywhere is
+    kept or reported once, and nothing claims History holds what it does not."""
+
+    def test_f4b_a_failure_outside_the_model_call_keeps_the_recording(self):
+        h, raw = Harness(says("Please call me back at four")), speech(2.0)
+        with patch("transcription.screen", side_effect=RuntimeError("screen broke")):
+            h.run_jobs(h.live_job(raw))
+        FailureHandlingTests.assert_kept_for_retry(self, h, raw, "RuntimeError")
+
+    def test_f4b_an_adaptive_failure_drops_its_staged_audio_before_the_fallback_row(self):
+        # The adaptive lane staged audio/<capture_id>.wav, then a later step
+        # raised: the capture is kept as an ordinary row under a new id, so the
+        # unadopted staging copy must go first (no unindexed duplicate).
+        h, raw = Harness(says("never used")), speech(2.0)
+        history = object()
+        h.worker.adaptive_runtime = types.SimpleNamespace(history=history)
+        order = []
+        h.coordinator._append = lambda text, *a, **k: (order.append("append"), {"id": "row9", "text": text})[1]
+        staged = ("adaptive text", {"repo": "adaptive/model"}, "audio/cap0001.wav")
+        with patch("transcription.adaptive_live_transcribe_prepared", return_value=staged), \
+             patch("transcription.discard_staged_adaptive_live_audio",
+                   side_effect=lambda hist, capture_id: order.append(("discard", hist, capture_id))), \
+             patch("transcription.screen", side_effect=RuntimeError("screen broke")):
+            h.run_jobs(h.live_job(raw))
+        self.assertEqual(order, [("discard", history, "cap0001"), "append"], h.logs)
+
+    def test_f4b_a_capture_that_cannot_even_be_prepared_still_tells_the_user(self):
+        h = Harness(says("never transcribed"))
+        with patch("transcription.prepare_for_whisper", side_effect=ValueError("bad buffer")):
+            h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(h.coordinator.appended, [])
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Transcription failed"])
+        self.assertIn("dictate again", h.status_ui.errors[0][1])
+
+    def test_f4b_a_failure_already_reported_by_f16a_is_not_kept_again(self):
+        calls = []
+
+        def disk_full(text, *args, **kwargs):
+            calls.append(text)
+            raise OSError(28, "No space left on device")
+        h = Harness(says("Please call me back at four"), append=disk_full)
+
+        def refresh_broke():
+            raise OSError("menu refresh failed")
+        h.worker.refresh_history = refresh_broke
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(calls, ["Please call me back at four"])   # no second, F4b row
+        self.assertEqual(h.injected, ["Please call me back at four"])
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["History could not be saved"])
+
+    def test_n17_a_failed_retry_tells_the_user_once(self):
+        def boom(samples, **kwargs):
+            raise RuntimeError("[metal::malloc] Resource limit exceeded")
+        h = Harness(boom, snapshot=snapshot(speech(2.0)))
+        h.run_jobs(h.retry_job())
+        self.assertEqual((h.coordinator.retries, h.copied), ([], []))
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Retry failed"])
+        self.assertIn("RuntimeError", h.status_ui.errors[0][1])
+
+    def test_n17_an_error_after_delivery_is_not_a_transcription_failure(self):
+        h = Harness(says("Please call me back at four"))
+
+        def totals_broke(text, seconds):
+            raise OSError("progress file locked")
+        h.worker.record_totals = totals_broke
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual(h.injected, ["Please call me back at four"])
+        self.assertEqual(len(h.coordinator.appended), 1)      # not kept a second time
+        self.assertEqual(h.status_ui.errors, [])
+        self.assertFalse(any("transcription failed" in line for line in h.logs), h.logs)
+        self.assertTrue(any("progress file locked" in line for line in h.logs), h.logs)
+
+    def test_n19_the_retry_copy_is_counted_until_the_main_thread_runs_it(self):
+        h = Harness(says("Please call me back at four"), snapshot=snapshot(speech(2.0)))
+        deliveries, main_loop = sotto.PendingDeliveries(), []
+        ui_call, deliver_call = sotto.main_thread_dispatch(
+            True, lambda method, *args: main_loop.append((method, args)), deliveries)
+        h.worker.ui_call, h.worker.deliver_call = ui_call, deliver_call
+        h.run_jobs(h.retry_job())
+        self.assertEqual(h.copied, [])                        # scheduled, not yet run
+        self.assertEqual(deliveries.count(), 1)               # so Quit still waits for it
+        self.assertIn(h.worker.copy_text, [method for method, _ in main_loop])
+
+    def test_n10_read_only_history_never_says_the_failed_audio_is_in_history(self):
+        def boom(samples, **kwargs):
+            raise RuntimeError("[metal::malloc] Resource limit exceeded")
+        h = Harness(boom, append=read_only_history())
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual([title for title, _ in h.status_ui.errors], ["Transcription failed"])
+        message = h.status_ui.errors[0][1]
+        self.assertNotIn("is in History", message)
+        self.assertIn("dictate again", message)
+        self.assertFalse(any("kept in History" in line for line in h.logs), h.logs)
+
+    def test_n10_read_only_history_never_says_held_text_was_kept(self):
+        h = Harness(says(LOOP), append=read_only_history())
+        h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual((h.injected, h.copied), ([], []))
+        self.assertFalse(any("kept in history" in line.lower() for line in h.logs), h.logs)
+        self.assertTrue(any("not pasted" in line for line in h.logs), h.logs)
+        # The startup alert already said History is unreadable; an empty or
+        # garbled capture is not worth a second one each time.
+        self.assertEqual(h.status_ui.errors, [])
+
+    def test_n16_the_paste_knows_whether_history_saved_the_text(self):
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        saved = Harness(says("Please call me back at four"))
+        failed = Harness(says("Please call me back at four"), append=disk_full)
+        read_only = Harness(says("Please call me back at four"), append=read_only_history())
+        for h in (saved, failed, read_only):
+            h.run_jobs(h.live_job(speech(2.0)))
+        self.assertEqual([h.delivered[0][1][2:] for h in (saved, failed, read_only)],
+                         [(True,), (False,), (False,)])
 
 
 if __name__ == "__main__":

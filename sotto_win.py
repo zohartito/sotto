@@ -45,6 +45,7 @@ if sys.platform != "win32":
     raise ImportError("sotto_win is Windows-only")
 
 import dictionary
+import pipeline
 import progress
 import settings as user_settings
 import sotto
@@ -62,15 +63,20 @@ from history import HistoryStore
 from learning import LearningCoordinator, LearningStore
 
 INSERT_WAIT_S = 120.0  # insert once modifiers are released; after this, History only
-# Restart waits this long for the dictation in flight: a long CPU dictation
-# finishes well inside it, but a wedged CUDA/CT2 call must not block recovery.
-RESTART_DRAIN_CAP_S = 300.0
+# Restart waits for the dictation in flight: the longest recording (the
+# hands-free watchdog) plus time to transcribe it on the CPU, then goes ahead
+# anyway, so a wedged CUDA/CT2 call cannot block recovery for good.
+RESTART_TRANSCRIBE_S = 300.0  # a long CPU dictation transcribes well inside this
+RESTART_DRAIN_CAP_S = sotto.HANDS_FREE_MAX_S + RESTART_TRANSCRIBE_S
 # Quit finishes the dictation in flight, up to this long: the Mac's
-# sotto.QUIT_DRAIN_S (branch fix/app-lifecycle), the owner's choice for both.
+# sotto.QUIT_DRAIN_S, the owner's choice for both.
 QUIT_DRAIN_S = 10.0
 DRAIN_POLL_S = 0.1  # how often a drain checks whether the work in flight is done
 UNREAD_PASTE = "a paste the app has not read yet"  # in_flight()'s words for it
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"  # History text when the model raised
+MIC_FAILED_TEXT = ("Could not start the microphone. Check that no other app holds it and that "
+                   "desktop apps may use it (Settings → Privacy & security → Microphone), "
+                   "then press the key again.")
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 
 
@@ -85,6 +91,8 @@ class _ConsoleLog:
     I/O.  Gesture callbacks log on the keyboard-hook thread, and Windows
     silently drops a low-level hook that is slow to return, so a log line must
     never wait for the disk there.  drain() (also at exit) writes what is left.
+    A log that grows past LOG_ROTATE_BYTES while Sotto runs moves to
+    sotto.log.1 and a fresh sotto.log starts (the Mac's keep_app_log_small).
     """
 
     def __init__(self) -> None:
@@ -92,10 +100,7 @@ class _ConsoleLog:
         self._file = None
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            path = DATA_DIR / "sotto.log"
-            if path.is_file() and path.stat().st_size > LOG_ROTATE_BYTES:
-                path.replace(path.with_name("sotto.log.1"))
-            self._file = open(path, "a", encoding="utf-8", buffering=1)
+            self._open_file()
         except OSError:
             pass  # console-only rather than crash on a read-only profile
         self._pending: queue.SimpleQueue = queue.SimpleQueue()
@@ -148,8 +153,28 @@ class _ConsoleLog:
             try:
                 self._file.write(text)
                 self._file.flush()
+                self._size += len(text.encode("utf-8", "replace"))
+                if self._size > LOG_ROTATE_BYTES:
+                    self._file.close()  # Windows cannot move a file that is open
+                    self._file = None
+                    self._open_file()
             except (OSError, ValueError):
                 self._file = None
+
+    def _open_file(self) -> None:
+        """Open DATA_DIR/sotto.log for appending, first moving one past
+        LOG_ROTATE_BYTES to sotto.log.1 (replacing the older one).
+
+        Side effects: may replace sotto.log.1; sets self._file and self._size.
+        """
+        path = DATA_DIR / "sotto.log"
+        if path.is_file() and path.stat().st_size > LOG_ROTATE_BYTES:
+            try:
+                path.replace(path.with_name("sotto.log.1"))
+            except OSError:
+                pass  # sotto.log.1 is held open elsewhere: keep appending, retry next time
+        self._file = open(path, "a", encoding="utf-8", buffering=1)
+        self._size = path.stat().st_size
 
 
 def log(msg: str) -> None:
@@ -844,15 +869,19 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("stopped before listening")
         return False
 
-    # An unreadable history.jsonl must not stop the app at every login (F16b):
-    # dictation keeps working, History is left untouched, the user is told once.
+    # An unreadable history.jsonl (F16b) or learning set (N21) must not stop
+    # the app at every login: dictation keeps working, both are left
+    # untouched, the user is told once.
     store = HistoryStore(tolerate_unreadable=True)
-    coordinator = sotto.history_coordinator(store, LearningStore())
-    if store.unreadable is not None:
-        message = sotto.history_unreadable_message(store)
-        log(f"! History unreadable ({store.unreadable}): {message}")
+    learning_store = LearningStore(tolerate_unreadable=True)
+    coordinator = sotto.history_coordinator(store, learning_store)
+    unreadable_alert = sotto.unreadable_store_alert(store, learning_store)
+    if unreadable_alert is not None:
+        title, message = unreadable_alert
+        what = "History" if store.unreadable is not None else "Learning set"
+        log(f"! {what} unreadable ({store.unreadable or learning_store.unreadable}): {message}")
         if ui is not None:  # a toast truncates this long a message; the box blocks only its thread
-            threading.Thread(target=win_ui.message_box, args=(sotto.HISTORY_UNREADABLE_TITLE, message),
+            threading.Thread(target=win_ui.message_box, args=(title, message),
                              kwargs={"error": True}, daemon=True).start()
     sotto.seed_totals(store)
     from adaptive_learning import AdaptiveLearning
@@ -924,12 +953,17 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                             "asr_seconds": 0.0},
             })
             log(f"! not pasted ({skip})")
-            sotto.finalize_primary_live_delivery(
-                append=lambda: coordinator.append_live(
-                    text, prepared, seconds, model_repo, ts=captured_ts, raw_samples=raw,
-                    raw_sample_rate=native_rate, provenance="live_suspect",
-                    adaptive=False, **attempt_metadata),
-                adaptive_runtime=None, appended_publication=None, shutdown=shutdown, inject=None)
+            try:
+                sotto.finalize_primary_live_delivery(
+                    append=lambda: coordinator.append_live(
+                        text, prepared, seconds, model_repo, ts=captured_ts, raw_samples=raw,
+                        raw_sample_rate=native_rate, provenance="live_suspect",
+                        adaptive=False, **attempt_metadata),
+                    adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
+                    inject=None)
+            except Exception as exc:
+                history_append_failed(exc)  # held: nothing to deliver
+                return
             log(f"→ 0.00s · {len(text)} chars")
             return
         # VAD is advisory only: it trims dead air from long captures and
@@ -1005,16 +1039,20 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         if reason:
             log(f"! not pasted ({reason}) — kept in history")
             preprocessing["outcome"] = "suspect"
-        appended = sotto.finalize_primary_live_delivery(
-            append=lambda: coordinator.append_live(
-                text, prepared, prepared_seconds, model_repo, ts=captured_ts,
-                raw_samples=raw, raw_sample_rate=native_rate,
-                provenance="live_suspect" if reason else "live", adaptive=False,
-                **attempt_metadata),
-            adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
-            inject=None if reason or not (text or voice_action) else lambda: deliveries.put(
-                (SCRATCH if voice_action == "scratch" else text, prefs, copy_only,
-                 time.monotonic())))
+        deliver = None if reason or not (text or voice_action) else lambda: deliveries.put(
+            (SCRATCH if voice_action == "scratch" else text, prefs, copy_only, time.monotonic()))
+        try:
+            appended = sotto.finalize_primary_live_delivery(
+                append=lambda: coordinator.append_live(
+                    text, prepared, prepared_seconds, model_repo, ts=captured_ts,
+                    raw_samples=raw, raw_sample_rate=native_rate,
+                    provenance="live_suspect" if reason else "live", adaptive=False,
+                    **attempt_metadata),
+                adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
+                inject=deliver)
+        except Exception as exc:
+            appended = None
+            history_append_failed(exc, deliver)
         if appended is not None and text and not reason and voice_action is None:
             sotto.record_totals(text, len(raw) / max(native_rate, 1.0))
         log(f"→ {attempt_metadata['latency']['release_to_text_seconds']:.2f}s after release "
@@ -1024,7 +1062,9 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                             vad_metadata, preprocessing, queued_at, started) -> None:
         """The speech model raised (CUDA out of memory, a driver error): the
         recording must not be lost.  It is kept as a suspect History row that
-        Retry can transcribe again, and the tray says so.
+        Retry can transcribe again, and the tray says so — unless History
+        could not take the row (an append that raised, or History unreadable
+        since startup), when the tray says the recording is lost instead.
 
         Side effects: appends one History row with its audio; a tray notification.
         """
@@ -1040,15 +1080,46 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             "vad": vad_metadata, "preprocessing": preprocessing,
             "latency": {"queue_wait_seconds": round(started - queued_at, 4),
                         "asr_seconds": round(time.monotonic() - started, 4)}})
-        sotto.finalize_primary_live_delivery(
-            append=lambda: coordinator.append_live(
-                TRANSCRIPTION_FAILED_TEXT, prepared, prepared_seconds, model_repo,
-                ts=captured_ts, raw_samples=raw, raw_sample_rate=native_rate,
-                provenance="live_suspect", adaptive=False, **attempt_metadata),
-            adaptive_runtime=None, appended_publication=None, shutdown=shutdown, inject=None)
+        try:
+            row = sotto.finalize_primary_live_delivery(
+                append=lambda: coordinator.append_live(
+                    TRANSCRIPTION_FAILED_TEXT, prepared, prepared_seconds, model_repo,
+                    ts=captured_ts, raw_samples=raw, raw_sample_rate=native_rate,
+                    provenance="live_suspect", adaptive=False, **attempt_metadata),
+                adaptive_runtime=None, appended_publication=None, shutdown=shutdown,
+                inject=None)
+        except Exception as append_exc:
+            log(f"! failed capture not saved ({type(append_exc).__name__}: "
+                f"{str(append_exc)[:160]})")
+            row = None
+        # UnsavedHistory (History unreadable) hands back a row it never wrote.
+        saved = row is not None and row.get("saved", True)
         if ui is not None:
             ui.notify("Transcription failed. The recording is in History: "
-                      "choose Retry there to transcribe it again.")
+                      "choose Retry there to transcribe it again." if saved else
+                      "Transcription failed, and the recording could not be saved to "
+                      "History either; please dictate again.")
+
+    def history_append_failed(exc: Exception, deliver=None) -> None:
+        """History could not take the live row (the Mac's F16a): disk full,
+        a locked or damaged store.  The dictation still reaches the user,
+        who is told once that it was not saved.
+
+        Side effects: runs ``deliver`` (the insertion, copy or "scratch that"
+        a saved row would have queued); one tray notification; a log line.
+        Nothing once shutdown is requested.
+        """
+        log(f"! History append failed ({type(exc).__name__}: {str(exc)[:160]})"
+            + (" — delivering the text anyway" if deliver is not None else ""))
+        if shutdown.requested():
+            return
+        if deliver is not None:
+            deliver()
+        if ui is not None:
+            ui.notify("History could not be saved. "
+                      + ("The text was still delivered, but it is not in History."
+                         if deliver is not None else
+                         "The held-back text could not be kept in History."))
 
     def retry_job(job) -> None:
         _, entry_id, queued_at, _capture_id, job_config = job
@@ -1083,12 +1154,18 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             return
         preprocessing: dict = {"retry_canonical": True}
         move_detected_language(attempt_metadata, preprocessing)
-        # No VAD verdict for a retry: only the text-based guards apply.
-        text, reason = screen_transcript(text, prepared_seconds, 1.0, preprocessing)
+        # The same guards and cleanup as live dictation (pipeline.screen, like
+        # the Mac's Retry).  No VAD verdict for a retry (speech_fraction 1.0),
+        # and Retry never undoes anything: a "scratch that" result keeps its words.
+        screened = pipeline.screen(
+            text, seconds=prepared_seconds, speech_fraction=1.0,
+            language=preprocessing.get("detected_language") or job_config.language, log=log)
+        preprocessing.update(screened.receipts)
+        text = (preprocessing.pop("voice")["asr_text"] if screened.voice_action == "scratch"
+                else screened.text)
+        reason = screened.held
         if reason:
             preprocessing["outcome"] = "suspect"
-        else:
-            text = sotto.apply_personal_dictionary(text, preprocessing)
         attempt_metadata.update({
             "vad": {"available": None, "speech_fraction": None, "span_count": None},
             "preprocessing": preprocessing,
@@ -1152,7 +1229,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             return
         with capture_gate.starting() as may_start:
             if may_start:
-                cold = capture.begin()
+                cold = capture.begin(epoch=engine.epoch())
         if not may_start:
             # A restart, update or Quit is draining: a new capture would
             # keep it waiting and then be cut off.  The mic stays closed, and
@@ -1184,7 +1261,7 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             deadline = time.monotonic() + 10
             while capture.is_waking() and time.monotonic() < deadline:
                 time.sleep(0.05)
-            if engine.snapshot()[0]:
+            if engine.snapshot()[0] and capture.is_active():  # a failed open is not live
                 log("● recording (mic live)")
 
         threading.Thread(target=announce_live, daemon=True).start()
@@ -1217,7 +1294,20 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
         log("○ tap ignored")
         ui_state()
 
+    def on_mic_failed(epoch: int | None = None) -> None:
+        """The newest capture's stream never opened (device busy or gone, or
+        the previous stream still closing): end the gesture, so nothing
+        pretends to record, and say so once — the Mac's on_mic_failed.
+        Runs on the capture's opening thread, never on the keyboard hook.
+        Bound to the key epoch the capture began under, so a failure that
+        lands after a newer press can never end that newer gesture."""
+        if engine.force_finish(if_epoch=epoch):
+            log("✗ could not start the microphone — dictation cancelled")
+        if ui is not None:
+            ui.notify(MIC_FAILED_TEXT)
+
     engine = sotto.GestureEngine(on_start, on_finish, on_discard)
+    capture.on_start_failed = on_mic_failed
     hook = win_hotkey.TriggerHook(engine, trigger=trigger)
     hook.start()
     hook_lock = threading.Lock()  # the resync poller's revive vs the teardown's stop
@@ -1246,22 +1336,38 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
             undo_last_dictation()
             return
         try:
-            win_inject.deliver(text, mode=prefs.insert_mode, spacing=prefs.spacing, log=log)
-            last_delivery["at"] = time.monotonic()
+            # The insert's target and the user's key-downs so far, read
+            # before it: "scratch that" may undo only this insert, there.
+            target, keydowns = win_inject.foreground_identity(), hook.keydowns
+            if win_inject.deliver(text, mode=prefs.insert_mode, spacing=prefs.spacing, log=log):
+                last_delivery["insert"] = {"at": time.monotonic(), "target": target,
+                                           "keydowns": keydowns}
         except OSError as exc:
             log(f"! not inserted ({str(exc)[:120]}) — kept in history")
 
-    last_delivery = {"at": 0.0}
+    last_delivery: dict = {"insert": None}  # the insert "scratch that" may undo
 
     def undo_last_dictation() -> None:
-        """'scratch that': the app's own Ctrl+Z, only for a dictation Sotto
-        inserted within the last minute."""
+        """'scratch that': the app's own Ctrl+Z, only for Sotto's own insert
+        within the last minute, with the same window still in front and
+        nothing typed by the user since (the Mac's DeliveryQueue._undo)."""
         import voice_commands
-        if time.monotonic() - last_delivery["at"] > voice_commands.SCRATCH_WINDOW_S:
+        last = last_delivery["insert"]
+        if last is None or time.monotonic() - last["at"] > voice_commands.SCRATCH_WINDOW_S:
             log("  scratch that: nothing recent to undo")
             return
+        target = win_inject.foreground_identity()
+        if target is None or last["target"] is None:  # None == None proves nothing
+            log("  scratch that: the window in front is unknown — nothing undone")
+            return
+        if target != last["target"]:
+            log("  scratch that: the dictation went to another window — nothing undone")
+            return
+        if hook.keydowns != last["keydowns"]:
+            log("  scratch that: you typed since the dictation — nothing undone")
+            return
         win_inject.send_inputs(win_inject.chord_inputs(win_inject.VK_CONTROL, VK_Z))
-        last_delivery["at"] = 0.0
+        last_delivery["insert"] = None
         log("↶ scratch that — undid the last dictation")
 
     def copy_instead(text: str) -> None:
@@ -1282,7 +1388,12 @@ def run(trigger: str, profile: str, model: str | None, language: str | None,
                 continue
             try:
                 if copy_only and text is SCRATCH:
-                    pass  # finished from the tray: there is no insertion to undo
+                    # Finished from the tray: the menu has the focus, so no
+                    # Ctrl+Z is sent; say so rather than drop it silently.
+                    log("  scratch that: finished from the tray — nothing undone")
+                    if ui is not None:
+                        ui.notify("Nothing was undone: \"scratch that\" finished from the tray "
+                                  "cannot reach your app. Press Ctrl+Z there instead.")
                 else:
                     copy_instead(text) if copy_only else insert_one(text, prefs, ready_at)
             except Exception as exc:

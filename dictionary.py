@@ -18,6 +18,7 @@ from sotto_paths import DATA_DIR
 
 DICTIONARY_PATH = DATA_DIR / "dictionary.txt"
 SEPARATOR = "=>"
+COMMENT = "#"  # starts a comment line, so no rule may start with it
 MAX_RULES = 500
 MAX_SIDE_CHARS = 120
 MAX_SUGGESTIONS = 5
@@ -51,7 +52,7 @@ def parse(text: str) -> list[Rule]:
     rules: list[Rule] = []
     seen: set[str] = set()
     for line in text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#") or SEPARATOR not in line:
+        if not line.strip() or line.lstrip().startswith(COMMENT) or SEPARATOR not in line:
             continue
         heard, write = (_clean(part) for part in line.split(SEPARATOR, 1))
         key = heard.lower()
@@ -169,6 +170,7 @@ def suggest(before: str, after: str, existing: list[Rule] = ()) -> list[Rule]:
     for heard, write, words in candidates:
         heard, write = _clean(heard), _clean(write)
         if (not heard or not write or heard == write or heard.lower() in known
+                or heard.startswith(COMMENT)
                 or len(heard) > MAX_SIDE_CHARS or len(write) > MAX_SIDE_CHARS
                 or (words == 1 and heard.lower() in _COMMON_WORDS)):
             continue
@@ -188,7 +190,16 @@ def ensure_file(path: Path | str = DICTIONARY_PATH) -> Path:
 
 
 def add(new_rules: list[Rule], path: Path | str = DICTIONARY_PATH) -> int:
-    """Append rules whose 'heard' side is new; returns how many were added."""
+    """Append rules whose 'heard' side is new; returns how many were added.
+
+    A heard side starting with ``COMMENT`` raises ValueError and nothing is
+    written: the file would read that line as a comment, so the rule would be
+    reported as added and never apply (N31)."""
+    for rule in new_rules:
+        heard = _clean(rule.heard)
+        if heard.startswith(COMMENT):
+            raise ValueError(f'"{heard}" cannot be a dictionary rule: a line starting with '
+                             f'"{COMMENT}" is a comment in the dictionary file.')
     path = Path(path)
     try:
         current = path.read_text(encoding="utf-8")

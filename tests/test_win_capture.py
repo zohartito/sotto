@@ -228,6 +228,100 @@ class WinCaptureTest(unittest.TestCase):
         capture.end()
         self._wait_closed(streams[1])
 
+    def test_an_open_racing_end_waits_for_the_stream_end_just_detached(self) -> None:
+        # [N7] end() detached the stream under the lock but registered its
+        # close only after letting go of it: a begin() in that gap saw
+        # nothing closing and put a second stream on the mic.
+        release = threading.Event()
+
+        class StuckStream(WinCaptureTest.FakeStream):
+            def stop(self) -> None:
+                release.wait(10)
+
+        streams: list = []
+
+        def factory(**kwargs):
+            streams.append(StuckStream() if not streams else WinCaptureTest.FakeStream())
+            return streams[-1]
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=lambda message: None)
+        capture._close_wait_s = 0.2
+        test_thread, race = threading.current_thread(), {"armed": False}
+
+        class RacingLock:
+            """A press lands the moment end() first lets go of the lock."""
+
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                self._lock.release()
+                if race["armed"] and threading.current_thread() is test_thread:
+                    race["armed"] = False
+                    race["began"] = capture.begin()
+                    for _ in range(100):  # up to 1 s: the new open ran, or failed
+                        if len(streams) > 1 or not capture.is_active():
+                            break
+                        time.sleep(0.01)
+                return False
+
+        capture._lock = RacingLock()
+        try:
+            self.assertTrue(capture.begin())
+            for _ in range(500):  # up to 5 s
+                if capture._stream is not None:
+                    break
+                time.sleep(0.01)
+            race["armed"] = True
+            capture.end()
+            self.assertTrue(race["began"])
+            self.assertEqual(len(streams), 1, "a second stream opened while the first was closing")
+        finally:
+            release.set()
+        self._wait_closed(streams[0])
+
+    def test_a_failed_open_reports_the_gesture_epoch_it_began_under(self) -> None:
+        # [#19 review] The failure names the key epoch its capture began under,
+        # so the app can refuse to end a newer gesture with it.
+        reported: list = []
+
+        def factory(**kwargs):
+            raise OSError("Error opening InputStream: Device unavailable")
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=lambda line: None)
+        capture.on_start_failed = reported.append
+        self.assertTrue(capture.begin(epoch=42))
+        for _ in range(500):  # up to 5 s
+            if reported:
+                break
+            time.sleep(0.01)
+        self.assertEqual(reported, [42])
+
+    def test_a_failed_open_is_reported_once_to_the_app(self) -> None:
+        # [N2] A failed open only logged: the app went on "recording" a
+        # capture that could not exist.
+        failures: list = []
+        logs: list[str] = []
+
+        def factory(**kwargs):
+            raise OSError("Error opening InputStream: Device unavailable")
+
+        capture = win_capture.WinCapture(stream_factory=factory, log=logs.append)
+        capture.on_start_failed = lambda epoch=None: failures.append(capture.is_active())
+        self.assertTrue(capture.begin())
+        for _ in range(500):  # up to 5 s
+            if failures:
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+        self.assertEqual(failures, [False], "reported once, after the capture ended")
+        self.assertFalse(capture.is_waking())
+        self.assertTrue(any("mic open failed" in line for line in logs), logs)
+
     def test_abort_discards_frames(self) -> None:
         self.capture.begin()
         self._wait_stream_open()

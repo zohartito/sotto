@@ -17,6 +17,7 @@ so there is no cycle at load whichever module is imported first.
 from __future__ import annotations
 
 import queue
+import threading
 import time
 
 
@@ -30,6 +31,11 @@ from sotto import (DEAD_ROUTE_TEXT, LONG_CAPTURE_S, SAMPLE_RATE, LocalWhisper, _
 # A live capture whose speech model failed (F4): the audio is kept under this
 # text so Retry can transcribe it again.
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"
+# A live capture Sotto stopped before transcribing (N9): kept the same way.
+NOT_TRANSCRIBED_TEXT = "[not transcribed: Sotto stopped]"
+# How long the teardown's keep waits for a History append of the same capture
+# that is already under way, before leaving that capture to it.
+APPEND_WAIT_S = 1.0
 
 
 class TranscriptionWorker:
@@ -70,6 +76,25 @@ class TranscriptionWorker:
         self._publication = None
         self._publication_adopted = False
         self._publication_committed = False
+        # The job being run, and the live captures it gave up on because
+        # shutdown came first: the teardown keeps both (N9).
+        self.current_job = None
+        self.abandoned: list = []
+        # Capture ids whose fate is decided — saved here, dropped as a tap,
+        # or kept by the teardown — so no capture is ever saved twice, and
+        # those whose History append is under way: settled only once it
+        # succeeds, so the teardown waits on it instead of trusting it.
+        self._settled: set[str] = set()
+        self._saving: set[str] = set()
+        self._settle_cond = threading.Condition()
+        self._live_id = None
+        # The History row the live job in flight got back (None until then),
+        # whether the user was already told about it (F4/F16a), and whether
+        # the Retry in flight reached commit_retry: the catch-all in run()
+        # reads them to keep or report a job that raised (F4b, N17).
+        self._live_row = None
+        self._live_reported = False
+        self._retry_committed = False
 
     def run(self) -> None:
         """The worker loop. Blocks until shutdown is requested.
@@ -84,6 +109,10 @@ class TranscriptionWorker:
             self._publication = None
             self._publication_adopted = False
             self._publication_committed = False
+            self.current_job = job
+            self._live_row = None
+            self._live_reported = False
+            self._retry_committed = False
             try:
                 if self.shutdown.requested():
                     continue
@@ -100,14 +129,48 @@ class TranscriptionWorker:
                 else:
                     raise RuntimeError("unknown transcription job")
             except Exception as exc:
-                self.log(f"! transcription failed: {str(exc)[:160]}")
+                try:
+                    self._job_failed(job, exc)
+                except Exception:  # reporting must never end the worker thread
+                    self.log(f"! transcription failed: {str(exc)[:160]}")
             finally:
                 if (self.adaptive_runtime is not None and self._publication is not None
                         and not self._publication_adopted and not self._publication_committed):
                     self.adaptive_runtime.cancel_comparator_publication({"comparator_publication": self._publication})
                 if self.status_ui is not None and job[0] not in {"stream-audio", "stream-close"}:
                     self.ui_call(self.status_ui.hide_if_transcribing)
+                if job[0] == "live" and self.shutdown.requested():
+                    self.abandoned.append(job)  # kept by the teardown unless saved here
+                self.current_job = None
                 self.jobs.task_done()
+
+    def _job_failed(self, job, exc: Exception) -> None:
+        """A job raised outside the paths that handle their own failures.
+
+        A live capture that never reached History is kept for Retry exactly
+        like a failed model call (F4b), whatever step raised: preparation,
+        VAD trim, silence collapse, screening, the adaptive lane. A Retry that
+        raised before commit_retry tells the user once, as Windows does
+        (N17). An error after the result was saved, delivered or already
+        reported is logged as that, not as a transcription failure.
+
+        Side effects: may append one History row and show one alert; logs."""
+        error = f"{type(exc).__name__}: {str(exc)[:160]}"
+        if job[0] == "live" and self._live_row is None and not self._live_reported:
+            _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, _stream = job
+            if self.adaptive_runtime is not None:
+                # The capture is kept below as an ordinary row under a new id;
+                # drop any unadopted adaptive staging of it first.
+                discard_staged_adaptive_live_audio(self.adaptive_runtime.history, capture_id)
+            self._keep_failed_live_capture(exc, raw=raw, native_rate=native_rate, captured_ts=captured_ts,
+                                           queued_at=queued_at, job_config=job_config, preprocessing={})
+        elif job[0] == "retry" and not self._retry_committed:
+            self.log(f"! retry failed ({error}) — the History entry is unchanged")
+            self._show_error("Retry failed", f"The History entry is unchanged.\n\n{error}")
+        elif job[0] in {"live", "retry"}:
+            self.log(f"! {job[0]} result already handled; a later step failed ({error})")
+        else:
+            self.log(f"! transcription failed: {str(exc)[:160]}")
 
     def _stream_audio(self, job) -> None:
         """Feed one captured block to a Nemotron stream (Nemotron runs its
@@ -141,6 +204,7 @@ class TranscriptionWorker:
         ``deliver_call``, records progress totals, refreshes the History menu, logs.
         Nothing is appended, delivered or persisted once shutdown is requested."""
         _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, stream = job
+        self._live_id = capture_id
         started = time.monotonic()
         stream_prepared = None
         stream_text = None
@@ -165,6 +229,8 @@ class TranscriptionWorker:
         seconds = len(samples) / SAMPLE_RATE
         if seconds < 0.2:
             self.log("○ sub-0.2s capture dropped (key-tap artifact)")
+            with self._settle_cond:
+                self._settled.add(capture_id)
             return
         skip = asr_skip_reason(samples)
         if skip:
@@ -192,7 +258,7 @@ class TranscriptionWorker:
             self.log(f"! not pasted ({skip})")
             try:
                 finalize_primary_live_delivery(
-                    append=lambda: self.coordinator.append_live(
+                    append=lambda: self._append_live(
                         text, prepared, seconds, self.model,
                         ts=captured_ts, raw_samples=raw,
                         raw_sample_rate=native_rate,
@@ -349,11 +415,10 @@ class TranscriptionWorker:
                 self.adaptive_runtime.fail_comparator_publication(publication_meta)
                 raise RuntimeError("comparator publication adoption unavailable")
             if reason:
-                self.log(f"! not pasted ({reason}) — kept in history")
                 preprocessing["outcome"] = "suspect"
                 try:
                     appended_row = finalize_primary_live_delivery(
-                        append=lambda: self.coordinator.append_live(
+                        append=lambda: self._append_live(
                             text, prepared, prepared_seconds, actual_model,
                             ts=captured_ts, raw_samples=raw,
                             raw_sample_rate=native_rate, provenance="live_suspect",
@@ -366,15 +431,21 @@ class TranscriptionWorker:
                     if self.adaptive_runtime is not None:
                         discard_staged_adaptive_live_audio(self.adaptive_runtime.history,capture_id)
                         raise
+                    self.log(f"! not pasted ({reason})")
                     self._history_append_failed(exc)  # F16(a): held text; nothing to deliver
+                else:
+                    # N10: read-only History (F16b) keeps nothing; never claim it did.
+                    self.log(f"! not pasted ({reason}) — "
+                             + ("kept in history" if self._in_history() else "not kept (History is read-only)"))
             else:
                 if self.shutdown.requested():
                     return
                 deliver = ((lambda: self.deliver_call(self.undo_when_clear, 0)) if voice_action == "scratch"
-                           else (lambda: self.deliver_call(self.inject_when_clear, text, 0)) if text else None)
+                           else (lambda: self.deliver_call(self.inject_when_clear, text, 0, self._in_history()))
+                           if text else None)
                 try:
                     appended_row = finalize_primary_live_delivery(
-                        append=lambda: self.coordinator.append_live(
+                        append=lambda: self._append_live(
                             text, prepared, prepared_seconds, actual_model, ts=captured_ts,
                             raw_samples=raw, raw_sample_rate=native_rate,
                             provenance="live", adaptive=entry_adaptive,
@@ -401,32 +472,41 @@ class TranscriptionWorker:
         self.log(f"→ {time.monotonic() - queued_at:.2f}s after release "
                  f"(speech model {elapsed:.2f}s) · {len(text)} chars")
 
+    def _in_history(self) -> bool:
+        """Did History really keep this live job's row? None when the append
+        failed (F16a); read-only History hands back a row marked ``saved``
+        False (F16b)."""
+        return self._live_row is not None and self._live_row.get("saved") is not False
+
     def _keep_failed_live_capture(self, exc: Exception, *, raw, native_rate, captured_ts, queued_at,
                                   job_config, preprocessing: dict, prepared=None, vad_metadata=None) -> None:
-        """The speech model failed on a live capture (F4). The recording is not
-        lost: it becomes a ``live_suspect`` History row reading
-        TRANSCRIPTION_FAILED_TEXT, so Retry can transcribe it again.
+        """The speech model (F4), or any step around it (F4b), failed on a live
+        capture. The recording is not lost: it becomes a ``live_suspect``
+        History row reading TRANSCRIPTION_FAILED_TEXT, so Retry can transcribe
+        it again. If even that row cannot be prepared or saved, the user is
+        told to dictate again.
 
         Side effects: appends that row with the raw audio and the error in its
         preprocessing receipt, refreshes the History menu, logs the error, and
         shows one alert. Nothing once shutdown is requested."""
         if self.shutdown.requested():
             return
+        self._live_reported = True
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
-        self.log(f"! transcription failed ({error}) — audio kept in History for Retry")
-        if prepared is None:  # the stream failed before any canonical audio existed
-            from audio_codec import prepare_canonical
-            prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
-        seconds = len(prepared.asr_samples) / SAMPLE_RATE
-        _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
-        attempt_metadata.update({
-            "vad": vad_metadata or {"available": None, "speech_fraction": None, "span_count": None},
-            "preprocessing": {**preprocessing, "outcome": "suspect", "error": error},
-            "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4), "asr_seconds": 0.0},
-        })
+        self.log(f"! transcription failed ({error})")
         try:
+            if prepared is None:  # no canonical audio exists yet (a stream or a step before it failed)
+                from audio_codec import prepare_canonical
+                prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
+            seconds = len(prepared.asr_samples) / SAMPLE_RATE
+            _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
+            attempt_metadata.update({
+                "vad": vad_metadata or {"available": None, "speech_fraction": None, "span_count": None},
+                "preprocessing": {**preprocessing, "outcome": "suspect", "error": error},
+                "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4), "asr_seconds": 0.0},
+            })
             finalize_primary_live_delivery(
-                append=lambda: self.coordinator.append_live(
+                append=lambda: self._append_live(
                     TRANSCRIPTION_FAILED_TEXT, prepared, seconds, self.model, ts=captured_ts,
                     raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
                     adaptive=False, **attempt_metadata),
@@ -437,7 +517,102 @@ class TranscriptionWorker:
                              f"{error}\n\nThe recording could not be saved to History either; please dictate again.")
             return
         self.refresh_history()
+        if not self._in_history():  # N10: read-only History (F16b) kept nothing
+            self.log("! failed capture not saved (History is read-only)")
+            self._show_error("Transcription failed",
+                             f"{error}\n\nHistory is read-only right now, so the recording was not "
+                             "kept; please dictate again.")
+            return
+        self.log("  audio kept in History for Retry")
         self._show_error("Transcription failed", f"The audio is in History; use Retry.\n\n{error}")
+
+    def keep_untranscribed(self, job, wait_s: float = APPEND_WAIT_S) -> None:
+        """Sotto is stopping and this live capture was never transcribed (N9):
+        Quit, Restart or SIGTERM waited as long as it may. The recording is
+        not lost: it becomes a ``live_suspect`` History row reading
+        NOT_TRANSCRIBED_TEXT, so Retry can transcribe it at the next start.
+        Unlike every other append this runs after shutdown is requested; the
+        teardown calls it only for captures nothing else will save.
+
+        An append of this capture already under way gets up to ``wait_s``:
+        if it saved the row, nothing more; if it failed, the capture is kept
+        here; if it is still running, it is left to that append, never saved
+        a second time.
+
+        Side effects: may wait; appends that row with the raw audio; logs.
+        Never raises. Nothing when this capture was already saved or kept."""
+        _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, _stream = job
+        with self._settle_cond:
+            self._settle_cond.wait_for(lambda: capture_id not in self._saving, timeout=wait_s)
+            if capture_id in self._saving:
+                self.log("! History was still saving a capture as Sotto stopped — left to that save")
+                return
+        if not self._start_saving(capture_id):
+            return
+        saved = False
+        try:
+            from audio_codec import prepare_canonical
+            prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
+            seconds = len(prepared.asr_samples) / SAMPLE_RATE
+            _, attempt_metadata = _transcription_kwargs(job_config, self.glossary_terms, seconds)
+            attempt_metadata.update({
+                "vad": {"available": None, "speech_fraction": None, "span_count": None},
+                "preprocessing": {"resampled_normalized": True, "vad_trimmed": False,
+                                  "silence_collapsed": False, "outcome": "suspect",
+                                  "error": "not transcribed before Sotto stopped"},
+                "latency": {"queue_wait_seconds": round(time.monotonic() - queued_at, 4),
+                            "asr_seconds": 0.0},
+            })
+            self.coordinator.append_live(
+                NOT_TRANSCRIBED_TEXT, prepared, seconds, self.model, ts=captured_ts,
+                raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
+                adaptive=False, **attempt_metadata)
+            saved = True
+        except Exception as exc:
+            self.log(f"! untranscribed capture not saved ({type(exc).__name__}: {str(exc)[:160]})")
+            return
+        finally:
+            self._end_saving(capture_id, saved)
+        self.log(f"○ {len(raw) / max(native_rate, 1.0):.1f}s capture not transcribed before "
+                 "stopping — kept in History for Retry")
+
+    def _start_saving(self, capture_id) -> bool:
+        """Claim a live capture's one History row; False if it is already
+        saved, settled, or being saved."""
+        with self._settle_cond:
+            if capture_id in self._settled or capture_id in self._saving:
+                return False
+            self._saving.add(capture_id)
+            return True
+
+    def _end_saving(self, capture_id, saved: bool) -> None:
+        """The append claimed by _start_saving returned: the capture is
+        settled only if it ``saved``; either way a waiting teardown wakes."""
+        with self._settle_cond:
+            self._saving.discard(capture_id)
+            if saved:
+                self._settled.add(capture_id)
+            self._settle_cond.notify_all()
+
+    def _append_live(self, *args, **kwargs):
+        """coordinator.append_live for the live capture in hand, remembering
+        the row it hands back, unless the teardown already kept it (a model
+        that returned too late): then None, so nothing is registered or
+        delivered, and an adaptive staging WAV is removed. The capture is
+        settled only once the append succeeds; one that raises saved nothing,
+        so the teardown, which waits for it, may still keep it."""
+        capture_id = self._live_id
+        if not self._start_saving(capture_id):
+            if self.adaptive_runtime is not None:
+                discard_staged_adaptive_live_audio(self.adaptive_runtime.history, capture_id)
+            return None
+        saved = False
+        try:
+            self._live_row = self.coordinator.append_live(*args, **kwargs)
+            saved = True
+            return self._live_row
+        finally:
+            self._end_saving(capture_id, saved)
 
     def _history_append_failed(self, exc: Exception, deliver=None) -> None:
         """History could not take the live row (F16a): disk full, a locked or
@@ -447,6 +622,7 @@ class TranscriptionWorker:
         Side effects: runs ``deliver`` (the cursor insertion or the "scratch
         that" undo, exactly what a saved row would have scheduled); shows one
         alert; logs the error. Nothing once shutdown is requested."""
+        self._live_reported = True
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
         self.log(f"! History append failed ({error})"
                  + (" — delivering the text anyway" if deliver is not None else ""))
@@ -469,7 +645,7 @@ class TranscriptionWorker:
         """Transcribe a History row's saved canonical audio again.
 
         Side effects: commits the new text to the row (``commit_retry``),
-        copies deliverable text to the clipboard via ``ui_call``, refreshes
+        copies deliverable text to the clipboard via ``deliver_call``, refreshes
         the History menu, logs. Nothing is committed or copied once shutdown
         is requested."""
         _, entry_id, queued_at, capture_id, job_config = job
@@ -497,6 +673,7 @@ class TranscriptionWorker:
                 entry_id, text, snapshot.expected_revision,
                 model=self.model, provenance="retry",
                 **attempt_metadata)
+            self._retry_committed = True
             self.log("↻ retry skipped — dead microphone (all-zero capture)")
             self.refresh_history()
             return
@@ -555,6 +732,7 @@ class TranscriptionWorker:
         committed = self.coordinator.commit_retry(
             entry_id, text, snapshot.expected_revision, model=retry_model,
             provenance="retry", **attempt_metadata)
+        self._retry_committed = True
         self._publication_committed = committed is not None
         if self.adaptive_runtime is not None and self._publication is not None:
             if committed is None:
@@ -573,6 +751,8 @@ class TranscriptionWorker:
         if held and committed is not None:
             self.log(f"↻ retried — not copied ({held}); kept in History")
         elif text and committed is not None and not self.shutdown.requested():
-            self.ui_call(self.copy_text, text)
+            # A delivery like a paste (N19): counted in PendingDeliveries until
+            # the main thread runs it, so Quit waits for the copy.
+            self.deliver_call(self.copy_text, text)
             self.log(f"↻ retried · {len(text)} chars")
         self.refresh_history()
