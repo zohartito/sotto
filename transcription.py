@@ -33,6 +33,9 @@ from sotto import (DEAD_ROUTE_TEXT, LONG_CAPTURE_S, SAMPLE_RATE, LocalWhisper, _
 TRANSCRIPTION_FAILED_TEXT = "[transcription failed]"
 # A live capture Sotto stopped before transcribing (N9): kept the same way.
 NOT_TRANSCRIBED_TEXT = "[not transcribed: Sotto stopped]"
+# How long the teardown's keep waits for a History append of the same capture
+# that is already under way, before leaving that capture to it.
+APPEND_WAIT_S = 1.0
 
 
 class TranscriptionWorker:
@@ -78,9 +81,12 @@ class TranscriptionWorker:
         self.current_job = None
         self.abandoned: list = []
         # Capture ids whose fate is decided — saved here, dropped as a tap,
-        # or kept by the teardown — so no capture is ever saved twice.
+        # or kept by the teardown — so no capture is ever saved twice, and
+        # those whose History append is under way: settled only once it
+        # succeeds, so the teardown waits on it instead of trusting it.
         self._settled: set[str] = set()
-        self._settle_lock = threading.Lock()
+        self._saving: set[str] = set()
+        self._settle_cond = threading.Condition()
         self._live_id = None
         # The History row the live job in flight got back (None until then),
         # whether the user was already told about it (F4/F16a), and whether
@@ -223,7 +229,8 @@ class TranscriptionWorker:
         seconds = len(samples) / SAMPLE_RATE
         if seconds < 0.2:
             self.log("○ sub-0.2s capture dropped (key-tap artifact)")
-            self._settle(capture_id)
+            with self._settle_cond:
+                self._settled.add(capture_id)
             return
         skip = asr_skip_reason(samples)
         if skip:
@@ -519,7 +526,7 @@ class TranscriptionWorker:
         self.log("  audio kept in History for Retry")
         self._show_error("Transcription failed", f"The audio is in History; use Retry.\n\n{error}")
 
-    def keep_untranscribed(self, job) -> None:
+    def keep_untranscribed(self, job, wait_s: float = APPEND_WAIT_S) -> None:
         """Sotto is stopping and this live capture was never transcribed (N9):
         Quit, Restart or SIGTERM waited as long as it may. The recording is
         not lost: it becomes a ``live_suspect`` History row reading
@@ -527,11 +534,22 @@ class TranscriptionWorker:
         Unlike every other append this runs after shutdown is requested; the
         teardown calls it only for captures nothing else will save.
 
-        Side effects: appends that row with the raw audio; logs. Never raises.
-        Nothing when this capture was already saved or kept."""
+        An append of this capture already under way gets up to ``wait_s``:
+        if it saved the row, nothing more; if it failed, the capture is kept
+        here; if it is still running, it is left to that append, never saved
+        a second time.
+
+        Side effects: may wait; appends that row with the raw audio; logs.
+        Never raises. Nothing when this capture was already saved or kept."""
         _, raw, native_rate, captured_ts, queued_at, capture_id, job_config, _stream = job
-        if not self._settle(capture_id):
+        with self._settle_cond:
+            self._settle_cond.wait_for(lambda: capture_id not in self._saving, timeout=wait_s)
+            if capture_id in self._saving:
+                self.log("! History was still saving a capture as Sotto stopped — left to that save")
+                return
+        if not self._start_saving(capture_id):
             return
+        saved = False
         try:
             from audio_codec import prepare_canonical
             prepared = prepare_canonical(prepare_for_whisper(raw, native_rate))
@@ -549,38 +567,52 @@ class TranscriptionWorker:
                 NOT_TRANSCRIBED_TEXT, prepared, seconds, self.model, ts=captured_ts,
                 raw_samples=raw, raw_sample_rate=native_rate, provenance="live_suspect",
                 adaptive=False, **attempt_metadata)
+            saved = True
         except Exception as exc:
             self.log(f"! untranscribed capture not saved ({type(exc).__name__}: {str(exc)[:160]})")
             return
+        finally:
+            self._end_saving(capture_id, saved)
         self.log(f"○ {len(raw) / max(native_rate, 1.0):.1f}s capture not transcribed before "
                  "stopping — kept in History for Retry")
 
-    def _settle(self, capture_id) -> bool:
-        """Claim a live capture's one History row; False if already claimed."""
-        with self._settle_lock:
-            if capture_id in self._settled:
+    def _start_saving(self, capture_id) -> bool:
+        """Claim a live capture's one History row; False if it is already
+        saved, settled, or being saved."""
+        with self._settle_cond:
+            if capture_id in self._settled or capture_id in self._saving:
                 return False
-            self._settled.add(capture_id)
+            self._saving.add(capture_id)
             return True
+
+    def _end_saving(self, capture_id, saved: bool) -> None:
+        """The append claimed by _start_saving returned: the capture is
+        settled only if it ``saved``; either way a waiting teardown wakes."""
+        with self._settle_cond:
+            self._saving.discard(capture_id)
+            if saved:
+                self._settled.add(capture_id)
+            self._settle_cond.notify_all()
 
     def _append_live(self, *args, **kwargs):
         """coordinator.append_live for the live capture in hand, remembering
         the row it hands back, unless the teardown already kept it (a model
         that returned too late): then None, so nothing is registered or
-        delivered, and an adaptive staging WAV is removed. An append that
-        raises saved nothing, so the capture is unsettled again and the
-        teardown may still keep it."""
-        if not self._settle(self._live_id):
+        delivered, and an adaptive staging WAV is removed. The capture is
+        settled only once the append succeeds; one that raises saved nothing,
+        so the teardown, which waits for it, may still keep it."""
+        capture_id = self._live_id
+        if not self._start_saving(capture_id):
             if self.adaptive_runtime is not None:
-                discard_staged_adaptive_live_audio(self.adaptive_runtime.history, self._live_id)
+                discard_staged_adaptive_live_audio(self.adaptive_runtime.history, capture_id)
             return None
+        saved = False
         try:
             self._live_row = self.coordinator.append_live(*args, **kwargs)
+            saved = True
             return self._live_row
-        except Exception:
-            with self._settle_lock:
-                self._settled.discard(self._live_id)
-            raise
+        finally:
+            self._end_saving(capture_id, saved)
 
     def _history_append_failed(self, exc: Exception, deliver=None) -> None:
         """History could not take the live row (F16a): disk full, a locked or

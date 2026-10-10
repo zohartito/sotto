@@ -28,6 +28,7 @@ import settings
 import sotto
 from audio_codec import prepare_canonical
 from speech_config import resolve_speech_config
+import transcription
 from transcription import TranscriptionWorker
 
 WHISPER = resolve_speech_config("auto", language="en")
@@ -74,6 +75,9 @@ class FakeStream:
 
     def close(self):
         self.closed += 1
+
+
+WAIT_S = 5.0
 
 
 class FakeCoordinator:
@@ -883,6 +887,52 @@ class UntranscribedAtShutdownTests(TemporaryUserFiles, unittest.TestCase):
         self.assertEqual(h.worker.abandoned, [job])
         h.worker.keep_untranscribed(job)
         self.assertEqual(calls, ["Please call me back at four", "[not transcribed: Sotto stopped]"])
+
+    def blocked_append(self, outcome):
+        """A Harness whose first History append blocks until released, then
+        ``outcome``s: "fails" raises, "saves" saves. Later appends save."""
+        started, release, calls = threading.Event(), threading.Event(), []
+
+        def append(text, prepared, seconds, model, **kw):
+            calls.append(text)
+            if len(calls) == 1:
+                started.set()
+                release.wait(WAIT_S)
+                if outcome == "fails":
+                    raise OSError(28, "No space left on device")
+            return {"id": f"row{len(calls)}", "text": text, "provenance": kw.get("provenance")}
+        h = Harness(says("Please call me back at four"), append=append)
+        job = h.live_job(speech(2.0))
+        threading.Thread(target=h.run_jobs, args=(job,), daemon=True).start()
+        self.assertTrue(started.wait(WAIT_S), "the worker never reached its History append")
+        h.shutdown.request()  # Quit's drain ran out while the append was under way
+        keeper = threading.Thread(target=h.worker.keep_untranscribed, args=(job,), daemon=True)
+        keeper.start()
+        return keeper, release, calls
+
+    def test_the_teardown_waits_for_an_append_under_way_and_keeps_the_capture_if_it_fails(self):
+        # Codex on #20: settling before the append let the teardown refuse a
+        # capture whose append then failed, losing audio and transcript.
+        keeper, release, calls = self.blocked_append("fails")
+        time.sleep(0.1)
+        self.assertTrue(keeper.is_alive(), "the teardown did not wait for the append under way")
+        release.set()
+        keeper.join(WAIT_S)
+        self.assertEqual(calls, ["Please call me back at four", "[not transcribed: Sotto stopped]"])
+
+    def test_the_teardown_waits_for_an_append_under_way_and_never_keeps_it_twice(self):
+        keeper, release, calls = self.blocked_append("saves")
+        time.sleep(0.1)
+        release.set()
+        keeper.join(WAIT_S)
+        self.assertEqual(calls, ["Please call me back at four"])
+
+    def test_the_teardown_wait_for_an_append_under_way_is_bounded(self):
+        keeper, release, calls = self.blocked_append("fails")
+        keeper.join(transcription.APPEND_WAIT_S + 2.0)
+        self.assertFalse(keeper.is_alive(), "a wedged append held the teardown")
+        release.set()
+        self.assertEqual(calls, ["Please call me back at four"])  # never two rows racing
 
     def test_a_suppressed_adaptive_append_discards_its_staged_audio(self):
         h = Harness(says("unused"))
