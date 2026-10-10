@@ -1,6 +1,6 @@
 """Check for Updates: only on request, only a clean checkout strictly behind GitHub."""
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import signal
 import subprocess
@@ -88,7 +88,7 @@ class CheckTests(unittest.TestCase):
         # [N28] Owner decision 2026-10-09: Check for Updates in a terminal run
         # refuses and names the manual command; it used to rebuild Sotto.app
         # for the alpha data folder, which that run may not use.
-        command = updates.mac_manual_update(Path("/Users/someone/my sotto"))
+        command = updates.mac_manual_update(PurePosixPath("/Users/someone/my sotto"))
         self.assertEqual(command, "cd '/Users/someone/my sotto' && scripts/install-mac.sh --update")
         title, text = updates.describe(updates.UpdateCheck("available", behind=1, changes=("Add A",)),
                                        command, self_update=False)

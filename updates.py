@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import shlex
 import shutil
 import signal
@@ -148,7 +148,7 @@ def apply_mac(root: Path, python: str, log_path: Path, run=subprocess.run,
     return finished, tail, bool(before and after and before != after)
 
 
-def mac_manual_update(root: Path) -> str:
+def mac_manual_update(root: PurePath) -> str:
     """The Terminal command that updates the checkout at root by hand."""
     return f"cd {shlex.quote(str(root))} && scripts/install-mac.sh --update"
 
